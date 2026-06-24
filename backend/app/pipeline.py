@@ -18,6 +18,21 @@ def _toks(s):
     return set(re.findall(r'[a-z0-9]+', (s or '').lower()))
 
 
+def _pick_link(r):
+    """Prefer a magnet URI (qB needs no fetch — works behind the VPN killswitch);
+    fall back to an http .torrent download URL."""
+    for k in ("magnetUrl", "guid", "downloadUrl"):
+        v = r.get(k)
+        if v and str(v).startswith("magnet:"):
+            return v
+    return r.get("downloadUrl") or r.get("magnetUrl") or r.get("guid")
+
+
+def _hash_from_magnet(link):
+    m = re.search(r'urn:btih:([0-9a-fA-F]{40})', link or "")
+    return m.group(1).lower() if m else None
+
+
 def _clients(cfg):
     return (Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"]),
             Radarr(cfg["radarr_url"], cfg["radarr_key"]),
@@ -98,8 +113,7 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
         sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src)
         if sc is None:
             continue
-        link = r.get("magnetUrl") or r.get("downloadUrl") or r.get("guid")
-        cand.append((sc, r.get("seeders") or 0, r.get("title"), link))
+        cand.append((sc, r.get("seeders") or 0, r.get("title"), _pick_link(r)))
     cand.sort(reverse=True)
     if not cand or cand[0][0] < cfg["score_threshold"] or cand[0][1] < cfg["min_seeders"]:
         core.set_status(tmdb_id, "no_release",
@@ -123,14 +137,12 @@ def grab(tmdb_id, link, cfg=None):
     savepath = f"{cfg['qb_download_dir']}/{mv['tmdb_id']}"
     try:
         qb.login()
-        before = {t["hash"] for t in qb.torrents(cfg["qb_category"])}
-        qb.add(link, cfg["qb_category"], savepath)
-        # find the new hash (best-effort)
-        after = qb.torrents(cfg["qb_category"])
-        new = [t for t in after if t["hash"] not in before]
-        h = new[0]["hash"] if new else None
+        qb.create_category(cfg["qb_category"], cfg["qb_download_dir"])
+        resp = qb.add(link, cfg["qb_category"], savepath)
+        ids = resp.get("added_torrent_ids") if isinstance(resp, dict) else None
+        h = (ids[0] if ids else None) or _hash_from_magnet(link)
         core.set_status(tmdb_id, "downloading", dl_hash=h)
-        core.log(f"grab tmdb={tmdb_id}: sent to qB ({savepath})")
+        core.log(f"grab tmdb={tmdb_id}: sent to qB ({savepath}) hash={h}")
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"grab: {e}")
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
@@ -279,18 +291,18 @@ def stage_finish(cfg=None):
     qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
     try:
         qb.login()
-        torrents = {t["hash"]: t for t in qb.torrents(cfg["qb_category"])}
+        torrents = qb.torrents(cfg["qb_category"])
     except Exception as e:
         core.log(f"stage_finish: qB error {e}"); return
+    by_hash = {t["hash"]: t for t in torrents}
     for mv in core.get_movies("downloading"):
-        h = mv.get("dl_hash")
-        t = torrents.get(h)
-        if not t:
+        tmdb = str(mv["tmdb_id"])
+        t = by_hash.get(mv.get("dl_hash"))
+        if not t:   # fall back: match by save/content path containing /<tmdb>
+            t = next((x for x in torrents
+                      if f"/{tmdb}" in (x.get("save_path", "") + x.get("content_path", ""))), None)
+        if not t or t.get("progress", 0) < 1.0:
             continue
-        if t.get("progress", 0) < 1.0:
-            continue
-        # map qB's content_path (its view) into our downloads mount
-        cp = t.get("content_path") or t.get("save_path")
         # qB save dir was <qb_download_dir>/<tmdb>; we see it under downloads_mount/<tmdb>
         local = os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
         vid = _find_video(local) if os.path.isdir(local) else (local if os.path.exists(local) else None)
