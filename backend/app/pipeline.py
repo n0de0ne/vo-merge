@@ -231,9 +231,11 @@ def merge_movie(tmdb_id, cfg=None):
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; have.add(a["lang"])
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new non-English tracks in FR file"); return
-    outdir = os.path.dirname(base) + "/_merged"
+    # write into the library folder (/media, rw) — /downloads is mounted read-only.
+    # mkvmerge always outputs Matroska, so force a .mkv extension.
+    outdir = os.path.dirname(donor) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, os.path.basename(base))
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(base))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base,
            "--no-video", "--no-subtitles", "--no-chapters", "--no-buttons", "--no-track-tags",
            "--audio-tracks", ",".join(str(i) for i in ids)]
@@ -261,11 +263,16 @@ def finish_movie(tmdb_id, cfg=None):
         return
     libdir = os.path.dirname(donor)
     dest = os.path.join(libdir, os.path.basename(merged))
+    mergedir = os.path.dirname(merged)
     try:
         shutil.move(merged, dest)
         # remove the old FR-only library file (its seed copy, if any, is a separate path)
         if os.path.exists(donor) and os.path.abspath(donor) != os.path.abspath(dest):
             os.remove(donor)
+        try:
+            os.rmdir(mergedir)          # clean up now-empty _merged
+        except OSError:
+            pass
         core.set_status(tmdb_id, "merged", merged_file=dest)
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
