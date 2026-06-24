@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+# node
+node_modules/
+frontend/dist/
+# app runtime / secrets
+config.json
+*.db
+*.log
+/config/

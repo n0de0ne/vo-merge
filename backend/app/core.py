@@ -1,0 +1,161 @@
+"""Config persistence + SQLite state + the per-movie pipeline state machine."""
+import json, os, sqlite3, threading, time
+from contextlib import contextmanager
+
+CONFIG_DIR = os.environ.get("VO_CONFIG", "/config")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+DB_FILE = os.path.join(CONFIG_DIR, "vo-merge.db")
+LOG_FILE = os.path.join(CONFIG_DIR, "vo-merge.log")
+
+# Pipeline states a movie moves through.
+STATES = ["pending", "searching", "no_release", "grabbed", "downloading",
+          "ready", "merging", "merged", "sync_fail", "error", "ignored"]
+
+DEFAULTS = {
+    "prowlarr_url": "http://10.0.1.5:9696",
+    "prowlarr_key": "",
+    "radarr_url": "http://10.0.1.5:7878",
+    "radarr_key": "",
+    "qb_url": "http://10.0.1.5:1290",
+    "qb_user": "admin",
+    "qb_pass": "",
+    "plex_url": "http://10.0.1.5:32400",
+    "plex_token": "",
+    "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
+    "vo_gap_tag": "vo-gap",
+    "qb_category": "audio-merge",
+    "qb_download_dir": "/downloads/audio-merge",   # container view of qB's save path
+    "downloads_mount": "/downloads/audio-merge",   # how THIS container sees the same files
+    "media_mount": "/media",                       # this container's view of /mnt/user/Plex
+    "score_threshold": 60,
+    "min_seeders": 5,
+    "grab_mode": "auto",                   # auto | approval
+    "scope_films": True,
+    "scope_series": False,
+    "exclude_french_origin": True,
+    "sync_tolerance_s": 2.0,
+    "search_interval_min": 60,
+    "finish_interval_min": 10,
+    "enabled": False,                      # master switch; off until configured
+}
+
+_lock = threading.Lock()
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            cfg.update(json.load(open(CONFIG_FILE)))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(updates: dict):
+    with _lock:
+        cfg = load_config()
+        cfg.update({k: v for k, v in updates.items() if k in DEFAULTS})
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
+    return load_config()
+
+
+def log(msg: str):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def tail_log(n=300):
+    if not os.path.exists(LOG_FILE):
+        return []
+    with open(LOG_FILE) as f:
+        return f.readlines()[-n:]
+
+
+@contextmanager
+def db():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS movies (
+            tmdb_id INTEGER PRIMARY KEY,
+            imdb_id TEXT, radarr_id INTEGER,
+            title TEXT, original_title TEXT, year INTEGER,
+            original_lang TEXT,
+            french_path TEXT,            -- existing FR library file (container /media path)
+            quality TEXT,                -- FR file quality e.g. Bluray-1080p
+            status TEXT DEFAULT 'pending',
+            candidate_title TEXT,        -- chosen EN release title
+            candidate_score INTEGER,
+            candidate_seeders INTEGER,
+            dl_hash TEXT,                -- qB torrent hash
+            en_file TEXT,                -- downloaded EN file (container path) once complete
+            merged_file TEXT,
+            sync_delta REAL,             -- duration delta base<->donor at merge time
+            sync_offset_ms INTEGER DEFAULT 0,  -- manual override
+            error TEXT,
+            updated REAL
+        )""")
+
+
+def upsert_movie(m: dict):
+    cols = ["tmdb_id", "imdb_id", "radarr_id", "title", "original_title", "year",
+            "original_lang", "french_path", "quality"]
+    with db() as c:
+        existing = c.execute("SELECT tmdb_id FROM movies WHERE tmdb_id=?",
+                             (m["tmdb_id"],)).fetchone()
+        if existing:
+            c.execute("""UPDATE movies SET imdb_id=?,radarr_id=?,title=?,original_title=?,
+                         year=?,original_lang=?,french_path=?,quality=?,updated=?
+                         WHERE tmdb_id=?""",
+                      (m["imdb_id"], m["radarr_id"], m["title"], m["original_title"],
+                       m["year"], m["original_lang"], m["french_path"], m["quality"],
+                       time.time(), m["tmdb_id"]))
+        else:
+            c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
+                          VALUES ({','.join('?'*len(cols))},?)""",
+                      tuple(m[k] for k in cols) + (time.time(),))
+
+
+def set_status(tmdb_id, status, **fields):
+    fields["status"] = status
+    fields["updated"] = time.time()
+    keys = ",".join(f"{k}=?" for k in fields)
+    with db() as c:
+        c.execute(f"UPDATE movies SET {keys} WHERE tmdb_id=?",
+                  tuple(fields.values()) + (tmdb_id,))
+
+
+def get_movies(status=None):
+    with db() as c:
+        if status:
+            rows = c.execute("SELECT * FROM movies WHERE status=? ORDER BY updated DESC",
+                            (status,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM movies ORDER BY updated DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_movie(tmdb_id):
+    with db() as c:
+        r = c.execute("SELECT * FROM movies WHERE tmdb_id=?", (tmdb_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def status_counts():
+    with db() as c:
+        rows = c.execute("SELECT status, COUNT(*) n FROM movies GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
