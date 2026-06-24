@@ -232,10 +232,12 @@ def merge_movie(tmdb_id, cfg=None):
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new non-English tracks in FR file"); return
     # write into the library folder (/media, rw) — /downloads is mounted read-only.
+    # Name the output after the DONOR (the existing library file) so it replaces it
+    # IN PLACE — keeping the path Plex/Radarr already know (no dead reference / rename).
     # mkvmerge always outputs Matroska, so force a .mkv extension.
     outdir = os.path.dirname(donor) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, os.path.splitext(os.path.basename(base))[0] + ".mkv")
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(donor))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base,
            "--no-video", "--no-subtitles", "--no-chapters", "--no-buttons", "--no-track-tags",
            "--audio-tracks", ",".join(str(i) for i in ids)]
@@ -276,7 +278,13 @@ def finish_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "merged", merged_file=dest)
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
-        core.log(f"finish {tmdb_id}: placed {dest}, Radarr rescan queued")
+        # tell Plex to re-read the changed file so the new audio track shows up
+        try:
+            plex_dir = libdir.replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
+            Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
+            core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan + Plex scan ({plex_dir}) queued")
+        except Exception as e:
+            core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan queued; Plex scan skipped: {e}")
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"finish: {e}")
 

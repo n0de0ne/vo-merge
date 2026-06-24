@@ -112,6 +112,25 @@ class Plex:
         requests.get(f"{self.url}/library/sections/{section_id}/refresh",
                      params={"X-Plex-Token": self.token}, timeout=30)
 
+    def sections(self):
+        r = requests.get(f"{self.url}/library/sections",
+                         params={"X-Plex-Token": self.token},
+                         headers={"Accept": "application/json"}, timeout=15)
+        return r.json().get("MediaContainer", {}).get("Directory", [])
+
+    def scan_path(self, folder):
+        """Targeted scan of `folder` in whichever movie section contains it, so Plex
+        re-reads a changed file's streams (e.g. newly-added audio tracks)."""
+        for d in self.sections():
+            if d.get("type") != "movie":
+                continue
+            locs = [l.get("path") for l in d.get("Location", []) if l.get("path")]
+            if any(folder.startswith(l) for l in locs):
+                requests.get(f"{self.url}/library/sections/{d['key']}/refresh",
+                             params={"path": folder, "X-Plex-Token": self.token}, timeout=15)
+                return True
+        return False
+
     def ping(self):
         r = requests.get(f"{self.url}/identity",
                          params={"X-Plex-Token": self.token}, timeout=15)

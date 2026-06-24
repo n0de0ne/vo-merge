@@ -21,6 +21,7 @@ DEFAULTS = {
     "qb_pass": "",
     "plex_url": "http://10.0.1.5:32400",
     "plex_token": "",
+    "plex_media_prefix": "/data",          # how Plex sees what this app mounts at /media
     "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
     "vo_gap_tag": "vo-gap",
     "qb_category": "audio-merge",
