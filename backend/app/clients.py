@@ -44,6 +44,36 @@ class Radarr:
         return self._req("GET", "/api/v3/system/status")
 
 
+class Sonarr:
+    def __init__(self, url, key):
+        self.url = url.rstrip("/"); self.key = key
+
+    def _req(self, method, path, **kw):
+        r = requests.request(method, f"{self.url}{path}",
+                             headers={"X-Api-Key": self.key}, timeout=60, **kw)
+        r.raise_for_status()
+        return r.json() if r.content else None
+
+    def series(self):
+        return self._req("GET", "/api/v3/series")
+
+    def tags(self):
+        return self._req("GET", "/api/v3/tag")
+
+    def episode_files(self, series_id):
+        return self._req("GET", f"/api/v3/episodefile?seriesId={series_id}")
+
+    def episodes(self, series_id):
+        return self._req("GET", f"/api/v3/episode?seriesId={series_id}")
+
+    def rescan(self, series_id):
+        return self._req("POST", "/api/v3/command",
+                         json={"name": "RescanSeries", "seriesId": series_id})
+
+    def ping(self):
+        return self._req("GET", "/api/v3/system/status")
+
+
 class QBittorrent:
     """qB WebUI API v2 with cookie-session auth (Radarr-style)."""
     def __init__(self, url, user, password):
