@@ -267,7 +267,11 @@ def merge_movie(tmdb_id, cfg=None):
         # PRIMARY: video scene-cut alignment (language-independent, most reliable)
         try:
             from .offdet_video import detect_offset_video_ms
-            vm, vc = detect_offset_video_ms(base, donor, start=ws, dur=wd)
+            vm, vc = detect_offset_video_ms(
+                base, donor, start=ws, dur=wd,
+                threads=cfg.get("sync_ffmpeg_threads", 4),
+                hwaccel=cfg.get("sync_hwaccel", "vaapi"),
+                device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
             if vm is not None and vc >= cfg.get("sync_video_min_conf", 0.4):
                 m, conf, method = vm, vc, "video"
         except Exception as e:

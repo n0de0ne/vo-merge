@@ -20,7 +20,8 @@ def audio_langs(path):
 
 
 def _pcm(path, ai, start, dur, sr):
-    p = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(start), "-t", str(dur),
+    p = subprocess.run(["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2",
+                        "-ss", str(start), "-t", str(dur),
                         "-i", path, "-map", f"0:a:{ai}", "-ac", "1", "-ar", str(sr),
                         "-f", "f32le", "-"], capture_output=True)
     return np.frombuffer(p.stdout, dtype=np.float32).astype(np.float64)

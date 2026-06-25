@@ -8,8 +8,12 @@ RUN npm run build           # -> /web/dist
 
 # ---- stage 2: python runtime + merge tooling ----
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# enable non-free (Intel iHD media driver lives there) for both bookworm & trixie layouts
+RUN (sed -i 's/ main$/ main contrib non-free non-free-firmware/' /etc/apt/sources.list 2>/dev/null || true) \
+ && (sed -i 's/^Components: main.*/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
+ && apt-get update && apt-get install -y --no-install-recommends \
         mkvtoolnix ffmpeg \
+        intel-media-va-driver-non-free libva2 libva-drm2 vainfo \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY backend/requirements.txt .

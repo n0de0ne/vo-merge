@@ -40,6 +40,9 @@ DEFAULTS = {
     "sync_video_min_conf": 0.4,            # min VIDEO (scene-cut) confidence; video is primary
     "sync_window_start": 300,              # seconds into the film to start the analysis window
     "sync_window_dur": 600,                # analysis window length (s)
+    "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
+    "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
+    "sync_hwaccel_device": "/dev/dri/renderD128",
     "search_interval_min": 60,
     "finish_interval_min": 10,
     "enabled": False,                      # master switch; off until configured
