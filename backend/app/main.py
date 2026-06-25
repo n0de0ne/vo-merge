@@ -139,9 +139,9 @@ def _audio_index(path, lang):
 
 
 @api.get("/movie/{tmdb_id}/preview")
-def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
-    """Generate a 20s window: muted video clip (frame-steppable) + the raw chosen audio
-    track (for the waveform). The browser aligns the audio spike to the video frame."""
+def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1, offset_ms: int = 0):
+    """One video clip with the chosen audio shifted by offset_ms baked in (single file,
+    sound in sync) PLUS the raw audio track (generated once) for the waveform."""
     mv = core.get_movie(tmdb_id)
     f = (mv or {}).get("merged_file") or (mv or {}).get("french_path")
     if not f or not os.path.exists(f):
@@ -153,14 +153,18 @@ def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
     out = os.path.join(PREVIEW_DIR, str(tmdb_id))
     os.makedirs(out, exist_ok=True)
     ai = _audio_index(f, lang)
-    vid, aud = os.path.join(out, "video.mp4"), os.path.join(out, "audio.m4a")
+    af = (f"adelay={int(offset_ms)}:all=1" if offset_ms >= 0
+          else f"atrim=start={abs(offset_ms) / 1000.0},asetpts=PTS-STARTPTS")
+    clip = os.path.join(out, "clip.mp4")
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
-                    "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "scale=640:-2",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-                    "-movflags", "+faststart", vid], capture_output=True)
-    subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
-                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
-    return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}",
+                    "-map", "0:v:0", "-map", f"0:a:{ai}", "-sn", "-dn", "-vf", "scale=640:-2",
+                    "-af", af, "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                    "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", clip], capture_output=True)
+    aud = os.path.join(out, "audio.m4a")          # raw track for the waveform (once)
+    if not os.path.exists(aud):
+        subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
+                        "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
+    return {"video": f"/api/preview/{tmdb_id}/clip.mp4?v={t}_{offset_ms}",
             "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}",
             "start": t, "fps": fps, "duration": 20}
 
