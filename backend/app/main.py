@@ -164,7 +164,7 @@ def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
     ver = int(os.path.getmtime(f))           # changes whenever Apply rewrites the file -> busts cache
     return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}_{ver}",
             "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}_{ver}",
-            "start": t, "fps": fps, "duration": 20}
+            "start": t, "fps": fps, "duration": 20, "movie_dur": int(dur)}
 
 
 @api.get("/preview/{tmdb_id}/{name}")

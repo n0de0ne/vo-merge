@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { api, Movie, Status } from "./api";
 
+const fmtTime = (s: number) => {
+  s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+  return (h ? `${h}:` : "") + `${String(m).padStart(h ? 2 : 1, "0")}:${String(ss).padStart(2, "0")}`;
+};
+
 // ---------------- Sync Editor (stable video + Web Audio live offset + waveform) ----------------
 function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
-  const [d, setD] = useState<{ video: string; audio: string; start: number; fps: number; duration: number } | null>(null);
+  const [d, setD] = useState<{ video: string; audio: string; start: number; fps: number; duration: number; movie_dur: number } | null>(null);
   // start at 0: the preview already reflects the CURRENT file; Apply adds this delta on top
   const [offset, setOffset] = useState(0);
+  const [previewT, setPreviewT] = useState(-1);     // movie position of the preview window (-1 = auto)
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const [vt, setVt] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -20,11 +26,11 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
   offRef.current = offset;
   const fps = d?.fps || 23.976, dur = d?.duration || 20;
 
-  async function load() {
+  async function load(t = previewT) {
     setMsg("loading preview…"); setPeaks(null);
     try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {}
     try {
-      const dd = await api.preview(movie.tmdb_id, "eng"); setD(dd); setMsg("decoding audio…");
+      const dd = await api.preview(movie.tmdb_id, "eng", t); setD(dd); setMsg("decoding audio…");
       const buf = await (await fetch(dd.audio)).arrayBuffer();
       const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
       const ab = await ac.decodeAudioData(buf);
@@ -39,6 +45,13 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
     return () => { try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {} };
     /* eslint-disable-next-line */
   }, []);
+  // jump the preview window anywhere in the movie (debounced re-generate)
+  useEffect(() => {
+    if (previewT < 0) return;
+    const h = setTimeout(() => load(previewT), 450);
+    return () => clearTimeout(h);
+    /* eslint-disable-next-line */
+  }, [previewT]);
 
   // (re)start the Web Audio source aligned to the video at the current offset (no reload)
   function startAudio() {
@@ -106,6 +119,14 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
         {d && <>
           <video ref={v} src={d.video} muted loop playsInline controls
             style={{ width: "100%", maxHeight: "46vh", borderRadius: 8, background: "#000" }} />
+          <div className="row" style={{ margin: "8px 0 2px" }}>
+            <span className="muted" style={{ width: 46 }}>scene:</span>
+            <input type="range" min={0} max={d.movie_dur || 0} step={1}
+              value={previewT < 0 ? d.start : previewT}
+              onChange={e => setPreviewT(Number(e.target.value))} style={{ flex: 1 }} />
+            <span className="muted" style={{ width: 120, textAlign: "right" }}>
+              {fmtTime(previewT < 0 ? d.start : previewT)} / {fmtTime(d.movie_dur)}</span>
+          </div>
           <canvas ref={cv} width={1200} height={110}
             style={{ width: "100%", height: 110, borderRadius: 8, marginTop: 10, border: "1px solid var(--border)" }} />
           <div className="row" style={{ margin: "6px 0 12px" }}>

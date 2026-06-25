@@ -36,7 +36,7 @@ export const api = {
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
   preview: (id: number, lang = "eng", t = -1) =>
-    j<{ video: string; audio: string; start: number; fps: number; duration: number }>(
+    j<{ video: string; audio: string; start: number; fps: number; duration: number; movie_dur: number }>(
       `/api/movie/${id}/preview?lang=${lang}&t=${t}`),
   applyOffset: (id: number, offset_ms: number, lang = "eng") =>
     j<Movie>(`/api/movie/${id}/apply_offset`,
