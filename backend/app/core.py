@@ -33,6 +33,13 @@ DEFAULTS = {
     "grab_mode": "auto",                   # auto | approval
     "scope_films": True,
     "scope_series": False,
+    "series_pilot": ["The Neighborhood", "Friends", "My Wife and Kids"],  # only these series run (empty = all tagged)
+    "sonarr_url": "http://10.0.1.3:8989",
+    "sonarr_key": "",
+    "sonarr_vo_gap_tag": "vo-gap",
+    "qb_tv_category": "audio-merge-tv",
+    "qb_tv_download_dir": "/downloads/audio-merge-tv",
+    "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
     "exclude_french_origin": True,
     "sync_tolerance_s": 2.0,
     "auto_sync": True,                     # auto-detect & correct constant A/V offset
@@ -118,6 +125,66 @@ def init_db():
             error TEXT,
             updated REAL
         )""")
+
+
+def init_tv():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT PRIMARY KEY,             -- f"{series_id}:{season}:{ep}"
+            series_id INTEGER, series_title TEXT, tvdb_id INTEGER,
+            season INTEGER, episode INTEGER,
+            french_path TEXT,                -- existing FR episode file (container /media path)
+            quality TEXT,
+            status TEXT DEFAULT 'pending',
+            candidate_title TEXT, candidate_score INTEGER, candidate_seeders INTEGER,
+            dl_hash TEXT,                    -- qB torrent (shared across a season pack)
+            en_file TEXT, merged_file TEXT,
+            sync_offset_ms INTEGER DEFAULT 0, sync_delta REAL,
+            error TEXT, updated REAL )""")
+
+
+def upsert_episode(e: dict):
+    cols = ["id", "series_id", "series_title", "tvdb_id", "season", "episode",
+            "french_path", "quality"]
+    with db() as c:
+        ex = c.execute("SELECT status FROM episodes WHERE id=?", (e["id"],)).fetchone()
+        if ex:
+            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,updated=?
+                         WHERE id=?""",
+                      (e["series_title"], e["tvdb_id"], e["french_path"], e["quality"],
+                       time.time(), e["id"]))
+        else:
+            c.execute(f"INSERT INTO episodes ({','.join(cols)},updated) "
+                      f"VALUES ({','.join('?'*len(cols))},?)",
+                      tuple(e[k] for k in cols) + (time.time(),))
+
+
+def set_ep_status(ep_id, status, **fields):
+    fields["status"] = status; fields["updated"] = time.time()
+    keys = ",".join(f"{k}=?" for k in fields)
+    with db() as c:
+        c.execute(f"UPDATE episodes SET {keys} WHERE id=?", tuple(fields.values()) + (ep_id,))
+
+
+def get_episodes(status=None):
+    with db() as c:
+        if status:
+            rows = c.execute("SELECT * FROM episodes WHERE status=? ORDER BY updated DESC", (status,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM episodes ORDER BY series_title,season,episode").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_episode(ep_id):
+    with db() as c:
+        r = c.execute("SELECT * FROM episodes WHERE id=?", (ep_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def ep_status_counts():
+    with db() as c:
+        rows = c.execute("SELECT status, COUNT(*) n FROM episodes GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
 
 
 def upsert_movie(m: dict):

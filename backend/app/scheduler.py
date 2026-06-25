@@ -1,6 +1,6 @@
 """APScheduler: runs the two pipeline stages on configurable intervals."""
 from apscheduler.schedulers.background import BackgroundScheduler
-from . import core, pipeline
+from . import core, pipeline, tv
 
 _sched = BackgroundScheduler(daemon=True)
 
@@ -8,15 +8,23 @@ _sched = BackgroundScheduler(daemon=True)
 def _search_job():
     try:
         cfg = core.load_config()
-        pipeline.scan(cfg)
-        pipeline.stage_search(cfg)
+        if cfg.get("scope_films", True):
+            pipeline.scan(cfg)
+            pipeline.stage_search(cfg)
+        if cfg.get("scope_series"):
+            tv.scan(cfg)
+            tv.stage_search(cfg)
     except Exception as e:
         core.log(f"search_job error: {e}")
 
 
 def _finish_job():
     try:
-        pipeline.stage_finish()
+        cfg = core.load_config()
+        if cfg.get("scope_films", True):
+            pipeline.stage_finish(cfg)
+        if cfg.get("scope_series"):
+            tv.stage_finish(cfg)
     except Exception as e:
         core.log(f"finish_job error: {e}")
 

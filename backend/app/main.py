@@ -14,6 +14,7 @@ STATIC = os.environ.get("VO_STATIC", "/app/static")
 @app.on_event("startup")
 def _startup():
     core.init_db()
+    core.init_tv()
     scheduler.start()
 
 
@@ -124,6 +125,33 @@ def ignore(tmdb_id: int):
 @api.get("/logs")
 def logs():
     return {"lines": core.tail_log()}
+
+
+# ----- series (Sonarr) -----
+@api.get("/tv/status")
+def tv_status():
+    return {"counts": core.ep_status_counts()}
+
+
+@api.get("/tv/episodes")
+def tv_episodes(status: str | None = None):
+    return core.get_episodes(status)
+
+
+@api.post("/tv/scan")
+def tv_scan():
+    from . import tv
+    return {"found": tv.scan()}
+
+
+@api.post("/episode/{ep_id}/retry")
+def ep_retry(ep_id: str):
+    core.set_ep_status(ep_id, "pending", error=None); return {"ok": True}
+
+
+@api.post("/episode/{ep_id}/ignore")
+def ep_ignore(ep_id: str):
+    core.set_ep_status(ep_id, "ignored"); return {"ok": True}
 
 
 app.mount("/api", api)
