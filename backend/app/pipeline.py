@@ -108,22 +108,29 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
         results = pro.search(otitle, cfg["en_indexer_ids"])
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"search: {e}"); return
+    import json as _json
+    tried = set(_json.loads(mv.get("tried") or "[]"))
     cand = []
     for r in results:
         sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src)
         if sc is None:
             continue
-        cand.append((sc, r.get("seeders") or 0, r.get("title"), _pick_link(r)))
+        link = _pick_link(r)
+        rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        if rid in tried:                     # already rejected (didn't sync) — skip
+            continue
+        cand.append((sc, r.get("seeders") or 0, r.get("title"), link, rid))
     cand.sort(reverse=True)
     if not cand or cand[0][0] < cfg["score_threshold"] or cand[0][1] < cfg["min_seeders"]:
         core.set_status(tmdb_id, "no_release",
                         candidate_title=(cand[0][2] if cand else None),
                         candidate_score=(cand[0][0] if cand else 0))
-        core.log(f"search '{otitle}': no usable release (best={cand[0][0] if cand else 'none'})")
+        core.log(f"search '{otitle}': no usable release (best={cand[0][0] if cand else 'none'}, "
+                 f"{len(tried)} already tried)")
         return
-    sc, seeders, title, link = cand[0]
+    sc, seeders, title, link, rid = cand[0]
     core.set_status(tmdb_id, "grabbed", candidate_title=title,
-                    candidate_score=sc, candidate_seeders=seeders)
+                    candidate_score=sc, candidate_seeders=seeders, dl_id=rid)
     core.log(f"search '{otitle}': picked [{sc}] {seeders}s {title}")
     if do_grab:
         grab(tmdb_id, link, cfg)
@@ -146,6 +153,32 @@ def grab(tmdb_id, link, cfg=None):
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"grab: {e}")
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
+
+
+def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
+    """A grabbed release didn't sync. Blocklist it, delete its download, and re-search for
+    another release — or give up (sync_fail) after max_sync_retries."""
+    import json as _json
+    cfg = cfg or core.load_config()
+    mv = core.get_movie(tmdb_id)
+    tried = _json.loads(mv.get("tried") or "[]")
+    if mv.get("dl_id") and mv["dl_id"] not in tried:
+        tried.append(mv["dl_id"])
+    attempts = (mv.get("attempts") or 0) + 1
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        if mv.get("dl_hash"):
+            qb.delete([mv["dl_hash"]], delete_files=True)
+    except Exception:
+        pass
+    if attempts >= cfg.get("max_sync_retries", 4):
+        core.set_status(tmdb_id, "sync_fail", tried=_json.dumps(tried), attempts=attempts,
+                        sync_delta=delta, error=f"{reason}; no compatible release after {attempts} tries")
+        core.log(f"merge {tmdb_id}: giving up after {attempts} tries ({reason})")
+    else:
+        core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
+                        dl_hash=None, dl_id=None, en_file=None, error=None)
+        core.log(f"merge {tmdb_id}: {reason} -> trying another release (attempt {attempts}/{cfg.get('max_sync_retries',4)})")
 
 
 # ---------------------------------------------------------------- PROBE (local bins)
@@ -237,9 +270,7 @@ def merge_movie(tmdb_id, cfg=None):
     # only a real framerate mismatch (>3%, e.g. 25 vs 23.976 PAL speedup) can't be fixed
     # by a constant offset; 23.976 vs 24.0 (NTSC rounding) is fine.
     if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
-        core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
-                        error=f"framerate differs ({ei['fps']} vs {fi['fps']}) — needs re-encode")
-        core.log(f"merge {tmdb_id}: SYNC FAIL fps {ei['fps']} vs {fi['fps']}")
+        reject_and_retry(tmdb_id, f"framerate differs ({ei['fps']} vs {fi['fps']})", cfg, delta)
         return
     # keep the better video; the other source donates its audio
     eq, fq = _video_quality(en, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -275,9 +306,7 @@ def merge_movie(tmdb_id, cfg=None):
             core.log(f"merge {tmdb_id}: auto-sync inconclusive (best conf {conf:.2f})")
     # couldn't confirm alignment AND runtimes differ a lot -> almost certainly a different cut
     if not aligned and delta > cfg["sync_tolerance_s"]:
-        core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
-                        error=f"couldn't auto-align (Δ{delta:.1f}s — likely a different cut/edit)")
-        core.log(f"merge {tmdb_id}: SYNC FAIL couldn't align Δ={delta:.2f}s")
+        reject_and_retry(tmdb_id, f"couldn't align (Δ{delta:.1f}s, likely different cut)", cfg, delta)
         return
     core.set_status(tmdb_id, "merging", sync_delta=delta)
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv

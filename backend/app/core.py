@@ -42,6 +42,7 @@ DEFAULTS = {
     "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
     "exclude_french_origin": True,
     "sync_tolerance_s": 2.0,
+    "max_sync_retries": 4,                 # try this many different releases before giving up
     "auto_sync": True,                     # auto-detect & correct constant A/V offset
     "auto_sync_min_conf": 0.2,             # min AUDIO cross-correlation confidence
     "sync_video_min_conf": 0.4,            # min VIDEO (scene-cut) confidence; video is primary
@@ -123,8 +124,19 @@ def init_db():
             sync_delta REAL,             -- duration delta base<->donor at merge time
             sync_offset_ms INTEGER DEFAULT 0,  -- manual override
             error TEXT,
-            updated REAL
+            updated REAL,
+            dl_id TEXT,                  -- identity (infohash) of the current release
+            tried TEXT,                  -- JSON list of release identities already rejected
+            attempts INTEGER DEFAULT 0
         )""")
+        _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0"})
+
+
+def _ensure_cols(c, table, cols):
+    have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+    for col, decl in cols.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 def init_tv():
@@ -140,7 +152,9 @@ def init_tv():
             dl_hash TEXT,                    -- qB torrent (shared across a season pack)
             en_file TEXT, merged_file TEXT,
             sync_offset_ms INTEGER DEFAULT 0, sync_delta REAL,
-            error TEXT, updated REAL )""")
+            error TEXT, updated REAL,
+            dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
+        _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0"})
 
 
 def upsert_episode(e: dict):

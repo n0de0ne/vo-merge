@@ -118,6 +118,13 @@ class QBittorrent:
         except Exception:
             return {"raw": r.text}    # older qB returns "Ok."
 
+    def delete(self, hashes, delete_files=True):
+        if not hashes:
+            return
+        self.s.post(f"{self.url}/api/v2/torrents/delete",
+                    data={"hashes": "|".join(hashes), "deleteFiles": str(delete_files).lower()},
+                    headers={"Referer": self.url}, timeout=30)
+
     def torrents(self, category=None):
         p = {"category": category} if category else {}
         return self.s.get(f"{self.url}/api/v2/torrents/info", params=p, timeout=30).json()
