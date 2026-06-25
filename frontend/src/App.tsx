@@ -1,54 +1,74 @@
 import { useEffect, useRef, useState } from "react";
 import { api, Movie, Status } from "./api";
 
-// ---------------- Sync Editor (one player w/ synced sound + waveform aid) ----------------
+// ---------------- Sync Editor (stable video + Web Audio live offset + waveform) ----------------
 function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
-  const [videoUrl, setVideoUrl] = useState("");
-  const [meta, setMeta] = useState({ start: 0, fps: 23.976, duration: 20 });
+  const [d, setD] = useState<{ video: string; audio: string; start: number; fps: number; duration: number } | null>(null);
   const [offset, setOffset] = useState(movie.sync_offset_ms || 0);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const [vt, setVt] = useState(0);
+  const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("rendering preview…");
+  const [msg, setMsg] = useState("loading preview…");
   const v = useRef<HTMLVideoElement>(null);
   const cv = useRef<HTMLCanvasElement>(null);
-  const savedT = useRef(0);
-  const decoded = useRef(false);
-  const fps = meta.fps, dur = meta.duration;
+  const ctxRef = useRef<AudioContext | null>(null);
+  const bufRef = useRef<AudioBuffer | null>(null);
+  const srcRef = useRef<AudioBufferSourceNode | null>(null);
+  const offRef = useRef(offset);
+  offRef.current = offset;
+  const fps = d?.fps || 23.976, dur = d?.duration || 20;
 
-  async function regen(off: number) {
-    setMsg("rendering preview…");
-    try {
-      const d = await api.preview(movie.tmdb_id, "eng", -1, off);
-      setMeta({ start: d.start, fps: d.fps, duration: d.duration });
-      setVideoUrl(d.video); setMsg("");
-      if (!decoded.current) {                       // waveform: decode raw audio once
-        decoded.current = true;
-        const buf = await (await fetch(d.audio)).arrayBuffer();
+  useEffect(() => {                                  // load once — never re-rendered after
+    (async () => {
+      try {
+        const dd = await api.preview(movie.tmdb_id, "eng"); setD(dd); setMsg("decoding audio…");
+        const buf = await (await fetch(dd.audio)).arrayBuffer();
         const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
         const ab = await ac.decodeAudioData(buf);
+        ctxRef.current = ac; bufRef.current = ab;
         const ch = ab.getChannelData(0), W = 1200, block = Math.max(1, Math.floor(ch.length / W)), pk: number[] = [];
         for (let i = 0; i < W; i++) { let m = 0; for (let j = 0; j < block; j++) { const a = Math.abs(ch[i * block + j] || 0); if (a > m) m = a; } pk.push(m); }
-        setPeaks(pk); ac.close();
-      }
-    } catch (e: any) { setMsg("preview failed: " + e.message); }
-  }
-  useEffect(() => { regen(offset); /* eslint-disable-next-line */ }, []);       // mount
-  // debounce: re-render the clip's sound when the offset settles
-  useEffect(() => {
-    if (!decoded.current) return;
-    const h = setTimeout(() => regen(offset), 500);
-    return () => clearTimeout(h);
+        setPeaks(pk); setMsg("");
+      } catch (e: any) { setMsg("preview failed: " + e.message); }
+    })();
+    return () => { try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {} };
     /* eslint-disable-next-line */
-  }, [offset]);
+  }, []);
 
+  // (re)start the Web Audio source aligned to the video at the current offset (no reload)
+  function startAudio() {
+    const ac = ctxRef.current, ab = bufRef.current, vv = v.current;
+    if (!ac || !ab || !vv) return;
+    try { srcRef.current?.stop(); } catch {}
+    ac.resume();
+    const s = ac.createBufferSource(); s.buffer = ab; s.connect(ac.destination); s.loop = false;
+    const pos = vv.currentTime - offRef.current / 1000;     // audio position for this frame
+    if (pos >= 0 && pos < ab.duration) s.start(0, pos); else s.start(0, 0);
+    srcRef.current = s;
+  }
+  function stopAudio() { try { srcRef.current?.stop(); } catch {} srcRef.current = null; }
+
+  // video drives everything; audio follows. Re-align on play/seek/loop and offset change.
   useEffect(() => {
-    let raf = 0; const tick = () => { if (v.current) setVt(v.current.currentTime); raf = requestAnimationFrame(tick); };
+    const vv = v.current; if (!vv) return;
+    const onPlay = () => { setPlaying(true); startAudio(); };
+    const onPause = () => { setPlaying(false); stopAudio(); };
+    const onSeek = () => { if (!vv.paused) startAudio(); };
+    vv.addEventListener("play", onPlay); vv.addEventListener("pause", onPause); vv.addEventListener("seeked", onSeek);
+    return () => { vv.removeEventListener("play", onPlay); vv.removeEventListener("pause", onPause); vv.removeEventListener("seeked", onSeek); };
+  }, [d]);
+  useEffect(() => { if (playing) startAudio(); /* eslint-disable-next-line */ }, [offset]); // live offset, no reload
+
+  useEffect(() => {                                  // track time + correct audio drift / loop
+    let raf = 0; const tick = () => {
+      const vv = v.current; if (vv) { setVt(vv.currentTime); }
+      raf = requestAnimationFrame(tick);
+    };
     raf = requestAnimationFrame(tick); return () => cancelAnimationFrame(raf);
   }, []);
 
-  // waveform (shifted by offset) + playhead at the video frame
-  useEffect(() => {
+  useEffect(() => {                                  // waveform shifted by offset + playhead
     const c = cv.current; if (!c || !peaks) return;
     const ctx = c.getContext("2d")!, W = c.width, H = c.height;
     ctx.fillStyle = "#0c0f14"; ctx.fillRect(0, 0, W, H);
@@ -60,47 +80,43 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
 
   const frame = Math.round(1000 / fps);
   const step = (df: number) => { const vv = v.current; if (vv) { vv.pause(); vv.currentTime = Math.max(0, vv.currentTime + df / 1000); } };
-  async function apply() { setBusy(true); try { await api.applyOffset(movie.tmdb_id, offset, "eng"); onClose(); } finally { setBusy(false); } }
+  async function apply() { setBusy(true); stopAudio(); try { await api.applyOffset(movie.tmdb_id, offset, "eng"); onClose(); } finally { setBusy(false); } }
 
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={e => e.stopPropagation()} style={{ width: "min(900px,94vw)" }}>
         <div className="row"><b>Tune sync — {movie.title}</b><div className="spacer" />
           <button className="btn sec" onClick={onClose}>✕</button></div>
-        <p className="muted">The clip plays <b>with the offset applied</b> (sound in sync). For precision: step to the
-          <b> moment of impact</b> and slide until the audio <b>spike</b> sits under the red playhead. Sound too early →
-          spike is <b>left</b> of the line → push toward <b>+</b>.</p>
-        <div style={{ position: "relative" }}>
-          {videoUrl
-            ? <video key={videoUrl} ref={v} src={videoUrl} autoPlay loop controls playsInline
-                onLoadedMetadata={() => { if (v.current) v.current.currentTime = savedT.current; }}
-                onTimeUpdate={() => { if (v.current) savedT.current = v.current.currentTime; }}
-                style={{ width: "100%", maxHeight: "46vh", borderRadius: 8, background: "#000" }} />
-            : <div style={{ height: 260 }} className="muted">loading…</div>}
-          {msg && <div style={{ position: "absolute", top: 8, left: 10 }} className="muted">{msg}</div>}
-        </div>
-        <canvas ref={cv} width={1200} height={110}
-          style={{ width: "100%", height: 110, borderRadius: 8, marginTop: 10, border: "1px solid var(--border)" }} />
-        <div className="row" style={{ margin: "6px 0 12px" }}>
-          <span className="muted">video:</span>
-          <button className="btn sec" onClick={() => step(-frame)}>◀ frame</button>
-          <button className="btn sec" onClick={() => step(frame)}>frame ▶</button>
-          <span className="muted">@ {(meta.start + vt).toFixed(2)}s</span>
-        </div>
-        <div className="row" style={{ marginBottom: 10 }}>
-          <button className="btn sec" onClick={() => setOffset(o => o - frame)}>−1 frame</button>
-          <button className="btn sec" onClick={() => setOffset(o => o - 5)}>−5ms</button>
-          <input type="range" min={-1500} max={1500} step={1} value={offset}
-            onChange={e => setOffset(Number(e.target.value))} style={{ flex: 1 }} />
-          <button className="btn sec" onClick={() => setOffset(o => o + 5)}>+5ms</button>
-          <button className="btn sec" onClick={() => setOffset(o => o + frame)}>+1 frame</button>
-        </div>
-        <div className="row">
-          <b style={{ width: 110 }}>{offset >= 0 ? "+" : ""}{offset} ms</b>
-          <span className="muted">{offset >= 0 ? "audio later" : "audio earlier"} · 1 frame ≈ {frame}ms</span>
-          <div className="spacer" />
-          <button className="btn" disabled={busy} onClick={apply}>Apply {offset >= 0 ? "+" : ""}{offset}ms</button>
-        </div>
+        <p className="muted">Press play — the English audio plays through the slider <b>live</b> (the video never reloads).
+          For precision: step to the <b>moment of impact</b> and slide until the audio <b>spike</b> sits under the red
+          playhead. Sound too early → spike is <b>left</b> of the line → push toward <b>+</b>.</p>
+        {msg && <div className="muted">{msg}</div>}
+        {d && <>
+          <video ref={v} src={d.video} muted loop playsInline controls
+            style={{ width: "100%", maxHeight: "46vh", borderRadius: 8, background: "#000" }} />
+          <canvas ref={cv} width={1200} height={110}
+            style={{ width: "100%", height: 110, borderRadius: 8, marginTop: 10, border: "1px solid var(--border)" }} />
+          <div className="row" style={{ margin: "6px 0 12px" }}>
+            <span className="muted">video:</span>
+            <button className="btn sec" onClick={() => step(-frame)}>◀ frame</button>
+            <button className="btn sec" onClick={() => step(frame)}>frame ▶</button>
+            <span className="muted">@ {(d.start + vt).toFixed(2)}s</span>
+          </div>
+          <div className="row" style={{ marginBottom: 10 }}>
+            <button className="btn sec" onClick={() => setOffset(o => o - frame)}>−1 frame</button>
+            <button className="btn sec" onClick={() => setOffset(o => o - 5)}>−5ms</button>
+            <input type="range" min={-1500} max={1500} step={1} value={offset}
+              onChange={e => setOffset(Number(e.target.value))} style={{ flex: 1 }} />
+            <button className="btn sec" onClick={() => setOffset(o => o + 5)}>+5ms</button>
+            <button className="btn sec" onClick={() => setOffset(o => o + frame)}>+1 frame</button>
+          </div>
+          <div className="row">
+            <b style={{ width: 110 }}>{offset >= 0 ? "+" : ""}{offset} ms</b>
+            <span className="muted">{offset >= 0 ? "audio later" : "audio earlier"} · 1 frame ≈ {frame}ms</span>
+            <div className="spacer" />
+            <button className="btn" disabled={busy} onClick={apply}>Apply {offset >= 0 ? "+" : ""}{offset}ms</button>
+          </div>
+        </>}
       </div>
     </div>
   );

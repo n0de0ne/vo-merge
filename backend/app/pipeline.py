@@ -360,18 +360,23 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
                             error=f"resync: no confident alignment ({conf:.2f}) — set offset manually")
             return
         offset_ms = int(round(m))
-    # global track id of the track to shift (the shift_ai-th audio track)
+    # shift EVERY audio track of that language (a release can carry 2+, e.g. 5.1 + 2.0)
     j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True).stdout)
-    aud_ids = [t["id"] for t in j["tracks"] if t["type"] == "audio"]
-    sid = aud_ids[shift_ai]
+    shift_ids = [t["id"] for t in j["tracks"]
+                 if t["type"] == "audio" and (t["properties"].get("language") or "").lower().startswith(shift_pfx)]
+    if not shift_ids:
+        core.set_status(tmdb_id, "error", error=f"resync: no {shift_pfx} track"); return
     out = f + ".resync.mkv"
-    r = subprocess.run(["mkvmerge", "-o", out, "--sync", f"{sid}:{offset_ms:+d}", f],
-                       capture_output=True, text=True)
+    cmd = ["mkvmerge", "-o", out]
+    for sid in shift_ids:
+        cmd += ["--sync", f"{sid}:{offset_ms:+d}"]
+    cmd += [f]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):
         core.set_status(tmdb_id, "error", error=f"resync mkvmerge rc={r.returncode}"); return
     shutil.move(out, f)
     core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
-    core.log(f"resync {tmdb_id}: shifted {shift_pfx} track {offset_ms:+d}ms")
+    core.log(f"resync {tmdb_id}: shifted {len(shift_ids)} {shift_pfx} track(s) {offset_ms:+d}ms")
     try:
         plex_dir = os.path.dirname(f).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
         Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
