@@ -262,16 +262,32 @@ def merge_movie(tmdb_id, cfg=None):
     # (shared music/SFX cross-correlation) unless a manual offset was set. Applied to the
     # added tracks so they line up with the base video.
     if not offset and cfg.get("auto_sync", True):
+        ws, wd = cfg.get("sync_window_start", 300), cfg.get("sync_window_dur", 600)
+        m, conf, method = None, 0.0, None
+        # PRIMARY: video scene-cut alignment (language-independent, most reliable)
         try:
-            from .offdet import detect_offset_ms
-            m, conf = detect_offset_ms(base, 0, donor, daidx[ids[0]])
-            if m is not None and abs(m) >= 40 and conf >= cfg.get("auto_sync_min_conf", 0.2):
-                offset = int(round(m))
-                core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms (conf {conf:.2f})")
-            elif m is not None:
-                core.log(f"merge {tmdb_id}: auto-sync skipped ({m:+.0f}ms conf {conf:.2f})")
+            from .offdet_video import detect_offset_video_ms
+            vm, vc = detect_offset_video_ms(base, donor, start=ws, dur=wd)
+            if vm is not None and vc >= cfg.get("sync_video_min_conf", 0.4):
+                m, conf, method = vm, vc, "video"
         except Exception as e:
-            core.log(f"merge {tmdb_id}: auto-sync error: {e}")
+            core.log(f"merge {tmdb_id}: video sync error: {e}")
+        # FALLBACK: audio music/SFX cross-correlation
+        if m is None:
+            try:
+                from .offdet import detect_offset_ms
+                am, ac = detect_offset_ms(base, 0, donor, daidx[ids[0]], start=ws, dur=wd)
+                if am is not None and ac >= cfg.get("auto_sync_min_conf", 0.2):
+                    m, conf, method = am, ac, "audio"
+            except Exception as e:
+                core.log(f"merge {tmdb_id}: audio sync error: {e}")
+        if m is not None and abs(m) >= 40:
+            offset = int(round(m))
+            core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms ({method} conf {conf:.2f})")
+        elif m is not None:
+            core.log(f"merge {tmdb_id}: in sync ({m:+.0f}ms {method} conf {conf:.2f})")
+        else:
+            core.log(f"merge {tmdb_id}: auto-sync inconclusive — merging unshifted")
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"

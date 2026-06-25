@@ -36,7 +36,10 @@ DEFAULTS = {
     "exclude_french_origin": True,
     "sync_tolerance_s": 2.0,
     "auto_sync": True,                     # auto-detect & correct constant A/V offset
-    "auto_sync_min_conf": 0.2,             # min cross-correlation confidence to trust it
+    "auto_sync_min_conf": 0.2,             # min AUDIO cross-correlation confidence
+    "sync_video_min_conf": 0.4,            # min VIDEO (scene-cut) confidence; video is primary
+    "sync_window_start": 300,              # seconds into the film to start the analysis window
+    "sync_window_dur": 600,                # analysis window length (s)
     "search_interval_min": 60,
     "finish_interval_min": 10,
     "enabled": False,                      # master switch; off until configured
