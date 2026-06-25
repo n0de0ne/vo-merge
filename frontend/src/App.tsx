@@ -70,6 +70,8 @@ function Dashboard() {
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.retry(m.tmdb_id))}>Retry</button>}
                   {m.status === "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-sync</button>}
+                  {m.status === "sync_fail" &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-try sync</button>}
                   {m.status !== "ignored" && m.status !== "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>}
                 </div></td>
@@ -89,24 +91,29 @@ function SyncFailures() {
   const [busy, setBusy] = useState(false);
   async function refresh() { setMovies(await api.movies("sync_fail")); }
   useEffect(() => { refresh(); }, []);
-  async function apply(id: number) {
+  async function run(id: number, ms: number) {
     setBusy(true);
-    try { await api.sync(id, parseInt(offset[id] || "0", 10) || 0); } finally { setBusy(false); refresh(); }
+    try { await api.sync(id, ms); } finally { setBusy(false); refresh(); }
   }
   return (
     <div className="panel">
-      <p className="muted">Releases whose runtime/framerate didn't match the French file. Enter a
-        millisecond offset to shift the added French track (+ delays it, − advances it), then re-merge.</p>
+      <p className="muted">Releases the matcher couldn't align (framerate differs, or a likely different
+        cut). <b>Auto-match</b> re-runs the video scene-cut matcher (it can rescue runtime-delta cases);
+        or enter a manual ms offset (+ delays the added track, − advances it) and apply.</p>
       <table>
-        <thead><tr><th>Title</th><th>Δ duration</th><th>Offset (ms)</th><th></th></tr></thead>
+        <thead><tr><th>Title</th><th>Δ / reason</th><th>Offset (ms)</th><th></th></tr></thead>
         <tbody>
           {movies.map(m => (
             <tr key={m.tmdb_id}>
               <td>{m.title}<div className="sub">{m.original_title} ({m.year})</div></td>
-              <td>{m.sync_delta != null ? m.sync_delta.toFixed(2) + "s" : "—"}</td>
+              <td>{m.sync_delta != null ? "Δ " + m.sync_delta.toFixed(2) + "s" : "—"}
+                {m.error && <div className="sub bad">{m.error}</div>}</td>
               <td><input className="sync" type="number" value={offset[m.tmdb_id] ?? ""}
                 placeholder="0" onChange={e => setOffset({ ...offset, [m.tmdb_id]: e.target.value })} /></td>
-              <td><button className="btn" disabled={busy} onClick={() => apply(m.tmdb_id)}>Apply &amp; re-merge</button></td>
+              <td><div className="row">
+                <button className="btn" disabled={busy} onClick={() => run(m.tmdb_id, 0)}>Auto-match</button>
+                <button className="btn sec" disabled={busy} onClick={() => run(m.tmdb_id, parseInt(offset[m.tmdb_id] || "0", 10) || 0)}>Apply offset</button>
+              </div></td>
             </tr>
           ))}
           {movies.length === 0 && <tr><td colSpan={4} className="muted">No sync failures 🎉</td></tr>}

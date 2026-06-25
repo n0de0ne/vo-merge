@@ -232,14 +232,13 @@ def merge_movie(tmdb_id, cfg=None):
     ei, fi = probe(en), probe(fr)
     if not ei or not fi:
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
-    # sync gate (duration + framerate)
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = mv.get("sync_offset_ms") or 0
-    sync_ok = (ei["dur"] and fi["dur"] and (delta <= cfg["sync_tolerance_s"] or offset)
-               and (ei["fps"] == fi["fps"] or offset))
-    if not sync_ok:
-        core.set_status(tmdb_id, "sync_fail", sync_delta=delta)
-        core.log(f"merge {tmdb_id}: SYNC FAIL Δ={delta:.2f}s fps {ei['fps']} vs {fi['fps']}")
+    # a framerate mismatch can't be corrected by a constant offset (would need re-encode)
+    if not offset and ei["fps"] and fi["fps"] and ei["fps"] != fi["fps"]:
+        core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
+                        error=f"framerate differs ({ei['fps']} vs {fi['fps']}) — needs re-encode")
+        core.log(f"merge {tmdb_id}: SYNC FAIL fps {ei['fps']} vs {fi['fps']}")
         return
     # keep the better video; the other source donates its audio
     eq, fq = _video_quality(en, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -247,7 +246,6 @@ def merge_movie(tmdb_id, cfg=None):
         base, bi, donor, di, who = fr, fi, en, ei, "FR"
     else:
         base, bi, donor, di, who = en, ei, fr, fi, "EN"
-    core.set_status(tmdb_id, "merging", sync_delta=delta)
     have = {a["lang"] for a in bi["auds"]}
     ids, langs, daidx = [], {}, {}
     for ix, a in enumerate(di["auds"]):
@@ -258,9 +256,10 @@ def merge_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error="merge: no English audio in either file"); return
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
-    # auto-detect the constant A/V offset between base video's audio and the donor track
-    # (shared music/SFX cross-correlation) unless a manual offset was set. Applied to the
-    # added tracks so they line up with the base video.
+    # Detect the constant A/V offset (video scene-cut match primary, audio fallback) unless a
+    # manual offset was given. A confident match means the content lines up even if runtimes
+    # differ (different intro); inability to align on a big runtime delta = a different cut.
+    aligned = bool(offset)
     if not offset and cfg.get("auto_sync", True):
         ws, wd = cfg.get("sync_window_start", 300), cfg.get("sync_window_dur", 600)
         m, conf, method = None, 0.0, None
@@ -285,13 +284,22 @@ def merge_movie(tmdb_id, cfg=None):
                     m, conf, method = am, ac, "audio"
             except Exception as e:
                 core.log(f"merge {tmdb_id}: audio sync error: {e}")
-        if m is not None and abs(m) >= 40:
-            offset = int(round(m))
-            core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms ({method} conf {conf:.2f})")
-        elif m is not None:
-            core.log(f"merge {tmdb_id}: in sync ({m:+.0f}ms {method} conf {conf:.2f})")
+        if m is not None:
+            aligned = True
+            if abs(m) >= 40:
+                offset = int(round(m))
+                core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms ({method} conf {conf:.2f})")
+            else:
+                core.log(f"merge {tmdb_id}: already aligned ({m:+.0f}ms {method} conf {conf:.2f})")
         else:
-            core.log(f"merge {tmdb_id}: auto-sync inconclusive — merging unshifted")
+            core.log(f"merge {tmdb_id}: auto-sync inconclusive")
+    # couldn't confirm alignment AND runtimes differ a lot -> almost certainly a different cut
+    if not aligned and delta > cfg["sync_tolerance_s"]:
+        core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
+                        error=f"couldn't auto-align (Δ{delta:.1f}s — likely a different cut/edit)")
+        core.log(f"merge {tmdb_id}: SYNC FAIL couldn't align Δ={delta:.2f}s")
+        return
+    core.set_status(tmdb_id, "merging", sync_delta=delta)
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"

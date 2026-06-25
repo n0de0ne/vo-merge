@@ -98,8 +98,16 @@ class SyncIn(BaseModel):
 
 @api.post("/movie/{tmdb_id}/sync")
 def set_sync(tmdb_id: int, body: SyncIn):
-    # offset_ms == 0  -> auto-detect & correct; nonzero -> apply that manual offset
-    pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms or None)
+    mv = core.get_movie(tmdb_id)
+    if mv and mv.get("status") == "merged" and mv.get("merged_file"):
+        # already merged -> shift the English track in place (offset 0 = auto-detect)
+        pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms or None)
+    else:
+        # not merged (sync_fail/error) -> re-attempt the merge; manual offset if given,
+        # otherwise the video scene-cut matcher tries to align it.
+        core.set_status(tmdb_id, mv["status"] if mv else "pending",
+                        sync_offset_ms=(body.offset_ms or 0), error=None)
+        pipeline.merge_movie(tmdb_id)
     return core.get_movie(tmdb_id)
 
 
