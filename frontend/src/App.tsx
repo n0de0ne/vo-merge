@@ -1,41 +1,32 @@
 import { useEffect, useRef, useState } from "react";
 import { api, Movie, Status } from "./api";
 
-// ---------------- Sync Editor (live preview + offset) ----------------
+// ---------------- Sync Editor (preview with the offset baked in, so sound works) ----------------
 function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
-  const [data, setData] = useState<{ video: string; audio: string; start: number; fps: number } | null>(null);
+  const [url, setUrl] = useState("");
+  const [fps, setFps] = useState(23.976);
   const [offset, setOffset] = useState(movie.sync_offset_ms || 0);
   const [start, setStart] = useState(-1);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("loading preview…");
-  const v = useRef<HTMLVideoElement>(null);
-  const a = useRef<HTMLAudioElement>(null);
-  const fps = data?.fps || 23.976;
+  const [msg, setMsg] = useState("generating preview…");
+  const seq = useRef(0);
 
-  async function load(t: number) {
-    setMsg("generating preview…"); setData(null);
-    try { const d = await api.preview(movie.tmdb_id, "eng", t); setData(d); setMsg(""); }
-    catch (e: any) { setMsg("preview failed: " + e.message); }
+  async function regen(off: number, t: number) {
+    const id = ++seq.current;
+    setMsg("rendering preview…");
+    try {
+      const d = await api.preview(movie.tmdb_id, "eng", t, off);
+      if (id !== seq.current) return;                 // a newer request superseded this one
+      setFps(d.fps); setUrl(d.video); setMsg("");
+    } catch (e: any) { setMsg("preview failed: " + e.message); }
   }
-  useEffect(() => { load(start); /* eslint-disable-next-line */ }, [start]);
-
-  // keep the audio shifted from the picture by `offset` ms (positive = audio later)
+  // (re)generate when offset (debounced) or segment changes
   useEffect(() => {
-    let raf = 0;
-    const tick = () => {
-      const vid = v.current, aud = a.current;
-      if (vid && aud && !vid.paused) {
-        const target = vid.currentTime - offset / 1000;
-        if (Math.abs(aud.currentTime - target) > 0.06) aud.currentTime = Math.max(0, target);
-        if (aud.paused) aud.play().catch(() => {});
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [offset, data]);
+    const h = setTimeout(() => regen(offset, start), 350);
+    return () => clearTimeout(h);
+    /* eslint-disable-next-line */
+  }, [offset, start]);
 
-  function playBoth() { v.current?.play(); a.current?.play().catch(() => {}); }
   const frame = Math.round(1000 / fps);
   async function apply() {
     setBusy(true);
@@ -48,28 +39,31 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
       <div className="modal" onClick={e => e.stopPropagation()}>
         <div className="row"><b>Tune sync — {movie.title}</b><div className="spacer" />
           <button className="btn sec" onClick={onClose}>✕</button></div>
-        {msg && <p className="muted">{msg}</p>}
-        {data && <>
-          <video ref={v} src={data.video} muted loop playsInline controls
-            style={{ width: "100%", borderRadius: 8, background: "#000" }} onPlay={playBoth} />
-          <audio ref={a} src={data.audio} loop />
-          <div className="row" style={{ margin: "12px 0" }}>
-            <button className="btn sec" onClick={() => setOffset(o => o - frame)}>−1 frame</button>
-            <button className="btn sec" onClick={() => setOffset(o => o - 10)}>−10ms</button>
-            <input type="range" min={-1500} max={1500} step={1} value={offset}
-              onChange={e => setOffset(Number(e.target.value))} style={{ flex: 1 }} />
-            <button className="btn sec" onClick={() => setOffset(o => o + 10)}>+10ms</button>
-            <button className="btn sec" onClick={() => setOffset(o => o + frame)}>+1 frame</button>
-          </div>
-          <div className="row">
-            <b style={{ width: 120 }}>{offset >= 0 ? "+" : ""}{offset} ms</b>
-            <span className="muted">English audio {offset >= 0 ? "delayed (later)" : "advanced (earlier)"} ·
-              negative = earlier, positive = later. It's "too early" → increase toward +.</span>
-            <div className="spacer" />
-            <button className="btn sec" onClick={() => setStart(s => (s < 0 ? (data.start + 60) : s + 60))}>Jump +60s</button>
-            <button className="btn" disabled={busy} onClick={apply}>Apply {offset >= 0 ? "+" : ""}{offset}ms</button>
-          </div>
-        </>}
+        <p className="muted">Set an offset → the clip re-renders with it baked in (plays with sound).
+          English "too early" → nudge toward <b>+</b> until lips match, then Apply.</p>
+        <div style={{ position: "relative" }}>
+          {url
+            ? <video key={url} src={url} autoPlay loop controls playsInline
+                style={{ width: "100%", borderRadius: 8, background: "#000" }} />
+            : <div style={{ height: 280, display: "flex", alignItems: "center", justifyContent: "center" }}
+                className="muted">no preview</div>}
+          {msg && <div style={{ position: "absolute", top: 8, left: 10 }} className="muted">{msg}</div>}
+        </div>
+        <div className="row" style={{ margin: "12px 0" }}>
+          <button className="btn sec" onClick={() => setOffset(o => o - frame)}>−1 frame</button>
+          <button className="btn sec" onClick={() => setOffset(o => o - 10)}>−10ms</button>
+          <input type="range" min={-1500} max={1500} step={1} value={offset}
+            onChange={e => setOffset(Number(e.target.value))} style={{ flex: 1 }} />
+          <button className="btn sec" onClick={() => setOffset(o => o + 10)}>+10ms</button>
+          <button className="btn sec" onClick={() => setOffset(o => o + frame)}>+1 frame</button>
+        </div>
+        <div className="row">
+          <b style={{ width: 110 }}>{offset >= 0 ? "+" : ""}{offset} ms</b>
+          <span className="muted">{offset >= 0 ? "later" : "earlier"} · 1 frame ≈ {frame}ms</span>
+          <div className="spacer" />
+          <button className="btn sec" onClick={() => setStart(s => (s < 0 ? 660 : s + 60))}>Jump +60s</button>
+          <button className="btn" disabled={busy} onClick={apply}>Apply {offset >= 0 ? "+" : ""}{offset}ms</button>
+        </div>
       </div>
     </div>
   );
