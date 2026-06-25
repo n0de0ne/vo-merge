@@ -98,8 +98,8 @@ class SyncIn(BaseModel):
 
 @api.post("/movie/{tmdb_id}/sync")
 def set_sync(tmdb_id: int, body: SyncIn):
-    core.set_status(tmdb_id, "ready", sync_offset_ms=body.offset_ms)
-    pipeline.merge_movie(tmdb_id)
+    # offset_ms == 0  -> auto-detect & correct; nonzero -> apply that manual offset
+    pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms or None)
     return core.get_movie(tmdb_id)
 
 

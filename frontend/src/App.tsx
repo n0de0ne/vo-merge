@@ -68,6 +68,8 @@ function Dashboard() {
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Search</button>}
                   {["no_release","error"].includes(m.status) &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.retry(m.tmdb_id))}>Retry</button>}
+                  {m.status === "merged" &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-sync</button>}
                   {m.status !== "ignored" && m.status !== "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>}
                 </div></td>

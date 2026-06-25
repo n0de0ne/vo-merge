@@ -249,15 +249,29 @@ def merge_movie(tmdb_id, cfg=None):
         base, bi, donor, di, who = en, ei, fr, fi, "EN"
     core.set_status(tmdb_id, "merging", sync_delta=delta)
     have = {a["lang"] for a in bi["auds"]}
-    ids, langs = [], {}
-    for a in di["auds"]:
+    ids, langs, daidx = [], {}, {}
+    for ix, a in enumerate(di["auds"]):
         if a["lang"] == "und" or a["lang"] in have:
             continue
-        ids.append(a["id"]); langs[a["id"]] = a["lang"]; have.add(a["lang"])
+        ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
     if "eng" not in have:
         core.set_status(tmdb_id, "error", error="merge: no English audio in either file"); return
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
+    # auto-detect the constant A/V offset between base video's audio and the donor track
+    # (shared music/SFX cross-correlation) unless a manual offset was set. Applied to the
+    # added tracks so they line up with the base video.
+    if not offset and cfg.get("auto_sync", True):
+        try:
+            from .offdet import detect_offset_ms
+            m, conf = detect_offset_ms(base, 0, donor, daidx[ids[0]])
+            if m is not None and abs(m) >= 40 and conf >= cfg.get("auto_sync_min_conf", 0.2):
+                offset = int(round(m))
+                core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms (conf {conf:.2f})")
+            elif m is not None:
+                core.log(f"merge {tmdb_id}: auto-sync skipped ({m:+.0f}ms conf {conf:.2f})")
+        except Exception as e:
+            core.log(f"merge {tmdb_id}: auto-sync error: {e}")
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"
@@ -279,6 +293,47 @@ def merge_movie(tmdb_id, cfg=None):
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
              f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")
     finish_movie(tmdb_id, cfg)
+
+
+def resync_movie(tmdb_id, offset_ms=None, cfg=None):
+    """Re-time the English track inside the already-merged library file. offset_ms=None
+    auto-detects (English vs the base/French track); positive = English plays later.
+    Operates on the current file (no need for the original sources)."""
+    cfg = cfg or core.load_config()
+    mv = core.get_movie(tmdb_id)
+    f = mv.get("merged_file") or mv.get("french_path")
+    if not f or not os.path.exists(f):
+        core.set_status(tmdb_id, "error", error="resync: file not found"); return
+    from .offdet import audio_langs, detect_offset_ms
+    langs = audio_langs(f)
+    try:
+        ref = next(i for i, l in enumerate(langs) if l.startswith("fr"))
+        eng = next(i for i, l in enumerate(langs) if l.startswith("en"))
+    except StopIteration:
+        core.set_status(tmdb_id, "error", error="resync: need both fr+en tracks"); return
+    if not offset_ms:
+        m, conf = detect_offset_ms(f, ref, f, eng)
+        if m is None or conf < cfg.get("auto_sync_min_conf", 0.2):
+            core.set_status(tmdb_id, "sync_fail",
+                            error=f"resync: low confidence ({conf:.2f}) — set offset manually")
+            return
+        offset_ms = int(round(m))
+    j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True).stdout)
+    eng_id = next(t["id"] for t in j["tracks"]
+                  if t["type"] == "audio" and (t["properties"].get("language") or "").startswith("en"))
+    out = f + ".resync.mkv"
+    r = subprocess.run(["mkvmerge", "-o", out, "--sync", f"{eng_id}:{offset_ms:+d}", f],
+                       capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        core.set_status(tmdb_id, "error", error=f"resync mkvmerge rc={r.returncode}"); return
+    shutil.move(out, f)
+    core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
+    core.log(f"resync {tmdb_id}: applied {offset_ms:+d}ms to English track")
+    try:
+        plex_dir = os.path.dirname(f).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
+        Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
+    except Exception:
+        pass
 
 
 def finish_movie(tmdb_id, cfg=None):
