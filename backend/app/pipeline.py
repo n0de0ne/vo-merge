@@ -200,44 +200,69 @@ def _find_video(folder):
 
 
 # ---------------------------------------------------------------- MERGE + FINISH
+def _video_quality(path, dur):
+    """(height, video_bitrate) — to pick the better-looking source. mkv often omits
+    per-stream bitrate, so fall back to filesize/duration."""
+    h = _ffprobe(path, ["-select_streams", "v:0", "-show_entries", "stream=height",
+                        "-of", "default=nk=1:nw=1"])
+    br = _ffprobe(path, ["-select_streams", "v:0", "-show_entries", "stream=bit_rate",
+                         "-of", "default=nk=1:nw=1"])
+    try: h = int(h)
+    except Exception: h = 0
+    try: br = int(br)
+    except Exception: br = 0
+    if not br and dur:
+        try: br = int(os.path.getsize(path) * 8 / dur)
+        except Exception: br = 0
+    return (h, br)
+
+
 def merge_movie(tmdb_id, cfg=None):
-    """Base = downloaded English release; donor = existing FR file. Add FR/VO audio."""
+    """Combine the English release and the existing French file into one multi-language
+    file. The VIDEO is kept from whichever source has the better picture (higher
+    resolution, then bitrate); the other source contributes its audio. The output
+    replaces the library file IN PLACE (keeps its name, so Plex/Radarr paths stay valid)."""
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
     if not mv or not mv.get("en_file") or not mv.get("french_path"):
         core.set_status(tmdb_id, "error", error="merge: missing en_file or french_path"); return
-    base, donor = mv["en_file"], mv["french_path"]
-    if not (os.path.exists(base) and os.path.exists(donor)):
+    en, fr = mv["en_file"], mv["french_path"]
+    if not (os.path.exists(en) and os.path.exists(fr)):
         core.set_status(tmdb_id, "error", error="merge: file(s) not found on disk"); return
-    bi, di = probe(base), probe(donor)
-    if not bi or not di:
+    ei, fi = probe(en), probe(fr)
+    if not ei or not fi:
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
-    if not any(a["lang"] == "eng" for a in bi["auds"]):
-        core.set_status(tmdb_id, "error", error="merge: no English audio in base release"); return
-    delta = abs((di["dur"] or 0) - (bi["dur"] or 0))
+    # sync gate (duration + framerate)
+    delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = mv.get("sync_offset_ms") or 0
-    sync_ok = (di["dur"] and bi["dur"] and (delta <= cfg["sync_tolerance_s"] or offset)
-               and (di["fps"] == bi["fps"] or offset))
+    sync_ok = (ei["dur"] and fi["dur"] and (delta <= cfg["sync_tolerance_s"] or offset)
+               and (ei["fps"] == fi["fps"] or offset))
     if not sync_ok:
         core.set_status(tmdb_id, "sync_fail", sync_delta=delta)
-        core.log(f"merge {tmdb_id}: SYNC FAIL Δ={delta:.2f}s fps {di['fps']} vs {bi['fps']}")
+        core.log(f"merge {tmdb_id}: SYNC FAIL Δ={delta:.2f}s fps {ei['fps']} vs {fi['fps']}")
         return
+    # keep the better video; the other source donates its audio
+    eq, fq = _video_quality(en, ei["dur"]), _video_quality(fr, fi["dur"])
+    if fq >= eq:
+        base, bi, donor, di, who = fr, fi, en, ei, "FR"
+    else:
+        base, bi, donor, di, who = en, ei, fr, fi, "EN"
     core.set_status(tmdb_id, "merging", sync_delta=delta)
     have = {a["lang"] for a in bi["auds"]}
     ids, langs = [], {}
     for a in di["auds"]:
-        if a["lang"] in ("eng", "und") or a["lang"] in have:
+        if a["lang"] == "und" or a["lang"] in have:
             continue
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; have.add(a["lang"])
+    if "eng" not in have:
+        core.set_status(tmdb_id, "error", error="merge: no English audio in either file"); return
     if not ids:
-        core.set_status(tmdb_id, "error", error="merge: no new non-English tracks in FR file"); return
-    # write into the library folder (/media, rw) — /downloads is mounted read-only.
-    # Name the output after the DONOR (the existing library file) so it replaces it
-    # IN PLACE — keeping the path Plex/Radarr already know (no dead reference / rename).
-    # mkvmerge always outputs Matroska, so force a .mkv extension.
-    outdir = os.path.dirname(donor) + "/_merged"
+        core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
+    # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
+    libfile = mv["french_path"]
+    outdir = os.path.dirname(libfile) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, os.path.splitext(os.path.basename(donor))[0] + ".mkv")
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base,
            "--no-video", "--no-subtitles", "--no-chapters", "--no-buttons", "--no-track-tags",
            "--audio-tracks", ",".join(str(i) for i in ids)]
@@ -251,7 +276,8 @@ def merge_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
     core.set_status(tmdb_id, "merged", merged_file=out)
-    core.log(f"merge {tmdb_id}: OK added {[langs[i] for i in ids]} -> {out}")
+    core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
+             f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")
     finish_movie(tmdb_id, cfg)
 
 
