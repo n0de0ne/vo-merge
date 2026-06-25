@@ -154,8 +154,7 @@ def stage_search(cfg=None):
 # ------------------------------------------------------------------ FINISH (map + merge)
 def _merge_episode(ep, en_file, cfg):
     """Merge: keep better video, graft the other language's audio, replace FR file in place."""
-    from .offdet_video import detect_offset_video_ms
-    from .offdet import detect_offset_ms
+    from . import sync
     from .clients import Sonarr as _S
     fr = ep["french_path"]
     if not (os.path.exists(en_file) and os.path.exists(fr)):
@@ -164,7 +163,8 @@ def _merge_episode(ep, en_file, cfg):
     if not ei or not fi:
         core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
-    if ei["fps"] and fi["fps"] and ei["fps"] != fi["fps"]:
+    offset = ep.get("sync_offset_ms") or 0
+    if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
         core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
                            error=f"framerate differs ({ei['fps']} vs {fi['fps']})"); return
     eq, fq = _video_quality(en_file, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -177,29 +177,15 @@ def _merge_episode(ep, en_file, cfg):
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
     if "eng" not in have or not ids:
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
-    offset, aligned = ep.get("sync_offset_ms") or 0, bool(ep.get("sync_offset_ms"))
+    aligned = bool(offset)
     if not offset and cfg.get("auto_sync", True):
-        ws, wd = cfg.get("sync_window_start", 300), cfg.get("sync_window_dur", 600)
-        m = None
-        try:
-            vm, vc = detect_offset_video_ms(base, donor, start=ws, dur=wd,
-                threads=cfg.get("sync_ffmpeg_threads", 4), hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-                device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
-            if vm is not None and vc >= cfg.get("sync_video_min_conf", 0.4):
-                m = vm
-        except Exception:
-            pass
-        if m is None:
-            try:
-                am, ac = detect_offset_ms(base, 0, donor, daidx[ids[0]], start=ws, dur=wd)
-                if am is not None and ac >= cfg.get("auto_sync_min_conf", 0.2):
-                    m = am
-            except Exception:
-                pass
+        m, conf, method = sync.detect(base, donor, 0, daidx[ids[0]],
+                                      min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}")
         if m is not None:
             aligned = True
             if abs(m) >= 40:
                 offset = int(round(m))
+            core.log(f"tv sync {ep['id']}: {offset:+d}ms ({method} conf {conf:.2f})")
     if not aligned and delta > cfg["sync_tolerance_s"]:
         core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
                            error=f"couldn't align (Δ{delta:.1f}s)"); return

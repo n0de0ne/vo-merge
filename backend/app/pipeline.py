@@ -4,7 +4,7 @@
 Search & merge logic is ported verbatim from the validated dry-run scripts.
 """
 import json, os, re, subprocess, shutil
-from . import core
+from . import core, sync
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
@@ -234,8 +234,9 @@ def merge_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = mv.get("sync_offset_ms") or 0
-    # a framerate mismatch can't be corrected by a constant offset (would need re-encode)
-    if not offset and ei["fps"] and fi["fps"] and ei["fps"] != fi["fps"]:
+    # only a real framerate mismatch (>3%, e.g. 25 vs 23.976 PAL speedup) can't be fixed
+    # by a constant offset; 23.976 vs 24.0 (NTSC rounding) is fine.
+    if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
         core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
                         error=f"framerate differs ({ei['fps']} vs {fi['fps']}) — needs re-encode")
         core.log(f"merge {tmdb_id}: SYNC FAIL fps {ei['fps']} vs {fi['fps']}")
@@ -261,29 +262,8 @@ def merge_movie(tmdb_id, cfg=None):
     # differ (different intro); inability to align on a big runtime delta = a different cut.
     aligned = bool(offset)
     if not offset and cfg.get("auto_sync", True):
-        ws, wd = cfg.get("sync_window_start", 300), cfg.get("sync_window_dur", 600)
-        m, conf, method = None, 0.0, None
-        # PRIMARY: video scene-cut alignment (language-independent, most reliable)
-        try:
-            from .offdet_video import detect_offset_video_ms
-            vm, vc = detect_offset_video_ms(
-                base, donor, start=ws, dur=wd,
-                threads=cfg.get("sync_ffmpeg_threads", 4),
-                hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-                device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
-            if vm is not None and vc >= cfg.get("sync_video_min_conf", 0.4):
-                m, conf, method = vm, vc, "video"
-        except Exception as e:
-            core.log(f"merge {tmdb_id}: video sync error: {e}")
-        # FALLBACK: audio music/SFX cross-correlation
-        if m is None:
-            try:
-                from .offdet import detect_offset_ms
-                am, ac = detect_offset_ms(base, 0, donor, daidx[ids[0]], start=ws, dur=wd)
-                if am is not None and ac >= cfg.get("auto_sync_min_conf", 0.2):
-                    m, conf, method = am, ac, "audio"
-            except Exception as e:
-                core.log(f"merge {tmdb_id}: audio sync error: {e}")
+        m, conf, method = sync.detect(base, donor, 0, daidx[ids[0]],
+                                      min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}")
         if m is not None:
             aligned = True
             if abs(m) >= 40:
@@ -292,7 +272,7 @@ def merge_movie(tmdb_id, cfg=None):
             else:
                 core.log(f"merge {tmdb_id}: already aligned ({m:+.0f}ms {method} conf {conf:.2f})")
         else:
-            core.log(f"merge {tmdb_id}: auto-sync inconclusive")
+            core.log(f"merge {tmdb_id}: auto-sync inconclusive (best conf {conf:.2f})")
     # couldn't confirm alignment AND runtimes differ a lot -> almost certainly a different cut
     if not aligned and delta > cfg["sync_tolerance_s"]:
         core.set_status(tmdb_id, "sync_fail", sync_delta=delta,
