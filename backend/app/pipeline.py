@@ -88,7 +88,7 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src):
     if want_res and want_res.lower() in tl: sc += 60
     if want_src and re.search(want_src[:3], tl): sc += 30
     if idok: sc += 80
-    if re.search(r'\bMULTI\b', t, re.I): sc += 20
+    if re.search(r'\bMULTI\b', t, re.I): sc += 200   # MULTI = both langs, native sync -> strongly prefer
     return sc
 
 
@@ -105,7 +105,7 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
     try:
-        results = pro.search(otitle, cfg["en_indexer_ids"])
+        results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"search: {e}"); return
     import json as _json
@@ -250,6 +250,21 @@ def _video_quality(path, dur):
     return (h, br)
 
 
+def _place_multi(en, mv, cfg, tmdb_id):
+    """A MULTI download already carries both languages in native sync — remux to a clean
+    .mkv with the library name and place it directly. No merge, no offset, no drift."""
+    libfile = mv["french_path"]
+    outdir = os.path.dirname(libfile) + "/_merged"
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
+    r = subprocess.run(["mkvmerge", "-o", out, en], capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        core.set_status(tmdb_id, "error", error=f"multi remux rc={r.returncode}: {r.stderr[-200:]}"); return
+    core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None)
+    core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
+    finish_movie(tmdb_id, cfg)
+
+
 def merge_movie(tmdb_id, cfg=None):
     """Combine the English release and the existing French file into one multi-language
     file. The VIDEO is kept from whichever source has the better picture (higher
@@ -265,6 +280,11 @@ def merge_movie(tmdb_id, cfg=None):
     ei, fi = probe(en), probe(fr)
     if not ei or not fi:
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
+    # MULTI release: the download already carries BOTH English & French in native sync ->
+    # no merge, no drift risk; use it directly (the ideal outcome).
+    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]}:
+        core.set_status(tmdb_id, "merging")
+        _place_multi(en, mv, cfg, tmdb_id); return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = mv.get("sync_offset_ms") or 0
     # only a real framerate mismatch (>3%, e.g. 25 vs 23.976 PAL speedup) can't be fixed
@@ -288,26 +308,18 @@ def merge_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error="merge: no English audio in either file"); return
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
-    # Detect the constant A/V offset (video scene-cut match primary, audio fallback) unless a
-    # manual offset was given. A confident match means the content lines up even if runtimes
-    # differ (different intro); inability to align on a big runtime delta = a different cut.
-    aligned = bool(offset)
+    # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
+    drift = None
     if not offset and cfg.get("auto_sync", True):
-        m, conf, method = sync.detect(base, donor, 0, daidx[ids[0]],
-                                      min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}")
-        if m is not None:
-            aligned = True
-            if abs(m) >= 40:
-                offset = int(round(m))
-                core.log(f"merge {tmdb_id}: auto-sync {offset:+d}ms ({method} conf {conf:.2f})")
-            else:
-                core.log(f"merge {tmdb_id}: already aligned ({m:+.0f}ms {method} conf {conf:.2f})")
-        else:
-            core.log(f"merge {tmdb_id}: auto-sync inconclusive (best conf {conf:.2f})")
-    # couldn't confirm alignment AND runtimes differ a lot -> almost certainly a different cut
-    if not aligned and delta > cfg["sync_tolerance_s"]:
-        reject_and_retry(tmdb_id, f"couldn't align (Δ{delta:.1f}s, likely different cut)", cfg, delta)
-        return
+        m, conf, method, drift = sync.detect(base, donor, 0, daidx[ids[0]],
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}")
+        if m is None:
+            reject_and_retry(tmdb_id, "couldn't sync (incompatible release/cut)", cfg, delta)
+            return
+        if abs(m) >= 40 or drift:
+            offset = int(round(m))
+        core.log(f"merge {tmdb_id}: sync {offset:+d}ms"
+                 f"{' drift ' + format(drift, '.6f') if drift else ''} ({method} conf {conf:.2f})")
     core.set_status(tmdb_id, "merging", sync_delta=delta)
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
@@ -319,8 +331,11 @@ def merge_movie(tmdb_id, cfg=None):
            "--audio-tracks", ",".join(str(i) for i in ids)]
     for i in ids:
         cmd += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
-        if offset:
-            cmd += ["--sync", f"{i}:{offset}"]
+        if offset or drift:
+            arg = f"{i}:{offset}"
+            if drift:                          # linear drift correction (lossless timestamp stretch)
+                arg += f",{round(drift * 1000000)}/1000000"
+            cmd += ["--sync", arg]
     cmd += [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)

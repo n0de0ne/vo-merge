@@ -162,6 +162,21 @@ def _merge_episode(ep, en_file, cfg):
     ei, fi = probe(en_file), probe(fr)
     if not ei or not fi:
         core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
+    # MULTI episode: download already has both langs -> remux directly, no merge
+    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]}:
+        out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if subprocess.run(["mkvmerge", "-o", out, en_file], capture_output=True).returncode in (0, 1):
+            shutil.move(out, fr)
+            try: os.rmdir(os.path.dirname(out))
+            except OSError: pass
+            core.set_ep_status(ep["id"], "merged", merged_file=fr, added_langs="", error=None)
+            core.log(f"tv merge {ep['id']}: MULTI used directly")
+            try: _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
+            except Exception: pass
+        else:
+            core.set_ep_status(ep["id"], "error", error="multi remux failed")
+        return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = ep.get("sync_offset_ms") or 0
     if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
@@ -177,18 +192,16 @@ def _merge_episode(ep, en_file, cfg):
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
     if "eng" not in have or not ids:
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
-    aligned = bool(offset)
+    drift = None
     if not offset and cfg.get("auto_sync", True):
-        m, conf, method = sync.detect(base, donor, 0, daidx[ids[0]],
-                                      min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}")
-        if m is not None:
-            aligned = True
-            if abs(m) >= 40:
-                offset = int(round(m))
-            core.log(f"tv sync {ep['id']}: {offset:+d}ms ({method} conf {conf:.2f})")
-    if not aligned and delta > cfg["sync_tolerance_s"]:
-        core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
-                           error=f"couldn't align (Δ{delta:.1f}s)"); return
+        m, conf, method, drift = sync.detect(base, donor, 0, daidx[ids[0]],
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}")
+        if m is None:
+            core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
+                               error="couldn't sync (incompatible release/cut)"); return
+        if abs(m) >= 40 or drift:
+            offset = int(round(m))
+        core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
@@ -196,8 +209,9 @@ def _merge_episode(ep, en_file, cfg):
            "--no-buttons", "--no-track-tags", "--audio-tracks", ",".join(str(i) for i in ids)]
     for i in ids:
         cmd += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
-        if offset:
-            cmd += ["--sync", f"{i}:{offset}"]
+        if offset or drift:
+            arg = f"{i}:{offset}" + (f",{round(drift * 1000000)}/1000000" if drift else "")
+            cmd += ["--sync", arg]
     cmd += [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):

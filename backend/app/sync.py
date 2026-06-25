@@ -55,18 +55,32 @@ def audio_consensus(path, ref_ai, shift_ai, dur, cfg, tag=""):
     return None, 0.0
 
 
-def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
-    """Returns (offset_ms|None, confidence, method). offset>0 delays the donor track.
+def _linfit(xs, ys):
+    n = len(xs); sx = sum(xs); sy = sum(ys); sxx = sum(x * x for x in xs); sxy = sum(x * y for x, y in zip(xs, ys))
+    den = n * sxx - sx * sx
+    if den == 0:
+        return 0.0, sy / n, 0.0
+    b = (n * sxy - sx * sy) / den; a = (sy - b * sx) / n
+    mean = sy / n; ss_tot = sum((y - mean) ** 2 for y in ys)
+    ss_res = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return b, a, r2
 
-    A real constant offset reproduces in EVERY analysis window; a spurious peak does not.
-    So we require cross-window CONSENSUS (>=2 windows agreeing within 150ms) before trusting
-    an offset. Without consensus we report inconclusive (None) rather than guess — the caller
-    then tries another release instead of applying a wrong shift."""
+
+def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
+    """Returns (offset_ms|None, confidence, method, drift_ratio|None).
+
+    Measures the video offset at several points across the movie:
+      - a MAJORITY agree on one value      -> constant offset (drift=None)
+      - they fall on a straight LINE        -> linear drift (framerate mismatch); returns
+                                               the base offset + an o1/o2 stretch ratio
+      - they're INCONSISTENT (different cut)-> reject (offset=None) so the caller tries
+                                               another release / a MULTI instead of guessing
+    """
     import statistics
-    vmin = cfg.get("sync_video_min_conf", 0.4)
     amin = cfg.get("auto_sync_min_conf", 0.2)
-    wins = _windows(dur, n=cfg.get("sync_windows", 4), length=cfg.get("sync_window_dur", 480))
-    vres = []
+    wins = _windows(dur, n=max(5, cfg.get("sync_windows", 5)), length=cfg.get("sync_window_dur", 480))
+    vres = []                                          # (center_time_s, offset_ms, conf)
     for (s, d) in wins:
         try:
             m, c = detect_offset_video_ms(
@@ -76,32 +90,35 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
                 device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
         except Exception as e:
             core.log(f"sync{tag}: video window {int(s)}s error: {e}"); m, c = None, 0.0
-        if m is not None:
-            vres.append((m, c))
-    # cross-window consensus
-    consensus = None
-    for m0, _ in sorted(vres, key=lambda x: -x[1]):
-        agree = [(m, c) for m, c in vres if abs(m - m0) <= 150]
-        if len(agree) >= 2:
-            consensus = (statistics.median(m for m, _ in agree), max(c for _, c in agree), len(agree))
-            break
-    # audio at a central window (cross-check / fallback)
+        if m is not None and c >= 0.3:
+            vres.append((s + d / 2.0, m, c))
+    if len(vres) >= 2:
+        offs = [o for _, o, _ in vres]
+        # largest cluster agreeing within 150ms
+        best = []
+        for o0 in offs:
+            cl = [(t, o, c) for t, o, c in vres if abs(o - o0) <= 150]
+            if len(cl) > len(best):
+                best = cl
+        if len(best) >= max(2, (len(vres) + 1) // 2) and len(best) >= len(vres) * 0.6:
+            off = statistics.median(o for _, o, _ in best)
+            core.log(f"sync{tag}: constant {off:+.0f}ms ({len(best)}/{len(vres)} windows)")
+            return int(round(off)), max(c for _, _, c in best), f"video x{len(best)}", None
+        if len(vres) >= 3:                             # linear drift?
+            ts = [t for t, _, _ in vres]
+            b, a, r2 = _linfit(ts, offs)
+            if r2 >= 0.93 and abs(b * dur) >= 300:     # meaningful, well-fit drift
+                k = 1.0 + b / 1000.0                    # audio runs b ms fast per s -> stretch
+                core.log(f"sync{tag}: LINEAR DRIFT {b*dur:+.0f}ms over movie, base {a:+.0f}ms, ratio {k:.6f} (R²={r2:.2f})")
+                return int(round(a)), r2, "video-drift", k
+        core.log(f"sync{tag}: inconsistent offsets {[int(o) for o in offs]} -> reject (different cut?)")
+        return None, max((c for _, _, c in vres), default=0.0), None, None
+    # audio fallback at a central window
     s, d = wins[len(wins) // 2]
-    am, ac = None, 0.0
     try:
         am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d))
-    except Exception as e:
-        core.log(f"sync{tag}: audio error: {e}")
-    if consensus:
-        off, conf, n = consensus
-        core.log(f"sync{tag}: video consensus {off:+.0f}ms across {n} windows (conf {conf:.2f})")
-        return off, conf, f"video x{n}"
-    # no consensus: trust a single window only if it's strong AND audio independently confirms it
-    if vres:
-        m, c = max(vres, key=lambda x: x[1])
-        if c >= vmin and am is not None and abs(m - am) <= 150:
-            return m, max(c, ac), "video+audio"
-    # audio-only is least reliable — require a solid peak
+    except Exception:
+        am, ac = None, 0.0
     if am is not None and ac >= max(amin, 0.35):
-        return am, ac, "audio"
-    return None, (consensus[1] if consensus else max((c for _, c in vres), default=0.0)), None
+        return int(round(am)), ac, "audio", None
+    return None, ac, None, None

@@ -23,6 +23,7 @@ DEFAULTS = {
     "plex_token": "",
     "plex_media_prefix": "/data",          # how Plex sees what this app mounts at /media
     "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
+    "multi_indexer_ids": [],               # extra indexers to also search for MULTI (e.g. FR trackers)
     "vo_gap_tag": "vo-gap",
     "qb_category": "audio-merge",
     "qb_download_dir": "/downloads/audio-merge",   # container view of qB's save path
