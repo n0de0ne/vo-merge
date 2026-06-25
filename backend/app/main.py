@@ -1,5 +1,5 @@
 """FastAPI app: REST API + serves the built React SPA."""
-import os
+import os, subprocess
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,6 +9,7 @@ from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 app = FastAPI(title="VO Merger")
 STATIC = os.environ.get("VO_STATIC", "/app/static")
+PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
 
 
 @app.on_event("startup")
@@ -125,6 +126,61 @@ def ignore(tmdb_id: int):
 @api.get("/logs")
 def logs():
     return {"lines": core.tail_log()}
+
+
+# ----- live sync editor -----
+def _audio_index(path, lang):
+    from .offdet import audio_langs
+    pfx = "en" if lang.startswith("en") else "fr" if lang.startswith("fr") else lang[:2]
+    for i, l in enumerate(audio_langs(path)):
+        if l.startswith(pfx):
+            return i
+    return 0
+
+
+@api.get("/movie/{tmdb_id}/preview")
+def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
+    """Generate a ~30s preview: muted downscaled video + the chosen audio track, as
+    separate web-playable files so the browser can shift audio vs picture live."""
+    mv = core.get_movie(tmdb_id)
+    f = (mv or {}).get("merged_file") or (mv or {}).get("french_path")
+    if not f or not os.path.exists(f):
+        raise HTTPException(404, "file not found")
+    ei = pipeline.probe(f) or {}
+    dur, fps = ei.get("dur") or 0, ei.get("fps") or 23.976
+    if t < 0:
+        t = int(dur * 0.45) if dur else 600
+    out = os.path.join(PREVIEW_DIR, str(tmdb_id))
+    os.makedirs(out, exist_ok=True)
+    ai = _audio_index(f, lang)
+    vid, aud = os.path.join(out, "video.mp4"), os.path.join(out, f"audio_{lang}.m4a")
+    subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "30", "-i", f,
+                    "-an", "-vf", "scale=640:-2", "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "26", "-movflags", "+faststart", vid], capture_output=True)
+    subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "30", "-i", f,
+                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
+    return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}",
+            "audio": f"/api/preview/{tmdb_id}/audio_{lang}.m4a?v={t}",
+            "start": t, "fps": fps, "duration": 30}
+
+
+@api.get("/preview/{tmdb_id}/{name}")
+def serve_preview(tmdb_id: int, name: str):
+    p = os.path.join(PREVIEW_DIR, str(tmdb_id), os.path.basename(name))
+    if not os.path.isfile(p):
+        raise HTTPException(404)
+    return FileResponse(p)
+
+
+class ApplyIn(BaseModel):
+    offset_ms: int
+    lang: str = "eng"
+
+
+@api.post("/movie/{tmdb_id}/apply_offset")
+def apply_offset(tmdb_id: int, body: ApplyIn):
+    pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms, shift_lang=body.lang)
+    return core.get_movie(tmdb_id)
 
 
 # ----- series (Sonarr) -----

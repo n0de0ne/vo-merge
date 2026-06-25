@@ -1,5 +1,79 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, Movie, Status } from "./api";
+
+// ---------------- Sync Editor (live preview + offset) ----------------
+function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
+  const [data, setData] = useState<{ video: string; audio: string; start: number; fps: number } | null>(null);
+  const [offset, setOffset] = useState(movie.sync_offset_ms || 0);
+  const [start, setStart] = useState(-1);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("loading preview…");
+  const v = useRef<HTMLVideoElement>(null);
+  const a = useRef<HTMLAudioElement>(null);
+  const fps = data?.fps || 23.976;
+
+  async function load(t: number) {
+    setMsg("generating preview…"); setData(null);
+    try { const d = await api.preview(movie.tmdb_id, "eng", t); setData(d); setMsg(""); }
+    catch (e: any) { setMsg("preview failed: " + e.message); }
+  }
+  useEffect(() => { load(start); /* eslint-disable-next-line */ }, [start]);
+
+  // keep the audio shifted from the picture by `offset` ms (positive = audio later)
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const vid = v.current, aud = a.current;
+      if (vid && aud && !vid.paused) {
+        const target = vid.currentTime - offset / 1000;
+        if (Math.abs(aud.currentTime - target) > 0.06) aud.currentTime = Math.max(0, target);
+        if (aud.paused) aud.play().catch(() => {});
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [offset, data]);
+
+  function playBoth() { v.current?.play(); a.current?.play().catch(() => {}); }
+  const frame = Math.round(1000 / fps);
+  async function apply() {
+    setBusy(true);
+    try { await api.applyOffset(movie.tmdb_id, offset, "eng"); onClose(); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="row"><b>Tune sync — {movie.title}</b><div className="spacer" />
+          <button className="btn sec" onClick={onClose}>✕</button></div>
+        {msg && <p className="muted">{msg}</p>}
+        {data && <>
+          <video ref={v} src={data.video} muted loop playsInline controls
+            style={{ width: "100%", borderRadius: 8, background: "#000" }} onPlay={playBoth} />
+          <audio ref={a} src={data.audio} loop />
+          <div className="row" style={{ margin: "12px 0" }}>
+            <button className="btn sec" onClick={() => setOffset(o => o - frame)}>−1 frame</button>
+            <button className="btn sec" onClick={() => setOffset(o => o - 10)}>−10ms</button>
+            <input type="range" min={-1500} max={1500} step={1} value={offset}
+              onChange={e => setOffset(Number(e.target.value))} style={{ flex: 1 }} />
+            <button className="btn sec" onClick={() => setOffset(o => o + 10)}>+10ms</button>
+            <button className="btn sec" onClick={() => setOffset(o => o + frame)}>+1 frame</button>
+          </div>
+          <div className="row">
+            <b style={{ width: 120 }}>{offset >= 0 ? "+" : ""}{offset} ms</b>
+            <span className="muted">English audio {offset >= 0 ? "delayed (later)" : "advanced (earlier)"} ·
+              negative = earlier, positive = later. It's "too early" → increase toward +.</span>
+            <div className="spacer" />
+            <button className="btn sec" onClick={() => setStart(s => (s < 0 ? (data.start + 60) : s + 60))}>Jump +60s</button>
+            <button className="btn" disabled={busy} onClick={apply}>Apply {offset >= 0 ? "+" : ""}{offset}ms</button>
+          </div>
+        </>}
+      </div>
+    </div>
+  );
+}
 
 const STATES = ["pending","searching","no_release","grabbed","downloading",
   "ready","merging","merged","sync_fail","error","ignored"];
@@ -14,6 +88,7 @@ function Dashboard() {
   const [movies, setMovies] = useState<Movie[]>([]);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
+  const [tune, setTune] = useState<Movie | null>(null);
 
   async function refresh() {
     setStatus(await api.status());
@@ -70,6 +145,8 @@ function Dashboard() {
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.retry(m.tmdb_id))}>Retry</button>}
                   {m.status === "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-sync</button>}
+                  {m.status === "merged" &&
+                    <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>}
                   {m.status === "sync_fail" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-try sync</button>}
                   {m.status !== "ignored" && m.status !== "merged" &&
@@ -80,6 +157,7 @@ function Dashboard() {
           </tbody>
         </table>
       </div>
+      {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
     </>
   );
 }

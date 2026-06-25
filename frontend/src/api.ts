@@ -35,4 +35,10 @@ export const api = {
   retry: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/retry`, { method: "POST" }),
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
+  preview: (id: number, lang = "eng", t = -1) =>
+    j<{ video: string; audio: string; start: number; fps: number; duration: number }>(
+      `/api/movie/${id}/preview?lang=${lang}&t=${t}`),
+  applyOffset: (id: number, offset_ms: number, lang = "eng") =>
+    j<Movie>(`/api/movie/${id}/apply_offset`,
+      { method: "POST", body: JSON.stringify({ offset_ms, lang }) }),
 };

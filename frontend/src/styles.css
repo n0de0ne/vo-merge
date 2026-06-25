@@ -54,3 +54,6 @@ td .sub { color: var(--muted); font-size: 12px; }
 pre.logs { background: #0c0f14; border: 1px solid var(--border); border-radius: 10px; padding: 14px; overflow: auto; max-height: 65vh; font-size: 12.5px; white-space: pre-wrap; }
 .muted { color: var(--muted); }
 input.sync { width: 110px; }
+.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; width: min(760px, 92vw); max-height: 92vh; overflow: auto; }
+.modal input[type=range] { accent-color: var(--accent); }
