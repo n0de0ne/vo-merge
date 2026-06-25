@@ -4,7 +4,8 @@ import { api, Movie, Status } from "./api";
 // ---------------- Sync Editor (stable video + Web Audio live offset + waveform) ----------------
 function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
   const [d, setD] = useState<{ video: string; audio: string; start: number; fps: number; duration: number } | null>(null);
-  const [offset, setOffset] = useState(movie.sync_offset_ms || 0);
+  // start at 0: the preview already reflects the CURRENT file; Apply adds this delta on top
+  const [offset, setOffset] = useState(0);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const [vt, setVt] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -19,19 +20,22 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
   offRef.current = offset;
   const fps = d?.fps || 23.976, dur = d?.duration || 20;
 
-  useEffect(() => {                                  // load once — never re-rendered after
-    (async () => {
-      try {
-        const dd = await api.preview(movie.tmdb_id, "eng"); setD(dd); setMsg("decoding audio…");
-        const buf = await (await fetch(dd.audio)).arrayBuffer();
-        const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const ab = await ac.decodeAudioData(buf);
-        ctxRef.current = ac; bufRef.current = ab;
-        const ch = ab.getChannelData(0), W = 1200, block = Math.max(1, Math.floor(ch.length / W)), pk: number[] = [];
-        for (let i = 0; i < W; i++) { let m = 0; for (let j = 0; j < block; j++) { const a = Math.abs(ch[i * block + j] || 0); if (a > m) m = a; } pk.push(m); }
-        setPeaks(pk); setMsg("");
-      } catch (e: any) { setMsg("preview failed: " + e.message); }
-    })();
+  async function load() {
+    setMsg("loading preview…"); setPeaks(null);
+    try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {}
+    try {
+      const dd = await api.preview(movie.tmdb_id, "eng"); setD(dd); setMsg("decoding audio…");
+      const buf = await (await fetch(dd.audio)).arrayBuffer();
+      const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const ab = await ac.decodeAudioData(buf);
+      ctxRef.current = ac; bufRef.current = ab;
+      const ch = ab.getChannelData(0), W = 1200, block = Math.max(1, Math.floor(ch.length / W)), pk: number[] = [];
+      for (let i = 0; i < W; i++) { let m = 0; for (let j = 0; j < block; j++) { const a = Math.abs(ch[i * block + j] || 0); if (a > m) m = a; } pk.push(m); }
+      setPeaks(pk); setMsg("");
+    } catch (e: any) { setMsg("preview failed: " + e.message); }
+  }
+  useEffect(() => {
+    load();
     return () => { try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {} };
     /* eslint-disable-next-line */
   }, []);
@@ -80,7 +84,15 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
 
   const frame = Math.round(1000 / fps);
   const step = (df: number) => { const vv = v.current; if (vv) { vv.pause(); vv.currentTime = Math.max(0, vv.currentTime + df / 1000); } };
-  async function apply() { setBusy(true); stopAudio(); try { await api.applyOffset(movie.tmdb_id, offset, "eng"); onClose(); } finally { setBusy(false); } }
+  async function apply() {
+    setBusy(true); stopAudio();
+    try {
+      await api.applyOffset(movie.tmdb_id, offset, "eng");
+      setOffset(0); await load();           // reload the now-modified file so you hear the result
+      setMsg("applied ✓ — preview updated; press play to confirm");
+    } catch (e: any) { setMsg("apply failed: " + e.message); }
+    finally { setBusy(false); }
+  }
 
   return (
     <div className="modal-bg" onClick={onClose}>

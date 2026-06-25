@@ -161,8 +161,9 @@ def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
                     "-movflags", "+faststart", vid], capture_output=True)
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
                     "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
-    return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}",
-            "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}",
+    ver = int(os.path.getmtime(f))           # changes whenever Apply rewrites the file -> busts cache
+    return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}_{ver}",
+            "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}_{ver}",
             "start": t, "fps": fps, "duration": 20}
 
 
