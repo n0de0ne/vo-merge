@@ -207,7 +207,8 @@ def _merge_episode(ep, en_file, cfg):
         os.rmdir(outdir)
     except OSError:
         pass
-    core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta, error=None)
+    core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
+                       error=None, added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms -> {os.path.basename(fr)}")
     try:
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])

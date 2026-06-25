@@ -47,7 +47,8 @@ DEFAULTS = {
     "auto_sync_min_conf": 0.2,             # min AUDIO cross-correlation confidence
     "sync_video_min_conf": 0.4,            # min VIDEO (scene-cut) confidence; video is primary
     "sync_window_start": 300,              # seconds into the film to start the analysis window
-    "sync_window_dur": 600,                # analysis window length (s)
+    "sync_window_dur": 480,                # analysis window length (s)
+    "sync_windows": 4,                     # number of windows; need >=2 to agree (consensus)
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
@@ -129,7 +130,8 @@ def init_db():
             tried TEXT,                  -- JSON list of release identities already rejected
             attempts INTEGER DEFAULT 0
         )""")
-        _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0"})
+        _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
+                                   "added_langs": "TEXT"})
 
 
 def _ensure_cols(c, table, cols):

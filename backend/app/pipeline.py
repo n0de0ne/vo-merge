@@ -326,46 +326,52 @@ def merge_movie(tmdb_id, cfg=None):
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
-    core.set_status(tmdb_id, "merged", merged_file=out)
+    core.set_status(tmdb_id, "merged", merged_file=out,
+                    added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
              f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")
     finish_movie(tmdb_id, cfg)
 
 
-def resync_movie(tmdb_id, offset_ms=None, cfg=None):
-    """Re-time the English track inside the already-merged library file. offset_ms=None
-    auto-detects (English vs the base/French track); positive = English plays later.
-    Operates on the current file (no need for the original sources)."""
+def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
+    """Re-time the GRAFTED track inside an already-merged file to align with the base
+    track (the one in sync with the video). Shifts the `added_langs` track (the donor),
+    NOT always English. offset_ms=None auto-detects via multi-window audio consensus."""
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
     f = mv.get("merged_file") or mv.get("french_path")
     if not f or not os.path.exists(f):
         core.set_status(tmdb_id, "error", error="resync: file not found"); return
-    from .offdet import audio_langs, detect_offset_ms
+    from .offdet import audio_langs
     langs = audio_langs(f)
+    # which track was grafted (and therefore may be misaligned)?
+    shift = shift_lang or (mv.get("added_langs") or "eng").split(",")[0]
+    shift_pfx = "en" if shift.startswith("en") else "fr" if shift.startswith("fr") else shift[:2]
     try:
-        ref = next(i for i, l in enumerate(langs) if l.startswith("fr"))
-        eng = next(i for i, l in enumerate(langs) if l.startswith("en"))
+        shift_ai = next(i for i, l in enumerate(langs) if l.startswith(shift_pfx))
+        ref_ai = next(i for i, l in enumerate(langs) if not l.startswith(shift_pfx))
     except StopIteration:
-        core.set_status(tmdb_id, "error", error="resync: need both fr+en tracks"); return
+        core.set_status(tmdb_id, "error", error="resync: need two distinct audio tracks"); return
+    ei = probe(f)
     if not offset_ms:
-        m, conf = detect_offset_ms(f, ref, f, eng)
-        if m is None or conf < cfg.get("auto_sync_min_conf", 0.2):
+        m, conf = sync.audio_consensus(f, ref_ai, shift_ai, (ei or {}).get("dur") or 0, cfg, tag=f" {tmdb_id}")
+        if m is None:
             core.set_status(tmdb_id, "sync_fail",
-                            error=f"resync: low confidence ({conf:.2f}) — set offset manually")
+                            error=f"resync: no confident alignment ({conf:.2f}) — set offset manually")
             return
         offset_ms = int(round(m))
+    # global track id of the track to shift (the shift_ai-th audio track)
     j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True).stdout)
-    eng_id = next(t["id"] for t in j["tracks"]
-                  if t["type"] == "audio" and (t["properties"].get("language") or "").startswith("en"))
+    aud_ids = [t["id"] for t in j["tracks"] if t["type"] == "audio"]
+    sid = aud_ids[shift_ai]
     out = f + ".resync.mkv"
-    r = subprocess.run(["mkvmerge", "-o", out, "--sync", f"{eng_id}:{offset_ms:+d}", f],
+    r = subprocess.run(["mkvmerge", "-o", out, "--sync", f"{sid}:{offset_ms:+d}", f],
                        capture_output=True, text=True)
     if r.returncode not in (0, 1):
         core.set_status(tmdb_id, "error", error=f"resync mkvmerge rc={r.returncode}"); return
     shutil.move(out, f)
     core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
-    core.log(f"resync {tmdb_id}: applied {offset_ms:+d}ms to English track")
+    core.log(f"resync {tmdb_id}: shifted {shift_pfx} track {offset_ms:+d}ms")
     try:
         plex_dir = os.path.dirname(f).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
         Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
