@@ -221,14 +221,20 @@ function Dashboard() {
                 <td><div className="row">
                   {["pending","no_release","error"].includes(m.status) &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Search</button>}
-                  {["no_release","error"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.retry(m.tmdb_id))}>Retry</button>}
+                  {/* search again — re-run the search now */}
+                  {["no_release","error","sync_fail","downloading","merged"].includes(m.status) &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.research(m.tmdb_id))}>Search again</button>}
+                  {/* pick another version — blocklist current release, grab the next */}
+                  {["grabbed","downloading","no_release","error","sync_fail"].includes(m.status) &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>}
                   {m.status === "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-sync</button>}
                   {m.status === "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>}
                   {m.status === "sync_fail" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-try sync</button>}
+                  {m.status === "ignored" &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.unignore(m.tmdb_id))}>Unignore</button>}
                   {m.status !== "ignored" && m.status !== "merged" &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>}
                 </div></td>

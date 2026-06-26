@@ -123,6 +123,44 @@ def ignore(tmdb_id: int):
     core.set_status(tmdb_id, "ignored"); return {"ok": True}
 
 
+@api.post("/movie/{tmdb_id}/unignore")
+def unignore(tmdb_id: int):
+    # fresh start: clear the tried/attempts blocklist so it can grab anything again
+    core.set_status(tmdb_id, "pending", error=None, tried="[]", attempts=0,
+                    dl_hash=None, dl_id=None, en_file=None)
+    return {"ok": True}
+
+
+@api.post("/movie/{tmdb_id}/research")
+def research(tmdb_id: int):
+    # search again now (keeps the tried-blocklist so it won't re-pick known-bad releases)
+    core.set_status(tmdb_id, "pending", error=None, dl_hash=None, dl_id=None, en_file=None)
+    pipeline.search_movie(tmdb_id)
+    return core.get_movie(tmdb_id)
+
+
+@api.post("/movie/{tmdb_id}/another")
+def another(tmdb_id: int):
+    """Pick another version: blocklist the current release, drop its download, grab the
+    next-best candidate."""
+    import json as _json
+    cfg = core.load_config()
+    mv = core.get_movie(tmdb_id) or {}
+    tried = _json.loads(mv.get("tried") or "[]")
+    if mv.get("dl_id") and mv["dl_id"] not in tried:
+        tried.append(mv["dl_id"])
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        if mv.get("dl_hash"):
+            qb.delete([mv["dl_hash"]], delete_files=True)
+    except Exception:
+        pass
+    core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
+                    dl_hash=None, dl_id=None, en_file=None)
+    pipeline.search_movie(tmdb_id)
+    return core.get_movie(tmdb_id)
+
+
 @api.get("/logs")
 def logs():
     return {"lines": core.tail_log()}

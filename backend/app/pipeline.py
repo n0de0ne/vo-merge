@@ -454,13 +454,20 @@ def stage_finish(cfg=None):
     except Exception as e:
         core.log(f"stage_finish: qB error {e}"); return
     by_hash = {t["hash"]: t for t in torrents}
+    all_paths = "".join((t.get("save_path", "") + t.get("content_path", "")) for t in torrents)
     for mv in core.get_movies("downloading"):
         tmdb = str(mv["tmdb_id"])
         t = by_hash.get(mv.get("dl_hash"))
         if not t:   # fall back: match by save/content path containing /<tmdb>
             t = next((x for x in torrents
                       if f"/{tmdb}" in (x.get("save_path", "") + x.get("content_path", ""))), None)
-        if not t or t.get("progress", 0) < 1.0:
+        if not t:
+            # torrent vanished from qB (removed/failed) -> re-queue so it searches again
+            if f"/{tmdb}" not in all_paths:
+                core.set_status(mv["tmdb_id"], "pending", dl_hash=None, dl_id=None, en_file=None, error=None)
+                core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued")
+            continue
+        if t.get("progress", 0) < 1.0:
             continue
         # qB save dir was <qb_download_dir>/<tmdb>; we see it under downloads_mount/<tmdb>
         local = os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))

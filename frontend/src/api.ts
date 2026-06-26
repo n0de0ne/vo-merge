@@ -34,6 +34,9 @@ export const api = {
     j<Movie>(`/api/movie/${id}/sync`, { method: "POST", body: JSON.stringify({ offset_ms }) }),
   retry: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/retry`, { method: "POST" }),
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
+  unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
+  research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
+  another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
   preview: (id: number, lang = "eng", t = -1) =>
     j<{ video: string; audio: string; start: number; fps: number; duration: number; movie_dur: number }>(
