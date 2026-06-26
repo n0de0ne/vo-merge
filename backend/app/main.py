@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from . import core, scheduler, pipeline
-from .clients import Prowlarr, Radarr, QBittorrent, Plex
+from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
 app = FastAPI(title="VO Merger")
 STATIC = os.environ.get("VO_STATIC", "/app/static")
@@ -41,6 +41,7 @@ def get_settings():
     cfg["qb_pass"] = "********" if cfg["qb_pass"] else ""   # never echo secret
     cfg["prowlarr_key"] = bool(cfg["prowlarr_key"])
     cfg["radarr_key"] = bool(cfg["radarr_key"])
+    cfg["sonarr_key"] = bool(cfg.get("sonarr_key"))
     cfg["plex_token"] = bool(cfg["plex_token"])
     return cfg
 
@@ -54,7 +55,7 @@ def post_settings(body: SettingsIn):
     # drop masked/unchanged secret placeholders
     d = {k: v for k, v in body.data.items()
          if not (k in ("qb_pass",) and v == "********")
-         and not (k in ("prowlarr_key", "radarr_key", "plex_token") and v in (True, False))}
+         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token") and v in (True, False))}
     cfg = core.save_config(d)
     scheduler.reschedule()
     return {"ok": True}
@@ -68,6 +69,8 @@ def test(which: str):
             Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"]).ping()
         elif which == "radarr":
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).ping()
+        elif which == "sonarr":
+            Sonarr(cfg["sonarr_url"], cfg["sonarr_key"]).ping()
         elif which == "qb":
             QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]).ping()
         elif which == "plex":

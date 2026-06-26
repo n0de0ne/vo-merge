@@ -288,7 +288,7 @@ function SyncFailures() {
 }
 
 // ---------------- Settings ----------------
-const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "plex_token"];
+const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token"];
 function Settings() {
   const [cfg, setCfg] = useState<Record<string, any> | null>(null);
   const [changed, setChanged] = useState<Record<string, any>>({});
@@ -308,8 +308,11 @@ function Settings() {
       if (SECRET_BOOLS.includes(k) && typeof v === "boolean") continue;
       data[k] = v;
     }
-    if ("en_indexer_ids" in data && typeof data.en_indexer_ids === "string")
-      data.en_indexer_ids = data.en_indexer_ids.split(",").map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !isNaN(n));
+    for (const key of ["en_indexer_ids", "multi_indexer_ids"])
+      if (key in data && typeof data[key] === "string")
+        data[key] = data[key].split(",").map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !isNaN(n));
+    if ("series_pilot" in data && typeof data.series_pilot === "string")
+      data.series_pilot = data.series_pilot.split(",").map((x: string) => x.trim()).filter(Boolean);
     await api.saveSettings(data); setSaved(true); setChanged({});
     api.settings().then(setCfg);
   }
@@ -338,6 +341,8 @@ function Settings() {
         <label>Prowlarr API key</label>{Secret("prowlarr_key")}<span />
         <label>Radarr URL</label>{Text("radarr_url")}{TestBtn("radarr")}
         <label>Radarr API key</label>{Secret("radarr_key")}<span />
+        <label>Sonarr URL</label>{Text("sonarr_url")}{TestBtn("sonarr")}
+        <label>Sonarr API key</label>{Secret("sonarr_key")}<span />
         <label>qBittorrent URL</label>{Text("qb_url")}{TestBtn("qb")}
         <label>qB username</label>{Text("qb_user")}<span />
         <label>qB password</label><input type="password" placeholder={cfg.qb_pass ? "•••••• (saved)" : "not set"}
@@ -362,9 +367,22 @@ function Settings() {
         <label>Sync tolerance (s)</label>{Text("sync_tolerance_s", "number")}<span />
         <label>Search interval (min)</label>{Text("search_interval_min", "number")}<span />
         <label>Finish interval (min)</label>{Text("finish_interval_min", "number")}<span />
+        <label>MULTI indexer IDs</label>
+        <input type="text" value={Array.isArray(val("multi_indexer_ids")) ? val("multi_indexer_ids").join(", ") : (val("multi_indexer_ids") ?? "")}
+          onChange={e => set("multi_indexer_ids", e.target.value)} /><span className="muted">extra (e.g. FR trackers) for MULTI</span>
         <label>Films</label>{Check("scope_films")}<span />
-        <label>Series/Anime</label>{Check("scope_series")}<span />
         <label>Exclude French-origin</label>{Check("exclude_french_origin")}<span />
+      </div>
+
+      <div className="section-title">Series (Sonarr)</div>
+      <div className="form-grid">
+        <label>Enable Series/Anime</label>{Check("scope_series")}<span className="muted">runs the episode pipeline</span>
+        <label>Sonarr vo-gap tag</label>{Text("sonarr_vo_gap_tag")}<span />
+        <label>Pilot series</label>
+        <input type="text" value={Array.isArray(val("series_pilot")) ? val("series_pilot").join(", ") : (val("series_pilot") ?? "")}
+          onChange={e => set("series_pilot", e.target.value)} /><span className="muted">comma-sep; empty = all tagged</span>
+        <label>qB TV category</label>{Text("qb_tv_category")}<span />
+        <label>Season-pack threshold</label>{Text("tv_pack_threshold", "number")}<span className="muted">≥ N gap eps → grab a pack</span>
       </div>
 
       <div className="section-title">Master</div>
