@@ -51,6 +51,8 @@ def scan(cfg=None):
             files = son.episode_files(s["id"])
         except Exception:
             continue
+        poster = next((i.get("remoteUrl") or i.get("url") for i in s.get("images", [])
+                       if i.get("coverType") == "poster"), None)
         for f in files:
             mi = f.get("mediaInfo") or {}
             if not _fr_only(mi.get("audioLanguages")):
@@ -65,6 +67,7 @@ def scan(cfg=None):
                 "series_title": s["title"], "tvdb_id": s.get("tvdbId"),
                 "season": season, "episode": ep, "french_path": _media(path, cfg),
                 "quality": mi.get("resolution") or (f.get("quality", {}).get("quality", {}) or {}).get("name"),
+                "poster": poster,
             })
             n += 1
     core.log(f"tv scan: {n} French-only episodes (pilot={sorted(pilot) or 'all'})")

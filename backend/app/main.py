@@ -97,6 +97,23 @@ def do_merge(tmdb_id: int):
     pipeline.merge_movie(tmdb_id); return core.get_movie(tmdb_id)
 
 
+@api.get("/movie/{tmdb_id}/candidates")
+def movie_candidates(tmdb_id: int):
+    return pipeline.candidates(tmdb_id, include_tried=True)
+
+
+class GrabIn(BaseModel):
+    link: str
+    rid: str | None = None
+    title: str | None = None
+
+
+@api.post("/movie/{tmdb_id}/grab")
+def movie_grab(tmdb_id: int, body: GrabIn):
+    pipeline.grab_release(tmdb_id, body.link, body.rid, body.title)
+    return core.get_movie(tmdb_id)
+
+
 class SyncIn(BaseModel):
     offset_ms: int
 

@@ -9,7 +9,7 @@ LOG_FILE = os.path.join(CONFIG_DIR, "vo-merge.log")
 
 # Pipeline states a movie moves through.
 STATES = ["pending", "searching", "no_release", "grabbed", "downloading",
-          "ready", "merging", "merged", "sync_fail", "error", "ignored"]
+          "ready", "merging", "merged", "review", "sync_fail", "error", "ignored"]
 
 DEFAULTS = {
     "prowlarr_url": "http://10.0.1.5:9696",
@@ -44,6 +44,7 @@ DEFAULTS = {
     "exclude_french_origin": True,
     "sync_tolerance_s": 2.0,
     "max_sync_retries": 4,                 # try this many different releases before giving up
+    "sync_review": True,                   # low-confidence/inconclusive sync -> 'review' (human) instead of auto-reject
     "auto_sync": True,                     # auto-detect & correct constant A/V offset
     "auto_sync_min_conf": 0.2,             # min AUDIO cross-correlation confidence
     "sync_video_min_conf": 0.4,            # min VIDEO (scene-cut) confidence; video is primary
@@ -132,7 +133,7 @@ def init_db():
             attempts INTEGER DEFAULT 0
         )""")
         _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
-                                   "added_langs": "TEXT"})
+                                   "added_langs": "TEXT", "poster": "TEXT"})
 
 
 def _ensure_cols(c, table, cols):
@@ -157,23 +158,24 @@ def init_tv():
             sync_offset_ms INTEGER DEFAULT 0, sync_delta REAL,
             error TEXT, updated REAL,
             dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
-        _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0"})
+        _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
+                                     "poster": "TEXT"})
 
 
 def upsert_episode(e: dict):
     cols = ["id", "series_id", "series_title", "tvdb_id", "season", "episode",
-            "french_path", "quality"]
+            "french_path", "quality", "poster"]
     with db() as c:
         ex = c.execute("SELECT status FROM episodes WHERE id=?", (e["id"],)).fetchone()
         if ex:
-            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,updated=?
+            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,poster=?,updated=?
                          WHERE id=?""",
                       (e["series_title"], e["tvdb_id"], e["french_path"], e["quality"],
-                       time.time(), e["id"]))
+                       e.get("poster"), time.time(), e["id"]))
         else:
             c.execute(f"INSERT INTO episodes ({','.join(cols)},updated) "
                       f"VALUES ({','.join('?'*len(cols))},?)",
-                      tuple(e[k] for k in cols) + (time.time(),))
+                      tuple(e.get(k) for k in cols) + (time.time(),))
 
 
 def set_ep_status(ep_id, status, **fields):
@@ -206,21 +208,21 @@ def ep_status_counts():
 
 def upsert_movie(m: dict):
     cols = ["tmdb_id", "imdb_id", "radarr_id", "title", "original_title", "year",
-            "original_lang", "french_path", "quality"]
+            "original_lang", "french_path", "quality", "poster"]
     with db() as c:
         existing = c.execute("SELECT tmdb_id FROM movies WHERE tmdb_id=?",
                              (m["tmdb_id"],)).fetchone()
         if existing:
             c.execute("""UPDATE movies SET imdb_id=?,radarr_id=?,title=?,original_title=?,
-                         year=?,original_lang=?,french_path=?,quality=?,updated=?
+                         year=?,original_lang=?,french_path=?,quality=?,poster=?,updated=?
                          WHERE tmdb_id=?""",
                       (m["imdb_id"], m["radarr_id"], m["title"], m["original_title"],
                        m["year"], m["original_lang"], m["french_path"], m["quality"],
-                       time.time(), m["tmdb_id"]))
+                       m.get("poster"), time.time(), m["tmdb_id"]))
         else:
             c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
                           VALUES ({','.join('?'*len(cols))},?)""",
-                      tuple(m[k] for k in cols) + (time.time(),))
+                      tuple(m.get(k) for k in cols) + (time.time(),))
 
 
 def set_status(tmdb_id, status, **fields):

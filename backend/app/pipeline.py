@@ -62,11 +62,14 @@ def scan(cfg=None):
             # m['path'] is Radarr's movie folder; map its leaf into our media mount
             fr_path = os.path.join(cfg["media_mount"], "Films",
                                    os.path.basename(m["path"].rstrip("/")), rel)
+        poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
+                       if i.get("coverType") == "poster"), None)
         core.upsert_movie({
             "tmdb_id": m["tmdbId"], "imdb_id": m.get("imdbId"), "radarr_id": m["id"],
             "title": m.get("title"), "original_title": m.get("originalTitle") or m.get("title"),
             "year": m.get("year"), "original_lang": lang, "french_path": fr_path,
             "quality": (((mf.get("quality") or {}).get("quality") or {}).get("name")),
+            "poster": poster,
         })
         n += 1
     core.log(f"scan: {n} candidate movies (non-French gap)")
@@ -92,48 +95,69 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src):
     return sc
 
 
-def search_movie(tmdb_id, cfg=None, do_grab=None):
+def candidates(tmdb_id, cfg=None, include_tried=False):
+    """Scored English/MULTI release candidates for a movie (no grab) — powers the UI's
+    interactive search and the auto-picker."""
     cfg = cfg or core.load_config()
-    if do_grab is None:
-        do_grab = (cfg["grab_mode"] == "auto")
     mv = core.get_movie(tmdb_id)
     if not mv:
-        return
+        return []
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
-    core.set_status(tmdb_id, "searching")
     otitle = mv["original_title"] or mv["title"]; year = mv["year"]
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
     try:
         results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
-        core.set_status(tmdb_id, "error", error=f"search: {e}"); return
+        core.log(f"candidates {tmdb_id}: {e}"); return []
     import json as _json
     tried = set(_json.loads(mv.get("tried") or "[]"))
-    cand = []
+    out = []
     for r in results:
         sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src)
         if sc is None:
             continue
-        link = _pick_link(r)
-        rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
-        if rid in tried:                     # already rejected (didn't sync) — skip
+        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        if rid in tried and not include_tried:
             continue
-        cand.append((sc, r.get("seeders") or 0, r.get("title"), link, rid))
-    cand.sort(reverse=True)
-    if not cand or cand[0][0] < cfg["score_threshold"] or cand[0][1] < cfg["min_seeders"]:
-        core.set_status(tmdb_id, "no_release",
-                        candidate_title=(cand[0][2] if cand else None),
-                        candidate_score=(cand[0][0] if cand else 0))
-        core.log(f"search '{otitle}': no usable release (best={cand[0][0] if cand else 'none'}, "
-                 f"{len(tried)} already tried)")
+        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                    "title": r.get("title"), "indexer": r.get("indexer"),
+                    "multi": bool(re.search(r"\bMULTI\b", r.get("title", ""), re.I)),
+                    "link": link, "rid": rid, "tried": rid in tried})
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def search_movie(tmdb_id, cfg=None, do_grab=None):
+    cfg = cfg or core.load_config()
+    if do_grab is None:
+        do_grab = (cfg["grab_mode"] == "auto")
+    if not core.get_movie(tmdb_id):
         return
-    sc, seeders, title, link, rid = cand[0]
-    core.set_status(tmdb_id, "grabbed", candidate_title=title,
-                    candidate_score=sc, candidate_seeders=seeders, dl_id=rid)
-    core.log(f"search '{otitle}': picked [{sc}] {seeders}s {title}")
+    core.set_status(tmdb_id, "searching")
+    cand = candidates(tmdb_id, cfg)
+    if not cand or cand[0]["score"] < cfg["score_threshold"] or cand[0]["seeders"] < cfg["min_seeders"]:
+        core.set_status(tmdb_id, "no_release",
+                        candidate_title=(cand[0]["title"] if cand else None),
+                        candidate_score=(cand[0]["score"] if cand else 0))
+        core.log(f"search {tmdb_id}: no usable release (best={cand[0]['score'] if cand else 'none'})")
+        return
+    top = cand[0]
+    core.set_status(tmdb_id, "grabbed", candidate_title=top["title"],
+                    candidate_score=top["score"], candidate_seeders=top["seeders"], dl_id=top["rid"])
+    core.log(f"search {tmdb_id}: picked [{top['score']}] {top['seeders']}s {top['title']}")
     if do_grab:
-        grab(tmdb_id, link, cfg)
+        grab(tmdb_id, top["link"], cfg)
+
+
+def grab_release(tmdb_id, link, rid=None, title=None, cfg=None):
+    """Grab a specific user-chosen release (interactive search)."""
+    cfg = cfg or core.load_config()
+    fields = {"dl_id": rid, "error": None}
+    if title:
+        fields["candidate_title"] = title
+    core.set_status(tmdb_id, "grabbed", **fields)
+    grab(tmdb_id, link, cfg)
 
 
 # ---------------------------------------------------------------- GRAB
@@ -314,7 +338,12 @@ def merge_movie(tmdb_id, cfg=None):
         m, conf, method, drift = sync.detect(base, donor, 0, daidx[ids[0]],
                                               min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}")
         if m is None:
-            reject_and_retry(tmdb_id, "couldn't sync (incompatible release/cut)", cfg, delta)
+            if cfg.get("sync_review", True):
+                core.set_status(tmdb_id, "review", sync_delta=delta,
+                                error="low-confidence sync — review or pick another release")
+                core.log(f"merge {tmdb_id}: inconclusive sync -> review")
+            else:
+                reject_and_retry(tmdb_id, "couldn't sync (incompatible release/cut)", cfg, delta)
             return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
