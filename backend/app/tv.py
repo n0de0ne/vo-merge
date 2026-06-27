@@ -16,6 +16,26 @@ SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
 
 
+def _parse_se(relpath):
+    """(season, episode) from a download file path. Handles SxxExx, and anime layouts where
+    the season is in a FOLDER ('Season 2'/'Saison 2') and the file is just an episode number
+    ('Dr Stone - 01.mkv'). Returns (None, None) if it can't tell."""
+    base = os.path.basename(relpath)
+    m = SXXEXX.search(base)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # season: prefer the word 'season'/'saison' in the path (the deepest match wins, so a
+    # per-season subfolder beats a 'S01+02' top folder)
+    sm = re.findall(r'(?:season|saison)\s*0*(\d{1,3})', relpath, re.I)
+    season = int(sm[-1]) if sm else 1                      # default S01 when only ep numbers
+    # episode: '- 01', 'ep 01', 'e01', or the trailing number before the extension
+    em = (re.search(r'(?:\s-\s|\bep\.?\s*|[._]e)0*(\d{1,4})', base, re.I)
+          or re.search(r'\b0*(\d{1,4})\b(?!.*\b\d)', os.path.splitext(base)[0]))
+    if not em:
+        return None, None
+    return season, int(em.group(1))
+
+
 def _no_eng(al):
     """True if the file is MISSING an English audio track (a gap to fill) — covers fre, fre/jpn
     (anime), jpn-only, etc. Unknown audio (no mediaInfo) -> False, to avoid flagging
@@ -425,21 +445,33 @@ def stage_finish(cfg=None):
             continue
         save = (t.get("content_path") or t.get("save_path") or "")
         local = save.replace(cfg["qb_tv_download_dir"], cfg["qb_tv_download_dir"], 1)  # same mount
-        # index downloaded video files by (season,episode)
-        files = {}
+        # index EVERY downloaded video file by (season,episode) — parse handles anime layouts
         root = local if os.path.isdir(local) else os.path.dirname(local)
+        files = {}
         for r, _, fs in os.walk(root):
             for f in fs:
                 if f.lower().endswith(VIDEXT):
-                    m = SXXEXX.search(f)
-                    if m:
-                        files[(int(m.group(1)), int(m.group(2)))] = os.path.join(r, f)
-        for e in eps:
-            vid = files.get((e["season"], e["episode"]))
-            if not vid:
+                    full = os.path.join(r, f)
+                    s, ep = _parse_se(os.path.relpath(full, root))
+                    if s is not None:
+                        files[(s, ep)] = full
+        # A single download can span multiple seasons (e.g. an "S01+02" anime pack). Match its
+        # files against ALL gap episodes of the series — not just the ones originally tagged with
+        # this hash — claiming pending episodes (e.g. S02) the pack also satisfies.
+        sid = eps[0]["series_id"]
+        gap = {(x["season"], x["episode"]): x for x in core.get_episodes()
+               if x["series_id"] == sid and x["status"] not in ("merged", "ignored")}
+        merged_any = False
+        for (s, ep), vid in files.items():
+            tgt = gap.get((s, ep))
+            if not tgt:
                 continue
-            core.set_ep_status(e["id"], "ready", en_file=vid)
-            _merge_episode(core.get_episode(e["id"]), vid, cfg)
+            core.set_ep_status(tgt["id"], "ready", en_file=vid, dl_hash=t["hash"], dl_id=eps[0].get("dl_id"))
+            _merge_episode(core.get_episode(tgt["id"]), vid, cfg)
+            merged_any = True
+        if not merged_any:
+            core.log(f"tv finish: {t['name'][:50]} complete but no files mapped to episodes "
+                     f"(parsed {sorted(files.keys())[:6]})")
     # resume episode merges interrupted by a restart/crash (stuck 'merging', not updated recently)
     import time as _t
     for e in core.get_episodes("merging"):
