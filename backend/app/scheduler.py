@@ -19,6 +19,8 @@ def _search_job():
 
 
 def _finish_job():
+    if not pipeline.FINISH_LOCK.acquire(blocking=False):
+        return                       # a finish cycle is already running
     try:
         cfg = core.load_config()
         if cfg.get("scope_films", True):
@@ -27,6 +29,8 @@ def _finish_job():
             tv.stage_finish(cfg)
     except Exception as e:
         core.log(f"finish_job error: {e}")
+    finally:
+        pipeline.FINISH_LOCK.release()
 
 
 def start():

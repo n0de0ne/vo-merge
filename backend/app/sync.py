@@ -67,7 +67,34 @@ def _linfit(xs, ys):
     return b, a, r2
 
 
-def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None):
+def verify_hint(base, donor, dur, hint, cfg, tag=""):
+    """Confirm a pack-mate's already-known offset with ONE window (≈5x faster than full
+    detect). Returns (offset, conf, method, drift) if it agrees, else None to force full
+    detect. Only for constant offsets (drift hints aren't quick-verifiable)."""
+    ho, hd = hint
+    if hd:
+        return None
+    s = (dur or 1200) * 0.45                       # one central window
+    try:
+        m, c = detect_offset_video_ms(
+            base, donor, start=int(s), dur=int(cfg.get("sync_window_dur", 480)),
+            threads=cfg.get("sync_ffmpeg_threads", 4),
+            hwaccel=cfg.get("sync_hwaccel", "vaapi"),
+            device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+    except Exception:
+        return None
+    if m is not None and c >= 0.5 and abs(m - ho) <= 150:
+        core.log(f"sync{tag}: pack offset {ho:+.0f}ms confirmed (1 window, conf {c:.2f})")
+        return int(round(ho)), c, "pack-verify", None
+    core.log(f"sync{tag}: pack offset {ho:+.0f}ms NOT confirmed (got {m}/{c:.2f}) -> full detect")
+    return None
+
+
+def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, hint=None):
+    if hint is not None:                           # try the fast pack-mate path first
+        r = verify_hint(base, donor, dur, hint, cfg, tag)
+        if r:
+            return r
     """Returns (offset_ms|None, confidence, method, drift_ratio|None).
 
     Measures the video offset at several points across the movie:

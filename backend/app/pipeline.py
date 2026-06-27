@@ -11,6 +11,9 @@ from .clients import Prowlarr, Radarr, QBittorrent, Plex
 # Only ONE merge (sync-detect + mux) runs at a time across the whole app, no matter how it's
 # triggered (scheduler, resume, or the API), so concurrent merges can't peg the CPU/GPU.
 MERGE_LOCK = threading.Lock()
+# Only ONE finish cycle runs at a time — concurrent triggers (scheduler + API) would each keep
+# their own per-pack offset cache and duplicate work. Callers acquire non-blocking and skip.
+FINISH_LOCK = threading.Lock()
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
 EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)

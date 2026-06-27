@@ -94,13 +94,18 @@ def do_finish():
     import threading
     from . import tv
 
+    if not pipeline.FINISH_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a finish cycle is already running"}
+
     def _run():
-        cfg = core.load_config()
         try:
+            cfg = core.load_config()
             pipeline.stage_finish(cfg)
             tv.stage_finish(cfg)
         except Exception as e:
             core.log(f"manual finish error: {e}")
+        finally:
+            pipeline.FINISH_LOCK.release()
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "started": True}

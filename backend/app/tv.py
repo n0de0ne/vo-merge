@@ -327,13 +327,15 @@ def stage_search(cfg=None):
 
 
 # ------------------------------------------------------------------ FINISH (map + merge)
-def _merge_episode(ep, en_file, cfg):
-    """Serialize merges (shared lock with movies) so concurrent merges can't peg CPU/GPU."""
+def _merge_episode(ep, en_file, cfg, hint=None):
+    """Serialize merges (shared lock with movies) so concurrent merges can't peg CPU/GPU.
+    `hint` = (offset, drift) from a pack-mate, to skip full sync detection when it matches.
+    Returns (offset, drift) on a detected merge, else None."""
     with MERGE_LOCK:
-        return _merge_episode_impl(ep, en_file, cfg)
+        return _merge_episode_impl(ep, en_file, cfg, hint)
 
 
-def _merge_episode_impl(ep, en_file, cfg):
+def _merge_episode_impl(ep, en_file, cfg, hint=None):
     """Merge: keep better video, graft the other language's audio, replace FR file in place."""
     from . import sync
     from .clients import Sonarr as _S
@@ -390,7 +392,7 @@ def _merge_episode_impl(ep, en_file, cfg):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
-            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg))
+            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint)
         if m is None or (fps_diff and not drift):
             why = ("framerates differ but no reliable drift could be measured"
                    if (m is not None and fps_diff and not drift)
@@ -427,6 +429,7 @@ def _merge_episode_impl(ep, en_file, cfg):
     except Exception:
         pass
     mirror_to_en(fr, cfg)          # add to Series-EN/Anime-EN + refresh that section now
+    return (offset, drift)         # cache as the pack hint for the next episode
 
 
 def _drop_stalled_eps(eps, t, cfg):
@@ -500,12 +503,15 @@ def stage_finish(cfg=None):
         gap = {(x["season"], x["episode"]): x for x in core.get_episodes()
                if x["series_id"] == sid and x["status"] not in ("merged", "ignored")}
         merged_any = False
-        for (s, ep), vid in files.items():
+        pack_hint = None                            # offset learned from this pack's first episode
+        for (s, ep), vid in sorted(files.items()):
             tgt = gap.get((s, ep))
             if not tgt:
                 continue
             core.set_ep_status(tgt["id"], "ready", en_file=vid, dl_hash=t["hash"], dl_id=eps[0].get("dl_id"))
-            _merge_episode(core.get_episode(tgt["id"]), vid, cfg)
+            res = _merge_episode(core.get_episode(tgt["id"]), vid, cfg, hint=pack_hint)
+            if res and res[0] is not None:          # reuse this pack's offset for the next episode
+                pack_hint = res
             merged_any = True
         if not merged_any:
             core.log(f"tv finish: {t['name'][:50]} complete but no files mapped to episodes "
