@@ -10,7 +10,7 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
+                       MERGE_LOCK, FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -278,6 +278,12 @@ def stage_search(cfg=None):
 
 # ------------------------------------------------------------------ FINISH (map + merge)
 def _merge_episode(ep, en_file, cfg):
+    """Serialize merges (shared lock with movies) so concurrent merges can't peg CPU/GPU."""
+    with MERGE_LOCK:
+        return _merge_episode_impl(ep, en_file, cfg)
+
+
+def _merge_episode_impl(ep, en_file, cfg):
     """Merge: keep better video, graft the other language's audio, replace FR file in place."""
     from . import sync
     from .clients import Sonarr as _S

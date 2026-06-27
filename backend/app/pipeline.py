@@ -3,10 +3,14 @@
 
 Search & merge logic is ported verbatim from the validated dry-run scripts.
 """
-import json, os, re, subprocess, shutil, time, hashlib
+import json, os, re, subprocess, shutil, time, hashlib, threading
 import requests
 from . import core, sync
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
+
+# Only ONE merge (sync-detect + mux) runs at a time across the whole app, no matter how it's
+# triggered (scheduler, resume, or the API), so concurrent merges can't peg the CPU/GPU.
+MERGE_LOCK = threading.Lock()
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
 EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
@@ -419,6 +423,12 @@ def _place_multi(en, mv, cfg, tmdb_id):
 
 
 def merge_movie(tmdb_id, cfg=None):
+    """Serialize merges (one at a time) so concurrent triggers can't peg CPU/GPU."""
+    with MERGE_LOCK:
+        return _merge_movie_impl(tmdb_id, cfg)
+
+
+def _merge_movie_impl(tmdb_id, cfg=None):
     """Combine the English release and the existing French file into one multi-language
     file. The VIDEO is kept from whichever source has the better picture (higher
     resolution, then bitrate); the other source contributes its audio. The output
