@@ -18,7 +18,7 @@ export interface Episode {
 export interface TvStatus { counts: Record<string, number>; }
 export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
-  multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean;
+  multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean; info_url?: string | null;
 }
 
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {

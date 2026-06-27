@@ -210,7 +210,7 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": r.get("title"), "indexer": r.get("indexer"),
                     "multi": bool(re.search(r"\bMULTI\b", r.get("title", ""), re.I)),
-                    "link": link, "rid": rid, "tried": rid in tried})
+                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
     out.sort(key=lambda x: -x["score"])
     return out
 

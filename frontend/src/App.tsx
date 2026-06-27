@@ -213,7 +213,10 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
               <div className={"rel-row" + (c.tried ? " tried" : "")} key={c.rid}>
                 <div className="rel-main">
                   <div className="rel-title">
-                    {c.title}
+                    {c.info_url
+                      ? <a href={c.info_url} target="_blank" rel="noreferrer" title="Open tracker page"
+                           style={{ color: "#9ecbff", textDecoration: "none" }}>{c.title} ↗</a>
+                      : c.title}
                     {c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
                     {c.multi && <span className="multi-badge">MULTI</span>}
                     {c.tried && <span className="tried-mark">tried</span>}

@@ -155,7 +155,7 @@ def season_candidates(series_id, season, cfg=None):
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
                     "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
-                    "link": link, "rid": rid, "tried": rid in tried})
+                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
     out.sort(key=lambda x: -x["score"])
     return out
 
@@ -213,7 +213,7 @@ def episode_candidates(ep_id, cfg=None):
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
                     "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
-                    "link": link, "rid": rid, "tried": rid in tried})
+                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
     out.sort(key=lambda x: -x["score"])
     return out
 
