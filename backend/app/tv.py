@@ -183,19 +183,46 @@ def season_candidates(series_id, season, cfg=None):
     return out
 
 
-def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
-    """Grab a user-chosen season pack and assign it to all the season's gap episodes."""
-    cfg = cfg or core.load_config()
-    eps = [e for e in core.get_episodes() if e["series_id"] == series_id and e["season"] == season
-           and e["status"] not in ("merged", "ignored")]
-    if not eps:
-        return 0
-    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_S{season:02d}", cfg)
+def _pack_seasons(title, default_season):
+    """Seasons a release title advertises. None = ALL seasons (complete/intégrale). Only expands
+    beyond {default_season} on a clear multi-season signal (range like S01-S03, or list like
+    S01+02) — otherwise a single season, to avoid over-claiming."""
+    t = title or ""
+    if re.search(r'(?<![a-z])(complete|int[eé]grale|integrale)(?![a-z])', t, re.I):
+        return None
+    seasons = set()
+    for m in re.finditer(r'(?:s|season|saison)\s*0*(\d{1,2})\s*(?:[-–~]|to|[aà])\s*(?:s|season|saison)?\s*0*(\d{1,2})', t, re.I):
+        a, b = int(m.group(1)), int(m.group(2))
+        if a < b <= a + 30:
+            seasons.update(range(a, b + 1))
+    lm = re.search(r'(?:s|season|saison)\s*0*(\d{1,2})((?:\s*[+&]\s*(?:s|season|saison)?\s*0*\d{1,2})+)', t, re.I)
+    if lm:
+        seasons.add(int(lm.group(1)))
+        seasons.update(int(x) for x in re.findall(r'\d{1,2}', lm.group(2)))
+    return seasons or {default_season}
+
+
+def _assign_pack(series_id, seasons, h, rid, title):
+    """Tag a grabbed pack onto every gap episode of the series in `seasons` (None = all seasons)
+    so a multi-season download isn't separately re-grabbed season-by-season. Returns count."""
+    eps = [e for e in core.get_episodes()
+           if e["series_id"] == series_id and e["status"] not in ("merged", "ignored", "downloading")
+           and (seasons is None or e["season"] in seasons)]
     for e in eps:
         core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
                            candidate_title=title, error=None)
-    core.log(f"tv grab SEASON {series_id} S{season:02d}: {len(eps)} eps <- {title}")
     return len(eps)
+
+
+def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
+    """Grab a user-chosen season pack and claim the gap episodes of every season the pack
+    advertises (e.g. an 'S01+02' pack also claims S02, so it isn't re-grabbed separately)."""
+    cfg = cfg or core.load_config()
+    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_S{season:02d}", cfg)
+    seasons = _pack_seasons(title, season)
+    n = _assign_pack(series_id, seasons, h, rid, title)
+    core.log(f"tv grab SEASON {series_id} (seasons {sorted(seasons) if seasons else 'ALL'}): {n} eps <- {title}")
+    return n
 
 
 def episode_candidates(ep_id, cfg=None):
@@ -249,8 +276,11 @@ def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
         return 0
     h = _grab(link, f"{cfg['qb_tv_download_dir']}/{ep_id.replace(':', '_')}", cfg)
     core.set_ep_status(ep_id, "downloading", dl_hash=h, dl_id=rid, candidate_title=title, error=None)
-    core.log(f"tv grab EP(interactive) {ep_id}: {title}")
-    return 1
+    # if the picked release is a multi-season pack, claim those seasons' gap episodes too
+    seasons = _pack_seasons(title, e["season"])
+    extra = _assign_pack(e["series_id"], seasons, h, rid, title) if (seasons is None or len(seasons) > 1) else 0
+    core.log(f"tv grab EP(interactive) {ep_id}: {title} -> {1 + extra} ep(s)")
+    return 1 + extra
 
 
 def stage_search(cfg=None):
@@ -272,10 +302,10 @@ def stage_search(cfg=None):
             if best:
                 sc, seed, rtitle, link = best
                 h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
-                for e in eps:
-                    core.set_ep_status(e["id"], "downloading", dl_hash=h,
-                                       candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
-                core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle}")
+                seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
+                claimed = _assign_pack(sid, seasons, h, None, rtitle)
+                core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
+                         f"(seasons {sorted(seasons) if seasons else 'ALL'})")
                 n += 1
                 continue
             # no pack -> fall through to per-episode
