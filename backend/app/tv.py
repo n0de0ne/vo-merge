@@ -123,11 +123,14 @@ def stage_search(cfg=None):
     if not (cfg["enabled"] and cfg["scope_series"]):
         return
     pend = core.get_episodes("pending")
+    cap = cfg.get("max_search_per_run", 25); n = 0   # ramp gradually, don't flood indexers
     # group by (series, season)
     by_season = defaultdict(list)
     for e in pend:
         by_season[(e["series_id"], e["series_title"], e["season"])].append(e)
     for (sid, title, season), eps in by_season.items():
+        if n >= cap:
+            break
         if len(eps) >= cfg["tv_pack_threshold"]:
             q = f"{title} S{season:02d}"
             best = _search(q, cfg, want_pack=True, season=season)
@@ -138,9 +141,12 @@ def stage_search(cfg=None):
                     core.set_ep_status(e["id"], "downloading", dl_hash=h,
                                        candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
                 core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle}")
+                n += 1
                 continue
             # no pack -> fall through to per-episode
         for e in eps:
+            if n >= cap:
+                break
             q = f"{title} S{e['season']:02d}E{e['episode']:02d}"
             best = _search(q, cfg, season=e["season"], ep=e["episode"])
             if not best or best[0] < cfg["min_seeders"]:
@@ -152,6 +158,7 @@ def stage_search(cfg=None):
             core.set_ep_status(e["id"], "downloading", dl_hash=h,
                                candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
             core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
+            n += 1
 
 
 # ------------------------------------------------------------------ FINISH (map + merge)

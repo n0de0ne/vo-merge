@@ -467,8 +467,11 @@ def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not cfg["enabled"]:
         return
+    cap = cfg.get("max_search_per_run", 25); n = 0
     for mv in core.get_movies("pending"):
-        search_movie(mv["tmdb_id"], cfg)
+        search_movie(mv["tmdb_id"], cfg); n += 1
+        if n >= cap:
+            break
 
 
 def stage_finish(cfg=None):

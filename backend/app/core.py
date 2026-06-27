@@ -56,6 +56,7 @@ DEFAULTS = {
     "sync_hwaccel_device": "/dev/dri/renderD128",
     "search_interval_min": 60,
     "finish_interval_min": 10,
+    "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "enabled": False,                      # master switch; off until configured
 }
 
