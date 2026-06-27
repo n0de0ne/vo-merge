@@ -8,7 +8,7 @@ body {
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 a { color: var(--accent); }
-.app { max-width: 1280px; margin: 0 auto; padding: 0 20px 60px; }
+.app { max-width: 1400px; margin: 0 auto; padding: 0 14px 60px; }
 header.top {
   display: flex; align-items: center; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--border);
 }
@@ -20,7 +20,7 @@ nav button {
   padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
 }
 nav button.active { background: var(--panel); color: var(--text); border-color: var(--border); }
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; overflow-x: auto; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 14px; overflow-x: hidden; }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
 button.btn {
@@ -33,7 +33,7 @@ table { width: 100%; border-collapse: collapse; }
 /* action buttons live in the last cell — bound the group so it wraps inside the card */
 tbody td:last-child .row { max-width: 220px; gap: 6px; justify-content: flex-end; margin-left: auto; }
 tbody td:last-child .btn { padding: 5px 9px; font-size: 12px; }
-th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 td .sub { color: var(--muted); font-size: 12px; }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }
