@@ -87,6 +87,25 @@ def do_scan():
     return {"found": pipeline.scan()}
 
 
+@api.post("/finish")
+def do_finish():
+    """Run the finish stage (poll qB, merge completed downloads) in-process so it shares the
+    merge lock with the scheduler — never spawn merges in a separate process."""
+    import threading
+    from . import tv
+
+    def _run():
+        cfg = core.load_config()
+        try:
+            pipeline.stage_finish(cfg)
+            tv.stage_finish(cfg)
+        except Exception as e:
+            core.log(f"manual finish error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True}
+
+
 @api.post("/movie/{tmdb_id}/search")
 def do_search(tmdb_id: int):
     pipeline.search_movie(tmdb_id); return core.get_movie(tmdb_id)
