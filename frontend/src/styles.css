@@ -63,6 +63,16 @@ input.sync { width: 110px; }
 
 /* poster thumbnails (Sonarr/Radarr-style rows) */
 .titlecell { display: flex; gap: 12px; align-items: flex-start; }
+.showgroup { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; overflow: hidden; }
+.showhead { display: flex; align-items: center; gap: 10px; padding: 8px 10px; cursor: pointer; background: var(--panel2); }
+.showhead:hover { filter: brightness(1.08); }
+.showhead .caret { width: 14px; color: var(--muted); }
+.showhead .poster { width: 34px; }
+.showhead .chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.showhead .pill { font-size: 11px; padding: 2px 7px; }
+.seasonblock { padding: 4px 10px 8px; }
+.seasonhead { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 8px 0 2px; }
+.seasonblock table td { border-bottom: 1px solid #232c38; }
 .poster {
   width: 46px; height: 69px; flex: 0 0 46px; border-radius: 6px;
   object-fit: cover; background: var(--panel2); border: 1px solid var(--border);

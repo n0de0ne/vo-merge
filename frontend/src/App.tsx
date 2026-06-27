@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, Movie, Status, Episode, Candidate } from "./api";
 
 const fmtTime = (s: number) => {
@@ -334,6 +334,24 @@ function Series() {
   const [eps, setEps] = useState<Episode[]>([]);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
+
+  // group episodes: show -> season -> episodes (+ per-show status tallies)
+  const shows = useMemo(() => {
+    const m = new Map<string, Episode[]>();
+    for (const e of eps) { let a = m.get(e.series_title); if (!a) { a = []; m.set(e.series_title, a); } a.push(e); }
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([title, list]) => {
+      const byStatus: Record<string, number> = {};
+      for (const e of list) byStatus[e.status] = (byStatus[e.status] || 0) + 1;
+      const sm = new Map<number, Episode[]>();
+      for (const e of list) { let a = sm.get(e.season); if (!a) { a = []; sm.set(e.season, a); } a.push(e); }
+      const seasons = [...sm.entries()].sort((a, b) => a[0] - b[0]);
+      for (const [, seps] of seasons) seps.sort((a, b) => a.episode - b.episode);
+      return { title, poster: list[0]?.poster, eps: list, byStatus, seasons };
+    });
+  }, [eps]);
+  const allOpen = shows.length > 0 && open.size >= shows.length;
 
   async function refresh() {
     setCounts((await api.tvStatus()).counts);
@@ -364,37 +382,53 @@ function Series() {
             <option value="">all states</option>
             {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
-          <span className="muted">{eps.length} episodes</span>
+          <span className="muted">{shows.length} shows · {eps.length} episodes</span>
+          <div className="spacer" />
+          <button className="btn sec" onClick={() => setOpen(allOpen ? new Set() : new Set(shows.map(s => s.title)))}>
+            {allOpen ? "Collapse all" : "Expand all"}</button>
         </div>
-        <table>
-          <thead><tr>
-            <th>Episode</th><th>Status</th><th>Candidate</th><th>Quality</th><th>Actions</th>
-          </tr></thead>
-          <tbody>
-            {eps.map(e => (
-              <tr key={e.id}>
-                <td><div className="titlecell">
-                  <Poster src={e.poster} alt={e.series_title} />
-                  <div>{e.series_title} — S{pad2(e.season)}E{pad2(e.episode)}
-                    {e.error && <div className="sub bad">{e.error}</div>}</div>
-                </div></td>
-                <td><Pill s={e.status} />{e.sync_delta != null && e.status === "sync_fail" &&
-                  <div className="sub">Δ {e.sync_delta.toFixed(1)}s</div>}</td>
-                <td>{e.candidate_title
-                  ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
-                  : <span className="muted">—</span>}</td>
-                <td className="muted">{e.quality || "—"}</td>
-                <td><div className="row">
-                  {["pending","no_release","error"].includes(e.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
-                  {!["ignored","merged"].includes(e.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>}
-                </div></td>
-              </tr>
-            ))}
-            {eps.length === 0 && <tr><td colSpan={5} className="muted">No episodes.</td></tr>}
-          </tbody>
-        </table>
+        {shows.map(sh => {
+          const isOpen = open.has(sh.title);
+          return (
+            <div className="showgroup" key={sh.title}>
+              <div className="showhead" onClick={() => toggle(sh.title)}>
+                <span className="caret">{isOpen ? "▾" : "▸"}</span>
+                <Poster src={sh.poster} alt={sh.title} />
+                <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
+                <div className="spacer" />
+                <span className="chips">
+                  {Object.entries(sh.byStatus).map(([s, n]) =>
+                    <span className={`pill ${s}`} key={s}>{n} {s.replace("_", " ")}</span>)}
+                </span>
+              </div>
+              {isOpen && sh.seasons.map(([season, seps]) => (
+                <div className="seasonblock" key={season}>
+                  <div className="seasonhead">Season {season} <span className="muted">· {seps.length}</span></div>
+                  <table><tbody>
+                    {seps.map(e => (
+                      <tr key={e.id}>
+                        <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
+                        <td style={{ width: 110 }}><Pill s={e.status} />
+                          {e.error && <div className="sub bad">{e.error}</div>}</td>
+                        <td>{e.candidate_title
+                          ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
+                          : <span className="muted">—</span>}</td>
+                        <td className="muted" style={{ width: 90 }}>{e.quality || "—"}</td>
+                        <td><div className="row">
+                          {["pending", "no_release", "error"].includes(e.status) &&
+                            <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
+                          {!["ignored", "merged"].includes(e.status) &&
+                            <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>}
+                        </div></td>
+                      </tr>
+                    ))}
+                  </tbody></table>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+        {shows.length === 0 && <div className="muted">No episodes.</div>}
       </div>
     </>
   );
