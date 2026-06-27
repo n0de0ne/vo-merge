@@ -294,14 +294,16 @@ function Dashboard() {
                   : <span className="muted">—</span>}</td>
                 <td className="muted">{m.quality || "—"}</td>
                 <td><div className="row">
+                  {/* Interactive: open the release picker to choose a release by hand */}
                   {["pending","no_release","error","review","sync_fail","grabbed","downloading"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>}
+                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Interactive…</button>}
+                  {/* Auto search: search + auto-grab the top-scored release */}
                   {["pending","no_release","error"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Search</button>}
-                  {/* search again — re-run the search now */}
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Auto-search</button>}
+                  {/* Search again — re-run the auto search now (keeps the blocklist) */}
                   {["no_release","error","sync_fail","downloading","merged"].includes(m.status) &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.research(m.tmdb_id))}>Search again</button>}
-                  {/* pick another version — blocklist current release, grab the next */}
+                  {/* Pick another version — blocklist current release, grab the next-best */}
                   {["grabbed","downloading","no_release","error","sync_fail"].includes(m.status) &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>}
                   {m.status === "merged" &&

@@ -56,7 +56,7 @@ DEFAULTS = {
     "sync_hwaccel_device": "/dev/dri/renderD128",
     "search_interval_min": 60,
     "finish_interval_min": 10,
-    "stall_timeout_min": 30,               # an incomplete download not moving (no seeds/0 speed) for
+    "stall_timeout_min": 5,                # an incomplete download not moving (no seeds/0 speed) for
                                            # this long is dropped + blocklisted -> grab another release
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "enabled": False,                      # master switch; off until configured
