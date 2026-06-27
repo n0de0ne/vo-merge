@@ -20,7 +20,7 @@ nav button {
   padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
 }
 nav button.active { background: var(--panel); color: var(--text); border-color: var(--border); }
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; overflow-x: auto; }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
 button.btn {
@@ -30,6 +30,9 @@ button.btn {
 button.btn.sec { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
 button.btn:disabled { opacity: .5; cursor: default; }
 table { width: 100%; border-collapse: collapse; }
+/* action buttons live in the last cell — bound the group so it wraps inside the card */
+tbody td:last-child .row { max-width: 220px; gap: 6px; justify-content: flex-end; margin-left: auto; }
+tbody td:last-child .btn { padding: 5px 9px; font-size: 12px; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 td .sub { color: var(--muted); font-size: 12px; }
