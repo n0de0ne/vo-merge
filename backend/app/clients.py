@@ -164,17 +164,16 @@ class Plex:
         return r.json().get("MediaContainer", {}).get("Directory", [])
 
     def scan_path(self, folder):
-        """Targeted scan of `folder` in whichever movie section contains it, so Plex
-        re-reads a changed file's streams (e.g. newly-added audio tracks)."""
+        """Targeted scan of `folder` in whichever section (movie OR show, incl. the -EN
+        libraries) contains it, so Plex re-reads changed files / picks up new symlinks."""
+        done = False
         for d in self.sections():
-            if d.get("type") != "movie":
-                continue
             locs = [l.get("path") for l in d.get("Location", []) if l.get("path")]
-            if any(folder.startswith(l) for l in locs):
+            if any(folder == l or folder.startswith(l.rstrip("/") + "/") for l in locs):
                 requests.get(f"{self.url}/library/sections/{d['key']}/refresh",
                              params={"path": folder, "X-Plex-Token": self.token}, timeout=15)
-                return True
-        return False
+                done = True   # a folder can live in >1 section (original + -EN) -> refresh all
+        return done
 
     def ping(self):
         r = requests.get(f"{self.url}/identity",

@@ -486,6 +486,7 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         # or a prior merge). Mark done instead of erroring on "nothing to add".
         core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"merge {tmdb_id}: library already has the wanted audio -> done")
+        mirror_to_en(fr, cfg)
         return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     drift = None
@@ -591,6 +592,31 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
         pass
 
 
+EN_LIBS = {"Films": "Films-EN", "Series": "Series-EN", "Anime": "Anime-EN"}
+
+
+def mirror_to_en(libfile, cfg=None):
+    """A just-merged file now has English -> add its symlink to the matching -EN library and
+    refresh that -EN Plex section immediately, so it shows up without waiting for the scheduled
+    mirror script. Best-effort; never raises into the merge flow."""
+    cfg = cfg or core.load_config()
+    try:
+        rel = os.path.relpath(libfile, cfg["media_mount"])     # e.g. Films/Movie (2003)/file.mkv
+        parts = rel.split(os.sep, 1)
+        en_top = EN_LIBS.get(parts[0]) if len(parts) == 2 else None
+        if not en_top:
+            return
+        link = os.path.join(cfg["media_mount"], en_top, parts[1])
+        if not os.path.lexists(link):
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            os.symlink(os.path.relpath(libfile, os.path.dirname(link)), link)
+        en_dir = os.path.dirname(link).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
+        Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(en_dir)
+        core.log(f"mirror: EN symlink + Plex scan for {en_top}/{parts[1]}")
+    except Exception as e:
+        core.log(f"mirror EN failed for {libfile}: {e}")
+
+
 def finish_movie(tmdb_id, cfg=None):
     """Swap merged file into the library folder, remove FR-only, trigger Radarr rescan.
     Hardlink-aware: if the FR file has nlink>1 (seeded), we don't delete it, just rename aside."""
@@ -621,6 +647,7 @@ def finish_movie(tmdb_id, cfg=None):
             core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan + Plex scan ({plex_dir}) queued")
         except Exception as e:
             core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan queued; Plex scan skipped: {e}")
+        mirror_to_en(dest, cfg)        # add to the -EN library + refresh that section now
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"finish: {e}")
 

@@ -162,7 +162,7 @@ def init_tv():
             error TEXT, updated REAL,
             dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
         _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
-                                     "poster": "TEXT", "progress": "TEXT"})
+                                     "poster": "TEXT", "progress": "TEXT", "added_langs": "TEXT"})
 
 
 def upsert_episode(e: dict):

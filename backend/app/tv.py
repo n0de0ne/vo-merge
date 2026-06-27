@@ -10,7 +10,7 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       MERGE_LOCK, FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
+                       mirror_to_en, MERGE_LOCK, FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -357,6 +357,7 @@ def _merge_episode_impl(ep, en_file, cfg):
             core.log(f"tv merge {ep['id']}: MULTI used directly")
             try: _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
             except Exception: pass
+            mirror_to_en(fr, cfg)
         else:
             core.set_ep_status(ep["id"], "error", error="multi remux failed")
         return
@@ -382,6 +383,7 @@ def _merge_episode_impl(ep, en_file, cfg):
         # episode file already has English -> already filled (stale tag / prior merge), mark done
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"tv merge {ep['id']}: already has English -> done")
+        mirror_to_en(fr, cfg)
         return
     drift = None
     if not offset and cfg.get("auto_sync", True):
@@ -424,6 +426,7 @@ def _merge_episode_impl(ep, en_file, cfg):
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
     except Exception:
         pass
+    mirror_to_en(fr, cfg)          # add to Series-EN/Anime-EN + refresh that section now
 
 
 def _drop_stalled_eps(eps, t, cfg):
