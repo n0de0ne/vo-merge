@@ -10,6 +10,9 @@ from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
 EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
+# strong signals the release actually carries an English track (esp. anime: "Dual Audio" =
+# Japanese + English). Used to boost/prefer English-bearing releases.
+EN_AUDIO = re.compile(r'(DUAL[\s._-]?AUDIO|\bDUAL\b|\bENG\b|\bENGLISH\b)', re.I)
 RES    = re.compile(r'(2160p|1080p|720p|480p)', re.I)
 SRC    = re.compile(r'(blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|dvdrip|remux)', re.I)
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")

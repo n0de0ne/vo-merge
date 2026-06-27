@@ -284,6 +284,19 @@ def ep_ignore(ep_id: str):
     core.set_ep_status(ep_id, "ignored"); return {"ok": True}
 
 
+@api.get("/episode/{ep_id}/candidates")
+def ep_candidates(ep_id: str):
+    from . import tv
+    return tv.episode_candidates(ep_id)
+
+
+@api.post("/episode/{ep_id}/grab")
+def ep_grab(ep_id: str, body: GrabIn):
+    from . import tv
+    n = tv.grab_episode(ep_id, body.link, body.rid, body.title)
+    return {"ok": True, "episodes": n}
+
+
 app.mount("/api", api)
 
 # ----- serve SPA (built React) -----

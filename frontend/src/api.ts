@@ -70,6 +70,11 @@ export const api = {
   seasonGrab: (seriesId: number, season: number, link: string, rid: string, title: string) =>
     j<{ ok: boolean; episodes: number }>(`/api/tv/${seriesId}/${season}/grab`,
       { method: "POST", body: JSON.stringify({ link, rid, title }) }),
+  episodeCandidates: (epId: string) =>
+    j<Candidate[]>(`/api/episode/${encodeURIComponent(epId)}/candidates`),
+  episodeGrab: (epId: string, link: string, rid: string, title: string) =>
+    j<{ ok: boolean; episodes: number }>(`/api/episode/${encodeURIComponent(epId)}/grab`,
+      { method: "POST", body: JSON.stringify({ link, rid, title }) }),
 
   // ---- Interactive release search ----
   candidates: (id: number) => j<Candidate[]>(`/api/movie/${id}/candidates`),

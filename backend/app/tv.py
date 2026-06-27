@@ -10,7 +10,7 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       FR_DUB, EN_OK, RES, SRC)
+                       FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -93,7 +93,7 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t):
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -110,6 +110,7 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
         sc = min(int(r.get("seeders") or 0), 100)
         if RES.search(t): sc += 20
         if re.search(r'\bMULTI\b', t, re.I): sc += 20
+        if EN_AUDIO.search(t): sc += 60          # explicit English / Dual-Audio (anime)
         link = _pick_link(r)
         if best is None or sc > best[0]:
             best = (sc, r.get("seeders") or 0, t, link)
@@ -136,7 +137,7 @@ def season_candidates(series_id, season, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t):
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -149,6 +150,7 @@ def season_candidates(series_id, season, cfg=None):
         if is_pack: sc += 50
         if RES.search(t): sc += 20
         if re.search(r"\bMULTI\b", t, re.I): sc += 200
+        if EN_AUDIO.search(t): sc += 120         # explicit English / Dual-Audio (anime)
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
@@ -171,6 +173,61 @@ def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
                            candidate_title=title, error=None)
     core.log(f"tv grab SEASON {series_id} S{season:02d}: {len(eps)} eps <- {title}")
     return len(eps)
+
+
+def episode_candidates(ep_id, cfg=None):
+    """Scored release candidates for ONE episode (single-ep releases preferred, season packs
+    that contain it also offered) — powers the per-episode interactive search. English/Dual-Audio
+    releases are boosted (useful for anime that ship French+Japanese and need English added)."""
+    cfg = cfg or core.load_config()
+    e = core.get_episode(ep_id)
+    if not e:
+        return []
+    title, season, ep = e["series_title"], e["season"], e["episode"]
+    import json as _json
+    tried = set(_json.loads(e.get("tried") or "[]"))
+    pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
+    try:
+        results = pro.search(f"{title} S{season:02d}E{ep:02d}",
+                             cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+    except Exception as ex:
+        core.log(f"episode_candidates: {ex}"); return []
+    qt = _toks(title); out = []
+    for r in results:
+        t = r.get("title", ""); tl = t.lower()
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
+            continue
+        if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
+            continue
+        m = SXXEXX.search(t)
+        is_ep = bool(m and int(m.group(1)) == season and int(m.group(2)) == ep)
+        is_pack = (not m) and bool(re.search(rf"(s0?{season}\b|season\s*0?{season}\b|complete|int[eé]grale)", tl))
+        if not (is_ep or is_pack):
+            continue
+        sc = min(int(r.get("seeders") or 0), 100)
+        if is_pack: sc += 30
+        if RES.search(t): sc += 20
+        if re.search(r"\bMULTI\b", t, re.I): sc += 200
+        if EN_AUDIO.search(t): sc += 120          # explicit English / Dual-Audio
+        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                    "title": t, "indexer": r.get("indexer"), "pack": is_pack,
+                    "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
+                    "link": link, "rid": rid, "tried": rid in tried})
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
+    """Grab a user-chosen release for a single episode (interactive)."""
+    cfg = cfg or core.load_config()
+    e = core.get_episode(ep_id)
+    if not e:
+        return 0
+    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{ep_id.replace(':', '_')}", cfg)
+    core.set_ep_status(ep_id, "downloading", dl_hash=h, dl_id=rid, candidate_title=title, error=None)
+    core.log(f"tv grab EP(interactive) {ep_id}: {title}")
+    return 1
 
 
 def stage_search(cfg=None):

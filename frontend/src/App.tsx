@@ -342,6 +342,7 @@ function Series() {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
+  const [relEp, setRelEp] = useState<Episode | null>(null);
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
 
   // group episodes: show -> season -> episodes (+ per-show status tallies)
@@ -427,6 +428,8 @@ function Series() {
                           : <span className="muted">—</span>}</td>
                         <td className="muted" style={{ width: 90 }}>{e.quality || "—"}</td>
                         <td><div className="row">
+                          {!["ignored", "merged"].includes(e.status) &&
+                            <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Interactive…</button>}
                           {["pending", "no_release", "error"].includes(e.status) &&
                             <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
                           {!["ignored", "merged"].includes(e.status) &&
@@ -446,6 +449,10 @@ function Series() {
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
         onGrab={c => api.seasonGrab(relSeason.seriesId, relSeason.season, c.link, c.rid, c.title)}
         onClose={() => setRelSeason(null)} onGrabbed={refresh} />}
+      {relEp && <ReleaseModal title={`${relEp.series_title} S${pad2(relEp.season)}E${pad2(relEp.episode)}`}
+        load={() => api.episodeCandidates(relEp.id)}
+        onGrab={c => api.episodeGrab(relEp.id, c.link, c.rid, c.title)}
+        onClose={() => setRelEp(null)} onGrabbed={refresh} />}
     </>
   );
 }
