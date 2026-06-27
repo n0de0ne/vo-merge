@@ -179,32 +179,30 @@ function Pill({ s }: { s: string }) {
 }
 
 // ---------------- Interactive release search modal ----------------
-function ReleaseModal({ movie, onClose, onGrabbed }:
-  { movie: Movie; onClose: () => void; onGrabbed: () => void }) {
+function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
+  { title: string; load: () => Promise<Candidate[]>; onGrab: (c: Candidate) => Promise<any>;
+    onClose: () => void; onGrabbed: () => void }) {
   const [list, setList] = useState<Candidate[] | null>(null);
   const [err, setErr] = useState("");
   const [grabbing, setGrabbing] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    api.candidates(movie.tmdb_id)
-      .then(c => { if (alive) setList(c); })
-      .catch(e => { if (alive) setErr(e.message || "search failed"); });
+    load().then(c => { if (alive) setList(c); }).catch(e => { if (alive) setErr(e.message || "search failed"); });
     return () => { alive = false; };
-  }, [movie.tmdb_id]);
+    /* eslint-disable-next-line */
+  }, []);
 
   async function grab(c: Candidate) {
     setGrabbing(c.rid);
-    try {
-      await api.grab(movie.tmdb_id, c.link, c.rid, c.title);
-      onGrabbed(); onClose();
-    } catch (e: any) { setErr(e.message || "grab failed"); setGrabbing(null); }
+    try { await onGrab(c); onGrabbed(); onClose(); }
+    catch (e: any) { setErr(e.message || "grab failed"); setGrabbing(null); }
   }
 
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={e => e.stopPropagation()} style={{ width: "min(860px,94vw)" }}>
-        <div className="row"><b>Releases — {movie.title}</b><div className="spacer" />
+        <div className="row"><b>Releases — {title}</b><div className="spacer" />
           <button className="btn sec" onClick={onClose}>✕</button></div>
         {err && <div className="sub bad" style={{ marginTop: 8 }}>{err}</div>}
         {!list && !err && <div className="muted" style={{ marginTop: 12 }}>searching indexers… (this can take a few seconds)</div>}
@@ -216,6 +214,7 @@ function ReleaseModal({ movie, onClose, onGrabbed }:
                 <div className="rel-main">
                   <div className="rel-title">
                     {c.title}
+                    {c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
                     {c.multi && <span className="multi-badge">MULTI</span>}
                     {c.tried && <span className="tried-mark">tried</span>}
                   </div>
@@ -320,7 +319,10 @@ function Dashboard() {
         </table>
       </div>
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
-      {release && <ReleaseModal movie={release} onClose={() => setRelease(null)} onGrabbed={refresh} />}
+      {release && <ReleaseModal title={release.title}
+        load={() => api.candidates(release.tmdb_id)}
+        onGrab={c => api.grab(release.tmdb_id, c.link, c.rid, c.title)}
+        onClose={() => setRelease(null)} onGrabbed={refresh} />}
     </>
   );
 }
@@ -335,6 +337,7 @@ function Series() {
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
+  const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
 
   // group episodes: show -> season -> episodes (+ per-show status tallies)
@@ -403,7 +406,10 @@ function Series() {
               </div>
               {isOpen && sh.seasons.map(([season, seps]) => (
                 <div className="seasonblock" key={season}>
-                  <div className="seasonhead">Season {season} <span className="muted">· {seps.length}</span></div>
+                  <div className="seasonhead">Season {season} <span className="muted">· {seps.length}</span>
+                    <button className="btn sec" style={{ marginLeft: 8, padding: "2px 8px", fontSize: 11 }}
+                      onClick={() => setRelSeason({ seriesId: seps[0].series_id, season, title: sh.title })}>
+                      Search pack…</button></div>
                   <table><tbody>
                     {seps.map(e => (
                       <tr key={e.id}>
@@ -430,6 +436,10 @@ function Series() {
         })}
         {shows.length === 0 && <div className="muted">No episodes.</div>}
       </div>
+      {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
+        load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
+        onGrab={c => api.seasonGrab(relSeason.seriesId, relSeason.season, c.link, c.rid, c.title)}
+        onClose={() => setRelSeason(null)} onGrabbed={refresh} />}
     </>
   );
 }
@@ -479,7 +489,10 @@ function Review() {
             </tbody>
           </table>}
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
-      {release && <ReleaseModal movie={release} onClose={() => setRelease(null)} onGrabbed={refresh} />}
+      {release && <ReleaseModal title={release.title}
+        load={() => api.candidates(release.tmdb_id)}
+        onGrab={c => api.grab(release.tmdb_id, c.link, c.rid, c.title)}
+        onClose={() => setRelease(null)} onGrabbed={refresh} />}
     </div>
   );
 }

@@ -18,7 +18,7 @@ export interface Episode {
 export interface TvStatus { counts: Record<string, number>; }
 export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
-  multi: boolean; link: string; rid: string; tried: boolean;
+  multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean;
 }
 
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
@@ -65,6 +65,11 @@ export const api = {
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+  seasonCandidates: (seriesId: number, season: number) =>
+    j<Candidate[]>(`/api/tv/${seriesId}/${season}/candidates`),
+  seasonGrab: (seriesId: number, season: number, link: string, rid: string, title: string) =>
+    j<{ ok: boolean; episodes: number }>(`/api/tv/${seriesId}/${season}/grab`,
+      { method: "POST", body: JSON.stringify({ link, rid, title }) }),
 
   // ---- Interactive release search ----
   candidates: (id: number) => j<Candidate[]>(`/api/movie/${id}/candidates`),

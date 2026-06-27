@@ -261,6 +261,19 @@ def tv_scan():
     return {"found": tv.scan()}
 
 
+@api.get("/tv/{series_id}/{season}/candidates")
+def tv_season_candidates(series_id: int, season: int):
+    from . import tv
+    return tv.season_candidates(series_id, season)
+
+
+@api.post("/tv/{series_id}/{season}/grab")
+def tv_season_grab(series_id: int, season: int, body: GrabIn):
+    from . import tv
+    n = tv.grab_season(series_id, season, body.link, body.rid, body.title)
+    return {"ok": True, "episodes": n}
+
+
 @api.post("/episode/{ep_id}/retry")
 def ep_retry(ep_id: str):
     core.set_ep_status(ep_id, "pending", error=None); return {"ok": True}

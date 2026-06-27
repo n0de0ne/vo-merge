@@ -118,6 +118,63 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
     return best
 
 
+def season_candidates(series_id, season, cfg=None):
+    """Scored release candidates for a whole season (packs preferred) — for the UI's
+    interactive season-pack search."""
+    cfg = cfg or core.load_config()
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id and e["season"] == season]
+    if not eps:
+        return []
+    title = eps[0]["series_title"]
+    import json as _json
+    tried = set()
+    for e in eps:
+        tried |= set(_json.loads(e.get("tried") or "[]"))
+    pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
+    try:
+        results = pro.search(f"{title} S{season:02d}", cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+    except Exception as e:
+        core.log(f"season_candidates: {e}"); return []
+    qt = _toks(title); out = []
+    for r in results:
+        t = r.get("title", ""); tl = t.lower()
+        if FR_DUB.search(t) and not EN_OK.search(t):
+            continue
+        if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
+            continue
+        m = SXXEXX.search(t)
+        is_pack = (not m) and bool(re.search(rf"(s0?{season}\b|season\s*0?{season}\b|complete|int[eé]grale)", tl))
+        is_ep = bool(m and int(m.group(1)) == season)
+        if not (is_pack or is_ep):
+            continue
+        sc = min(int(r.get("seeders") or 0), 100)
+        if is_pack: sc += 50
+        if RES.search(t): sc += 20
+        if re.search(r"\bMULTI\b", t, re.I): sc += 200
+        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                    "title": t, "indexer": r.get("indexer"), "pack": is_pack,
+                    "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
+                    "link": link, "rid": rid, "tried": rid in tried})
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
+    """Grab a user-chosen season pack and assign it to all the season's gap episodes."""
+    cfg = cfg or core.load_config()
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id and e["season"] == season
+           and e["status"] not in ("merged", "ignored")]
+    if not eps:
+        return 0
+    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_S{season:02d}", cfg)
+    for e in eps:
+        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
+                           candidate_title=title, error=None)
+    core.log(f"tv grab SEASON {series_id} S{season:02d}: {len(eps)} eps <- {title}")
+    return len(eps)
+
+
 def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
