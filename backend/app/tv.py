@@ -376,8 +376,13 @@ def _merge_episode_impl(ep, en_file, cfg):
         if a["lang"] == "und" or a["lang"] in have:
             continue
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
-    if "eng" not in have or not ids:
+    if "eng" not in have:
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
+    if not ids:
+        # episode file already has English -> already filled (stale tag / prior merge), mark done
+        core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
+        core.log(f"tv merge {ep['id']}: already has English -> done")
+        return
     drift = None
     if not offset and cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)

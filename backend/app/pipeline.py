@@ -482,7 +482,11 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error",
                         error="merge: no English or original-language (VO) audio to add"); return
     if not ids:
-        core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
+        # base already has the wanted audio (English/VO) -> gap already filled (stale vo-gap tag
+        # or a prior merge). Mark done instead of erroring on "nothing to add".
+        core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
+        core.log(f"merge {tmdb_id}: library already has the wanted audio -> done")
+        return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     drift = None
     if not offset and cfg.get("auto_sync", True):
