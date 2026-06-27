@@ -286,7 +286,9 @@ function Dashboard() {
                     {m.error && <div className="sub bad">{m.error}</div>}</div>
                 </div></td>
                 <td><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
-                  <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}</td>
+                  <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
+                  {m.status === "merging" && m.progress &&
+                  <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}</td>
                 <td>{m.candidate_title
                   ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
                   : <span className="muted">—</span>}</td>
@@ -415,6 +417,8 @@ function Series() {
                       <tr key={e.id}>
                         <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
                         <td style={{ width: 110 }}><Pill s={e.status} />
+                          {e.status === "merging" && e.progress &&
+                          <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
                           {e.error && <div className="sub bad">{e.error}</div>}</td>
                         <td>{e.candidate_title
                           ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>

@@ -4,7 +4,7 @@ export interface Movie {
   status: string; candidate_title: string | null; candidate_score: number | null;
   candidate_seeders: number | null; dl_hash: string | null; en_file: string | null;
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
-  error: string | null; updated: number; poster?: string | null;
+  error: string | null; updated: number; poster?: string | null; progress?: string | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
@@ -13,7 +13,7 @@ export interface Episode {
   id: string; series_id: number; series_title: string; season: number; episode: number;
   status: string; candidate_title: string | null; candidate_score: number | null;
   candidate_seeders: number | null; quality: string | null; poster: string | null;
-  sync_delta: number | null; error: string | null;
+  sync_delta: number | null; error: string | null; progress?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface Candidate {

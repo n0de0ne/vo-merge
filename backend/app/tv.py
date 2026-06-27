@@ -9,7 +9,7 @@ import os, re, subprocess, shutil
 from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
-from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet,
+from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        FR_DUB, EN_OK, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
@@ -79,9 +79,7 @@ def _grab(link, savepath, cfg):
     qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
     qb.login()
     qb.create_category(cfg["qb_tv_category"], cfg["qb_tv_download_dir"])
-    resp = qb.add(link, cfg["qb_tv_category"], savepath)
-    ids = resp.get("added_torrent_ids") if isinstance(resp, dict) else None
-    return (ids[0] if ids else None) or _hash_from_magnet(link)
+    return qb_grab(qb, link, cfg["qb_tv_category"], savepath)
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
@@ -229,8 +227,10 @@ def _merge_episode(ep, en_file, cfg):
     ei, fi = probe(en_file), probe(fr)
     if not ei or not fi:
         core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
-    # MULTI episode: download already has both langs -> remux directly, no merge
-    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]}:
+    # MULTI episode: download has both langs -> remux directly, but ONLY if its video isn't
+    # worse than the library file; otherwise keep the library video and graft English (below).
+    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]} \
+       and _video_quality(en_file, ei["dur"]) >= _video_quality(fr, fi["dur"]):
         out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
         os.makedirs(os.path.dirname(out), exist_ok=True)
         if subprocess.run(["mkvmerge", "-o", out, en_file], capture_output=True).returncode in (0, 1):
@@ -246,9 +246,12 @@ def _merge_episode(ep, en_file, cfg):
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = ep.get("sync_offset_ms") or 0
-    if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
+    # framerate mismatch is handled by the drift detector below (not rejected upfront);
+    # only bail here if auto-sync is off, since a constant offset can't fix frame drift.
+    fps_diff = not sync.fps_close(ei["fps"], fi["fps"])
+    if fps_diff and not offset and not cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
-                           error=f"framerate differs ({ei['fps']} vs {fi['fps']})"); return
+                           error=f"framerate differs ({ei['fps']} vs {fi['fps']}), auto-sync off"); return
     eq, fq = _video_quality(en_file, ei["dur"]), _video_quality(fr, fi["dur"])
     base, bi, donor, di = (fr, fi, en_file, ei) if fq >= eq else (en_file, ei, fr, fi)
     have = {a["lang"] for a in bi["auds"]}
@@ -261,14 +264,19 @@ def _merge_episode(ep, en_file, cfg):
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
     drift = None
     if not offset and cfg.get("auto_sync", True):
-        m, conf, method, drift = sync.detect(base, donor, 0, daidx[ids[0]],
-                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}")
-        if m is None:
-            core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
-                               error="couldn't sync (incompatible release/cut)"); return
+        core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
+        m, conf, method, drift = sync.detect(
+            base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
+            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg))
+        if m is None or (fps_diff and not drift):
+            why = ("framerates differ but no reliable drift could be measured"
+                   if (m is not None and fps_diff and not drift)
+                   else "couldn't sync (incompatible release/cut)")
+            core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta, progress="", error=why); return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
+    core.set_ep_status(ep["id"], "merging", progress="muxing audio…")
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
@@ -289,12 +297,36 @@ def _merge_episode(ep, en_file, cfg):
     except OSError:
         pass
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
-                       error=None, added_langs=",".join(sorted({langs[i] for i in ids})))
+                       error=None, progress="", added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms -> {os.path.basename(fr)}")
     try:
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
     except Exception:
         pass
+
+
+def _drop_stalled_eps(eps, t, cfg):
+    """A stalled season-pack/episode torrent: delete it, blocklist that release for all its
+    episodes, set them back to pending so stage_search grabs another (better-seeded) release."""
+    import json as _json
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        if eps and eps[0].get("dl_hash"):
+            qb.delete([eps[0]["dl_hash"]], delete_files=True)
+    except Exception:
+        pass
+    seeds = t.get("num_complete", t.get("num_seeds", 0)) or 0
+    for e in eps:
+        tried = _json.loads(e.get("tried") or "[]")
+        if e.get("dl_id") and e["dl_id"] not in tried:
+            tried.append(e["dl_id"])
+        attempts = (e.get("attempts") or 0) + 1
+        st = "no_release" if attempts >= cfg.get("max_sync_retries", 4) else "pending"
+        core.set_ep_status(e["id"], st, tried=_json.dumps(tried), attempts=attempts,
+                           dl_hash=None, dl_id=None, en_file=None, progress="",
+                           error=("all releases stalled" if st == "no_release" else None))
+    core.log(f"tv stall: '{t.get('name','')[:50]}' stalled ({seeds} seeds) -> blocklisted "
+             f"{len(eps)} ep(s), re-searching")
 
 
 def stage_finish(cfg=None):
@@ -314,7 +346,11 @@ def stage_finish(cfg=None):
         by_hash[e.get("dl_hash")].append(e)
     for h, eps in by_hash.items():
         t = torrents.get(h)
-        if not t or t.get("progress", 0) < 1.0:
+        if not t:
+            continue
+        if t.get("progress", 0) < 1.0:
+            if _is_stalled(t, cfg):
+                _drop_stalled_eps(eps, t, cfg)
             continue
         save = (t.get("content_path") or t.get("save_path") or "")
         local = save.replace(cfg["qb_tv_download_dir"], cfg["qb_tv_download_dir"], 1)  # same mount

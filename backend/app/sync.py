@@ -67,7 +67,7 @@ def _linfit(xs, ys):
     return b, a, r2
 
 
-def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
+def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None):
     """Returns (offset_ms|None, confidence, method, drift_ratio|None).
 
     Measures the video offset at several points across the movie:
@@ -80,8 +80,12 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
     import statistics
     amin = cfg.get("auto_sync_min_conf", 0.2)
     wins = _windows(dur, n=max(5, cfg.get("sync_windows", 5)), length=cfg.get("sync_window_dur", 480))
+    n = len(wins)
     vres = []                                          # (center_time_s, offset_ms, conf)
-    for (s, d) in wins:
+    for i, (s, d) in enumerate(wins):
+        if on_progress:
+            on_progress(f"sync: scanning window {i+1}/{n} (@{int(s//60)}min)")
+        core.log(f"sync{tag}: window {i+1}/{n} @ {int(s)}s ({int(d)}s)")
         try:
             m, c = detect_offset_video_ms(
                 base, donor, start=int(s), dur=int(d),
@@ -92,6 +96,9 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag=""):
             core.log(f"sync{tag}: video window {int(s)}s error: {e}"); m, c = None, 0.0
         if m is not None and c >= 0.3:
             vres.append((s + d / 2.0, m, c))
+            core.log(f"sync{tag}: window {i+1}/{n} -> {int(m):+d}ms (conf {c:.2f})")
+    if on_progress:
+        on_progress("sync: computing offset")
     if len(vres) >= 2:
         offs = [o for _, o, _ in vres]
         # largest cluster agreeing within 150ms

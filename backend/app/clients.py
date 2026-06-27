@@ -105,18 +105,26 @@ class QBittorrent:
         except Exception:
             pass  # already exists / non-fatal
 
-    def add(self, urls, category, savepath):
-        r = self.s.post(f"{self.url}/api/v2/torrents/add",
-                        data={"urls": urls, "category": category,
-                              "savepath": savepath, "autoTMM": "false"},
+    def add(self, urls=None, category=None, savepath=None, torrent_file=None):
+        """Add by magnet/URL (urls=) OR by uploading .torrent bytes (torrent_file=).
+        qB's /add never returns the hash — callers confirm it via torrents()/hashes()."""
+        data = {"autoTMM": "false"}
+        if category: data["category"] = category
+        if savepath: data["savepath"] = savepath
+        if urls:     data["urls"] = urls
+        files = {"torrents": ("vo.torrent", torrent_file, "application/x-bittorrent")} if torrent_file else None
+        r = self.s.post(f"{self.url}/api/v2/torrents/add", data=data, files=files,
                         headers={"Referer": self.url}, timeout=60)
         if r.status_code == 409:
             return {"duplicate": True}   # already in qB — fine
         r.raise_for_status()
         try:
-            return r.json()          # {"added_torrent_ids": [...], ...} on qB 5.x
+            return r.json()
         except Exception:
-            return {"raw": r.text}    # older qB returns "Ok."
+            return {"raw": r.text}    # qB returns "Ok." / "Fails."
+
+    def hashes(self, category=None):
+        return {t["hash"].lower() for t in self.torrents(category) if t.get("hash")}
 
     def delete(self, hashes, delete_files=True):
         if not hashes:

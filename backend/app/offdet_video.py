@@ -13,13 +13,19 @@ import numpy as np
 
 def _run(path, start, dur, thresh, scale, threads, hwaccel, device):
     pre = ["nice", "-n", "19", "ffmpeg", "-v", "info", "-threads", str(threads)]
+    # Keep the downscale ON THE GPU (scale_vaapi/scale_qsv + hwdownload) so only tiny frames
+    # cross PCIe — decode+scale of 4K stays on the iGPU. ~7x faster than '-hwaccel vaapi' alone
+    # (which downloads full 4K surfaces to do a software scale).
     if hwaccel == "vaapi":
-        pre += ["-hwaccel", "vaapi", "-hwaccel_device", device]
+        pre += ["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]
+        vf = f"scale_vaapi={scale}:-2,hwdownload,format=nv12,select='gt(scene,{thresh})',showinfo"
     elif hwaccel == "qsv":
-        pre += ["-hwaccel", "qsv"]
+        pre += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        vf = f"scale_qsv={scale}:-2,hwdownload,format=nv12,select='gt(scene,{thresh})',showinfo"
+    else:
+        vf = f"scale={scale}:-2,select='gt(scene,{thresh})',showinfo"
     cmd = pre + ["-ss", str(start), "-t", str(dur), "-i", path,
-                 "-vf", f"scale={scale}:-2,select='gt(scene,{thresh})',showinfo",
-                 "-an", "-sn", "-f", "null", "-"]
+                 "-vf", vf, "-an", "-sn", "-f", "null", "-"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     cuts = [float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", r.stderr)]
     return cuts, r.returncode
@@ -31,7 +37,9 @@ def scene_cuts(path, start, dur, thresh=0.3, scale=160, threads=4,
     available — ~70% less CPU — and transparently falls back to software decode if
     hwaccel isn't present or fails. Run at nice 19 and capped to `threads`."""
     cuts, rc = _run(path, start, dur, thresh, scale, threads, hwaccel, device)
-    if hwaccel and (rc != 0 or len(cuts) < 5):     # hwaccel missing/failed -> software
+    # only fall back to (slow, full-res) software decode on a real hwaccel failure — NOT on a
+    # legitimately low-action window, which would needlessly software-decode 4K.
+    if hwaccel and (rc != 0 or len(cuts) == 0):
         cuts, rc = _run(path, start, dur, thresh, scale, threads, None, device)
     return np.array(cuts)
 

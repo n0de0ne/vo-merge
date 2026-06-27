@@ -3,7 +3,8 @@
 
 Search & merge logic is ported verbatim from the validated dry-run scripts.
 """
-import json, os, re, subprocess, shutil
+import json, os, re, subprocess, shutil, time, hashlib
+import requests
 from . import core, sync
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
@@ -12,6 +13,23 @@ EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
 RES    = re.compile(r'(2160p|1080p|720p|480p)', re.I)
 SRC    = re.compile(r'(blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|dvdrip|remux)', re.I)
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
+
+# original-language name (Radarr/Sonarr) -> audio-track codes ffprobe may report (ISO-639-2 B/T)
+_ORIG3 = {
+    "english":{"eng"}, "french":{"fre","fra"}, "norwegian":{"nor"}, "japanese":{"jpn"},
+    "korean":{"kor"}, "spanish":{"spa"}, "german":{"ger","deu"}, "italian":{"ita"},
+    "portuguese":{"por"}, "russian":{"rus"}, "chinese":{"chi","zho"}, "mandarin":{"chi","zho"},
+    "cantonese":{"chi","zho"}, "dutch":{"dut","nld"}, "swedish":{"swe"}, "danish":{"dan"},
+    "finnish":{"fin"}, "polish":{"pol"}, "turkish":{"tur"}, "thai":{"tha"}, "arabic":{"ara"},
+    "hindi":{"hin"}, "czech":{"cze","ces"}, "greek":{"gre","ell"}, "hungarian":{"hun"},
+    "romanian":{"rum","ron"}, "ukrainian":{"ukr"}, "icelandic":{"ice","isl"}, "hebrew":{"heb"},
+    "indonesian":{"ind"}, "vietnamese":{"vie"},
+}
+def _orig_codes(name):
+    """Audio-track codes for a title's original language, EXCLUDING English/French (those are
+    handled directly). Empty if the original is English/French/unknown."""
+    s = _ORIG3.get((name or "").strip().lower(), set())
+    return s - {"eng", "fre", "fra"}
 
 
 def _toks(s):
@@ -31,6 +49,72 @@ def _pick_link(r):
 def _hash_from_magnet(link):
     m = re.search(r'urn:btih:([0-9a-fA-F]{40})', link or "")
     return m.group(1).lower() if m else None
+
+
+def _infohash(data):
+    """v1 infohash = SHA1 of the bencoded info dict (matches qB's lowercase hash)."""
+    try:
+        i = data.index(b"4:info") + 6
+        def skip(p):
+            c = data[p:p+1]
+            if c.isdigit():
+                colon = data.index(b":", p); return colon + 1 + int(data[p:colon])
+            if c == b"i":
+                return data.index(b"e", p) + 1
+            if c in (b"l", b"d"):
+                p += 1
+                while data[p:p+1] != b"e":
+                    p = skip(p)
+                return p + 1
+            raise ValueError("bad bencode")
+        return hashlib.sha1(data[i:skip(i)]).hexdigest().lower()
+    except Exception:
+        return None
+
+
+def _fetch_torrent(link):
+    """Resolve a release link OURSELVES — vo-merge can reach LAN Prowlarr; qB behind the
+    VPN killswitch cannot. Returns ('magnet', uri) or ('file', torrent_bytes)."""
+    if not link:
+        raise RuntimeError("empty link")
+    if link.startswith("magnet:"):
+        return "magnet", link
+    url = link
+    for _ in range(6):                       # follow redirects manually (requests can't follow magnet:)
+        resp = requests.get(url, allow_redirects=False, timeout=60)
+        loc = resp.headers.get("Location", "")
+        if loc.startswith("magnet:"):
+            return "magnet", loc
+        if resp.status_code in (301, 302, 303, 307, 308) and loc:
+            url = loc; continue
+        resp.raise_for_status()
+        body = resp.content
+        if body[:7] == b"magnet:":
+            return "magnet", body.decode("utf-8", "ignore").strip()
+        return "file", body                  # .torrent (bencoded) bytes
+    raise RuntimeError("too many redirects fetching torrent")
+
+
+def qb_grab(qb, link, category, savepath):
+    """Add a release to qB robustly and return its real infohash (or None on failure).
+    Fetches the torrent ourselves, uploads it to qB, then confirms by diffing the
+    category's hash set before/after (also proves it actually landed)."""
+    kind, payload = _fetch_torrent(link)
+    before = qb.hashes(category)
+    if kind == "magnet":
+        qb.add(urls=payload, category=category, savepath=savepath)
+        guess = _hash_from_magnet(payload)
+    else:
+        qb.add(torrent_file=payload, category=category, savepath=savepath)
+        guess = _infohash(payload)
+    for _ in range(12):                       # ~18s for magnet metadata / torrent registration
+        new = qb.hashes(category) - before
+        if new:
+            return guess if (guess and guess in new) else new.pop()
+        if guess and guess in before:         # 409 duplicate: already present
+            return guess
+        time.sleep(1.5)
+    return guess
 
 
 def _clients(cfg):
@@ -169,14 +253,56 @@ def grab(tmdb_id, link, cfg=None):
     try:
         qb.login()
         qb.create_category(cfg["qb_category"], cfg["qb_download_dir"])
-        resp = qb.add(link, cfg["qb_category"], savepath)
-        ids = resp.get("added_torrent_ids") if isinstance(resp, dict) else None
-        h = (ids[0] if ids else None) or _hash_from_magnet(link)
+        h = qb_grab(qb, link, cfg["qb_category"], savepath)
+        if not h:
+            raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
         core.set_status(tmdb_id, "downloading", dl_hash=h)
-        core.log(f"grab tmdb={tmdb_id}: sent to qB ({savepath}) hash={h}")
+        core.log(f"grab tmdb={tmdb_id}: added to qB ({savepath}) hash={h}")
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"grab: {e}")
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
+
+
+def _is_stalled(t, cfg):
+    """A qB torrent is 'stalled' = incomplete, active a while, NOT currently downloading, and
+    has no seed source (or qB flags it stalled/errored). Progress level doesn't matter: a
+    0-seed download that isn't moving will never finish, whether it's at 5% or 95%."""
+    if (t.get("progress", 0) or 0) >= 1.0:
+        return False
+    if (t.get("time_active", 0) or 0) < cfg.get("stall_timeout_min", 30) * 60:
+        return False                              # give it time to find peers first
+    if (t.get("dlspeed", 0) or 0) > 0:
+        return False                              # still pulling bytes -> not stalled
+    seeds = t.get("num_complete", t.get("num_seeds", 0)) or 0   # full-swarm seed count
+    return (seeds == 0) or t.get("state") in ("stalledDL", "error", "missingFiles", "metaDL")
+
+
+def drop_stalled(mv, t, cfg):
+    """Delete a stalled download, blocklist that release, and grab another (better-seeded)
+    candidate — or give up after max_sync_retries."""
+    import json as _json
+    tmdb_id = mv["tmdb_id"]
+    tried = _json.loads(mv.get("tried") or "[]")
+    if mv.get("dl_id") and mv["dl_id"] not in tried:
+        tried.append(mv["dl_id"])
+    attempts = (mv.get("attempts") or 0) + 1
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        if mv.get("dl_hash"):
+            qb.delete([mv["dl_hash"]], delete_files=True)
+    except Exception:
+        pass
+    seeds = t.get("num_complete", t.get("num_seeds", 0)) or 0
+    core.log(f"stall {tmdb_id}: '{t.get('name','')[:50]}' stalled "
+             f"({int((t.get('time_active',0) or 0)/60)}min, {seeds} seeds) -> blocklisted, re-searching")
+    if attempts >= cfg.get("max_sync_retries", 4):
+        core.set_status(tmdb_id, "no_release", tried=_json.dumps(tried), attempts=attempts,
+                        dl_hash=None, dl_id=None, en_file=None, progress="",
+                        error=f"all candidate releases stalled after {attempts} tries")
+        return
+    core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
+                    dl_hash=None, dl_id=None, en_file=None, error=None, progress="")
+    search_movie(tmdb_id, cfg)
 
 
 def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
@@ -304,17 +430,28 @@ def merge_movie(tmdb_id, cfg=None):
     ei, fi = probe(en), probe(fr)
     if not ei or not fi:
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
-    # MULTI release: the download already carries BOTH English & French in native sync ->
-    # no merge, no drift risk; use it directly (the ideal outcome).
-    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]}:
-        core.set_status(tmdb_id, "merging")
-        _place_multi(en, mv, cfg, tmdb_id); return
+    # The "wanted" foreign track is English; if this title's original language isn't English
+    # and no English exists, the original-language VO is the fallback (e.g. Norwegian Kraken).
+    rel_langs = {a["lang"] for a in ei["auds"]}
+    orig_codes = _orig_codes(mv.get("original_lang"))
+    # A release is "complete" when it has French + a wanted track (English, or the VO when
+    # the release carries no English). Use it DIRECTLY only if its video isn't worse than the
+    # library file; otherwise keep the library video and graft the wanted audio (fall through).
+    has_wanted = ("eng" in rel_langs) or (bool(orig_codes & rel_langs) and "eng" not in rel_langs)
+    if "fre" in rel_langs and has_wanted:
+        if _video_quality(en, ei["dur"]) >= _video_quality(fr, fi["dur"]):
+            core.set_status(tmdb_id, "merging")
+            _place_multi(en, mv, cfg, tmdb_id); return
+        core.log(f"merge {tmdb_id}: release is lower-res than the library file -> keeping the "
+                 f"library video, grafting its audio instead")
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     offset = mv.get("sync_offset_ms") or 0
-    # only a real framerate mismatch (>3%, e.g. 25 vs 23.976 PAL speedup) can't be fixed
-    # by a constant offset; 23.976 vs 24.0 (NTSC rounding) is fine.
-    if not offset and not sync.fps_close(ei["fps"], fi["fps"]):
-        reject_and_retry(tmdb_id, f"framerate differs ({ei['fps']} vs {fi['fps']})", cfg, delta)
+    # Different framerates (e.g. 25 vs 23.976 PAL speedup) need a linear-drift STRETCH, not a
+    # constant offset. We no longer reject these outright: the drift detector below corrects
+    # them when the sync is confident (high R²), otherwise routes to review.
+    fps_diff = not sync.fps_close(ei["fps"], fi["fps"])
+    if fps_diff and not offset and not cfg.get("auto_sync", True):
+        reject_and_retry(tmdb_id, f"framerate differs ({ei['fps']} vs {fi['fps']}), auto-sync off", cfg, delta)
         return
     # keep the better video; the other source donates its audio
     eq, fq = _video_quality(en, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -328,28 +465,37 @@ def merge_movie(tmdb_id, cfg=None):
         if a["lang"] == "und" or a["lang"] in have:
             continue
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
-    if "eng" not in have:
-        core.set_status(tmdb_id, "error", error="merge: no English audio in either file"); return
+    if not ("eng" in have or (orig_codes & have)):
+        core.set_status(tmdb_id, "error",
+                        error="merge: no English or original-language (VO) audio to add"); return
     if not ids:
         core.set_status(tmdb_id, "error", error="merge: no new audio tracks to add"); return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     drift = None
     if not offset and cfg.get("auto_sync", True):
-        m, conf, method, drift = sync.detect(base, donor, 0, daidx[ids[0]],
-                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}")
-        if m is None:
+        core.set_status(tmdb_id, "merging", progress="sync: starting", error=None)
+        m, conf, method, drift = sync.detect(
+            base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}",
+            on_progress=lambda msg: core.set_status(tmdb_id, "merging", progress=msg))
+        if m is None or (fps_diff and not drift):
+            # m is None  -> inconsistent/low-confidence sync.
+            # fps_diff & no drift -> framerates differ but only a constant offset was found
+            #   (e.g. audio fallback); a constant can't correct frame drift, so don't risk it.
+            why = ("framerates differ but no reliable drift could be measured"
+                   if (m is not None and fps_diff and not drift)
+                   else "low-confidence sync")
             if cfg.get("sync_review", True):
-                core.set_status(tmdb_id, "review", sync_delta=delta,
-                                error="low-confidence sync — review or pick another release")
-                core.log(f"merge {tmdb_id}: inconclusive sync -> review")
+                core.set_status(tmdb_id, "review", sync_delta=delta, progress="",
+                                error=f"{why} — review or pick another release")
+                core.log(f"merge {tmdb_id}: {why} -> review")
             else:
-                reject_and_retry(tmdb_id, "couldn't sync (incompatible release/cut)", cfg, delta)
+                reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta)
             return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"merge {tmdb_id}: sync {offset:+d}ms"
                  f"{' drift ' + format(drift, '.6f') if drift else ''} ({method} conf {conf:.2f})")
-    core.set_status(tmdb_id, "merging", sync_delta=delta)
+    core.set_status(tmdb_id, "merging", sync_delta=delta, progress="muxing audio…")
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"
@@ -370,7 +516,7 @@ def merge_movie(tmdb_id, cfg=None):
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
-    core.set_status(tmdb_id, "merged", merged_file=out,
+    core.set_status(tmdb_id, "merged", merged_file=out, progress="",
                     added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
              f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")
@@ -500,6 +646,8 @@ def stage_finish(cfg=None):
                 core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued")
             continue
         if t.get("progress", 0) < 1.0:
+            if _is_stalled(t, cfg):
+                drop_stalled(mv, t, cfg)
             continue
         # qB save dir was <qb_download_dir>/<tmdb>; we see it under downloads_mount/<tmdb>
         local = os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))

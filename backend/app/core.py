@@ -56,6 +56,8 @@ DEFAULTS = {
     "sync_hwaccel_device": "/dev/dri/renderD128",
     "search_interval_min": 60,
     "finish_interval_min": 10,
+    "stall_timeout_min": 30,               # an incomplete download not moving (no seeds/0 speed) for
+                                           # this long is dropped + blocklisted -> grab another release
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "enabled": False,                      # master switch; off until configured
 }
@@ -134,7 +136,7 @@ def init_db():
             attempts INTEGER DEFAULT 0
         )""")
         _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
-                                   "added_langs": "TEXT", "poster": "TEXT"})
+                                   "added_langs": "TEXT", "poster": "TEXT", "progress": "TEXT"})
 
 
 def _ensure_cols(c, table, cols):
@@ -160,7 +162,7 @@ def init_tv():
             error TEXT, updated REAL,
             dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
         _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
-                                     "poster": "TEXT"})
+                                     "poster": "TEXT", "progress": "TEXT"})
 
 
 def upsert_episode(e: dict):
