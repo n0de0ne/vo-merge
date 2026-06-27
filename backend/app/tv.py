@@ -16,11 +16,14 @@ SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
 
 
-def _fr_only(al):
+def _no_eng(al):
+    """True if the file is MISSING an English audio track (a gap to fill) — covers fre, fre/jpn
+    (anime), jpn-only, etc. Unknown audio (no mediaInfo) -> False, to avoid flagging
+    un-analysed files."""
     if not al:
         return False
-    parts = [x.strip().lower() for x in al.replace("/", ",").split(",")]
-    return bool(parts) and all(p.startswith("fr") for p in parts)
+    a = al.lower()
+    return ("eng" not in a) and ("english" not in a)
 
 
 def _media(path, cfg):          # Sonarr /data path -> our /media mount
@@ -55,7 +58,7 @@ def scan(cfg=None):
                        if i.get("coverType") == "poster"), None)
         for f in files:
             mi = f.get("mediaInfo") or {}
-            if not _fr_only(mi.get("audioLanguages")):
+            if not _no_eng(mi.get("audioLanguages")):
                 continue
             path = f.get("path") or ""
             m = SXXEXX.search(os.path.basename(path))
@@ -70,7 +73,7 @@ def scan(cfg=None):
                 "poster": poster,
             })
             n += 1
-    core.log(f"tv scan: {n} French-only episodes (pilot={sorted(pilot) or 'all'})")
+    core.log(f"tv scan: {n} episodes missing English (pilot={sorted(pilot) or 'all'})")
     return n
 
 
@@ -404,6 +407,11 @@ def stage_finish(cfg=None):
     for h, eps in by_hash.items():
         t = torrents.get(h)
         if not t:
+            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
+            for e in eps:
+                core.set_ep_status(e["id"], "pending", dl_hash=None, dl_id=None,
+                                   en_file=None, error=None, progress="")
+            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) -> re-queued")
             continue
         if t.get("progress", 0) < 1.0:
             if _is_stalled(t, cfg):
@@ -426,3 +434,15 @@ def stage_finish(cfg=None):
                 continue
             core.set_ep_status(e["id"], "ready", en_file=vid)
             _merge_episode(core.get_episode(e["id"]), vid, cfg)
+    # resume episode merges interrupted by a restart/crash (stuck 'merging', not updated recently)
+    import time as _t
+    for e in core.get_episodes("merging"):
+        if _t.time() - (e.get("updated") or 0) < 900:
+            continue
+        en, fr = e.get("en_file"), e.get("french_path")
+        if en and fr and os.path.exists(en) and os.path.exists(fr):
+            core.log(f"resume {e['id']}: stale merge -> re-merging")
+            _merge_episode(core.get_episode(e["id"]), en, cfg)
+        else:
+            core.set_ep_status(e["id"], "pending", progress="",
+                               error="merge interrupted and source file missing")

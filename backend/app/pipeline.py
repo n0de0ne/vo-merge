@@ -660,3 +660,15 @@ def stage_finish(cfg=None):
             continue
         core.set_status(mv["tmdb_id"], "ready", en_file=vid)
         merge_movie(mv["tmdb_id"], cfg)
+    # resume merges interrupted by a restart/crash: stuck at 'merging' but not updated recently
+    # (an active merge bumps `updated` every window via the progress field).
+    for mv in core.get_movies("merging"):
+        if time.time() - (mv.get("updated") or 0) < 900:     # <15min -> probably still running
+            continue
+        en, fr = mv.get("en_file"), mv.get("french_path")
+        if en and fr and os.path.exists(en) and os.path.exists(fr):
+            core.log(f"resume {mv['tmdb_id']}: stale merge -> re-merging")
+            merge_movie(mv["tmdb_id"], cfg)
+        else:
+            core.set_status(mv["tmdb_id"], "pending", progress="",
+                            error="merge interrupted and source file missing")
