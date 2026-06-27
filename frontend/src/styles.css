@@ -57,3 +57,34 @@ input.sync { width: 110px; }
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; width: min(760px, 92vw); max-height: 92vh; overflow: auto; }
 .modal input[type=range] { accent-color: var(--accent); }
+
+/* poster thumbnails (Sonarr/Radarr-style rows) */
+.titlecell { display: flex; gap: 12px; align-items: flex-start; }
+.poster {
+  width: 46px; height: 69px; flex: 0 0 46px; border-radius: 6px;
+  object-fit: cover; background: var(--panel2); border: 1px solid var(--border);
+}
+.poster.placeholder {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; color: var(--muted);
+}
+
+/* MULTI badge */
+.multi-badge {
+  display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 5px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  background: #15324f; color: #6fb6ff; border: 1px solid #234d75; vertical-align: middle;
+}
+
+/* interactive release list (modal) */
+.rel-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.rel-row {
+  display: flex; gap: 12px; align-items: center; padding: 10px 12px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+}
+.rel-row.tried { opacity: .55; }
+.rel-main { flex: 1; min-width: 0; }
+.rel-title { font-size: 13px; word-break: break-word; }
+.tried-mark {
+  margin-left: 8px; font-size: 11px; color: var(--muted); font-style: italic;
+}

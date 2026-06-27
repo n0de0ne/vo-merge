@@ -1,10 +1,26 @@
 import { useEffect, useRef, useState } from "react";
-import { api, Movie, Status } from "./api";
+import { api, Movie, Status, Episode, Candidate } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
   return (h ? `${h}:` : "") + `${String(m).padStart(h ? 2 : 1, "0")}:${String(ss).padStart(2, "0")}`;
 };
+
+const fmtBytes = (b: number) => {
+  if (!b || b <= 0) return "—";
+  const gb = b / 1e9;
+  if (gb >= 1) return gb.toFixed(2) + " GB";
+  return (b / 1e6).toFixed(0) + " MB";
+};
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+// poster thumbnail at the start of a row; neutral box if missing
+function Poster({ src, alt }: { src?: string | null; alt: string }) {
+  return src
+    ? <img className="poster" src={src} alt={alt} loading="lazy" />
+    : <div className="poster placeholder" aria-label="no poster">🎞</div>;
+}
 
 // ---------------- Sync Editor (stable video + Web Audio live offset + waveform) ----------------
 function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
@@ -162,6 +178,60 @@ function Pill({ s }: { s: string }) {
   return <span className={`pill ${s}`}>{s.replace("_", " ")}</span>;
 }
 
+// ---------------- Interactive release search modal ----------------
+function ReleaseModal({ movie, onClose, onGrabbed }:
+  { movie: Movie; onClose: () => void; onGrabbed: () => void }) {
+  const [list, setList] = useState<Candidate[] | null>(null);
+  const [err, setErr] = useState("");
+  const [grabbing, setGrabbing] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.candidates(movie.tmdb_id)
+      .then(c => { if (alive) setList(c); })
+      .catch(e => { if (alive) setErr(e.message || "search failed"); });
+    return () => { alive = false; };
+  }, [movie.tmdb_id]);
+
+  async function grab(c: Candidate) {
+    setGrabbing(c.rid);
+    try {
+      await api.grab(movie.tmdb_id, c.link, c.rid, c.title);
+      onGrabbed(); onClose();
+    } catch (e: any) { setErr(e.message || "grab failed"); setGrabbing(null); }
+  }
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ width: "min(860px,94vw)" }}>
+        <div className="row"><b>Releases — {movie.title}</b><div className="spacer" />
+          <button className="btn sec" onClick={onClose}>✕</button></div>
+        {err && <div className="sub bad" style={{ marginTop: 8 }}>{err}</div>}
+        {!list && !err && <div className="muted" style={{ marginTop: 12 }}>searching indexers… (this can take a few seconds)</div>}
+        {list && list.length === 0 && <div className="muted" style={{ marginTop: 12 }}>No releases found.</div>}
+        {list && list.length > 0 &&
+          <div className="rel-list">
+            {list.map(c => (
+              <div className={"rel-row" + (c.tried ? " tried" : "")} key={c.rid}>
+                <div className="rel-main">
+                  <div className="rel-title">
+                    {c.title}
+                    {c.multi && <span className="multi-badge">MULTI</span>}
+                    {c.tried && <span className="tried-mark">tried</span>}
+                  </div>
+                  <div className="sub">{c.indexer} · {c.seeders}s · {fmtBytes(c.size)} · score {c.score}</div>
+                </div>
+                <button className="btn" disabled={grabbing === c.rid} onClick={() => grab(c)}>
+                  {grabbing === c.rid ? "Grabbing…" : "Grab"}
+                </button>
+              </div>
+            ))}
+          </div>}
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Dashboard ----------------
 function Dashboard() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -169,6 +239,7 @@ function Dashboard() {
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
+  const [release, setRelease] = useState<Movie | null>(null);
 
   async function refresh() {
     setStatus(await api.status());
@@ -210,8 +281,11 @@ function Dashboard() {
           <tbody>
             {movies.map(m => (
               <tr key={m.tmdb_id}>
-                <td>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
-                  {m.error && <div className="sub bad">{m.error}</div>}</td>
+                <td><div className="titlecell">
+                  <Poster src={m.poster} alt={m.title} />
+                  <div>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
+                    {m.error && <div className="sub bad">{m.error}</div>}</div>
+                </div></td>
                 <td><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
                   <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}</td>
                 <td>{m.candidate_title
@@ -219,6 +293,8 @@ function Dashboard() {
                   : <span className="muted">—</span>}</td>
                 <td className="muted">{m.quality || "—"}</td>
                 <td><div className="row">
+                  {["pending","no_release","error","review","sync_fail","grabbed","downloading"].includes(m.status) &&
+                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>}
                   {["pending","no_release","error"].includes(m.status) &&
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Search</button>}
                   {/* search again — re-run the search now */}
@@ -244,45 +320,132 @@ function Dashboard() {
         </table>
       </div>
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
+      {release && <ReleaseModal movie={release} onClose={() => setRelease(null)} onGrabbed={refresh} />}
     </>
   );
 }
 
-// ---------------- Sync failures ----------------
-function SyncFailures() {
-  const [movies, setMovies] = useState<Movie[]>([]);
-  const [offset, setOffset] = useState<Record<number, string>>({});
+// ---------------- Series (Sonarr / TV) ----------------
+const TV_STATES = ["pending","searching","no_release","grabbed","downloading",
+  "ready","merging","merged","sync_fail","error","ignored"];
+
+function Series() {
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [eps, setEps] = useState<Episode[]>([]);
+  const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(false);
-  async function refresh() { setMovies(await api.movies("sync_fail")); }
-  useEffect(() => { refresh(); }, []);
-  async function run(id: number, ms: number) {
-    setBusy(true);
-    try { await api.sync(id, ms); } finally { setBusy(false); refresh(); }
+
+  async function refresh() {
+    setCounts((await api.tvStatus()).counts);
+    setEps(await api.tvEpisodes(filter || undefined));
   }
+  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
+
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+
+  return (
+    <>
+      <div className="panel">
+        <div className="row">
+          <div><b>Series pipeline</b> <span className="muted">episode VO merges</span></div>
+          <div className="spacer" />
+          <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
+        </div>
+        <div className="chips" style={{ marginTop: 14 }}>
+          {TV_STATES.map(s => (
+            <span className="chip" key={s}>{s.replace("_"," ")} <b>{counts[s] ?? 0}</b></span>
+          ))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 10 }}>
+          <select value={filter} onChange={e => setFilter(e.target.value)}>
+            <option value="">all states</option>
+            {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <span className="muted">{eps.length} episodes</span>
+        </div>
+        <table>
+          <thead><tr>
+            <th>Episode</th><th>Status</th><th>Candidate</th><th>Quality</th><th>Actions</th>
+          </tr></thead>
+          <tbody>
+            {eps.map(e => (
+              <tr key={e.id}>
+                <td><div className="titlecell">
+                  <Poster src={e.poster} alt={e.series_title} />
+                  <div>{e.series_title} — S{pad2(e.season)}E{pad2(e.episode)}
+                    {e.error && <div className="sub bad">{e.error}</div>}</div>
+                </div></td>
+                <td><Pill s={e.status} />{e.sync_delta != null && e.status === "sync_fail" &&
+                  <div className="sub">Δ {e.sync_delta.toFixed(1)}s</div>}</td>
+                <td>{e.candidate_title
+                  ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
+                  : <span className="muted">—</span>}</td>
+                <td className="muted">{e.quality || "—"}</td>
+                <td><div className="row">
+                  {["pending","no_release","error"].includes(e.status) &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
+                  {!["ignored","merged"].includes(e.status) &&
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>}
+                </div></td>
+              </tr>
+            ))}
+            {eps.length === 0 && <tr><td colSpan={5} className="muted">No episodes.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// ---------------- Review (needs attention) ----------------
+function Review() {
+  const [movies, setMovies] = useState<Movie[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [tune, setTune] = useState<Movie | null>(null);
+  const [release, setRelease] = useState<Movie | null>(null);
+
+  async function refresh() {
+    const [r, s] = await Promise.all([api.movies("review"), api.movies("sync_fail")]);
+    setMovies([...r, ...s]);
+  }
+  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, []);
+
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+
   return (
     <div className="panel">
-      <p className="muted">Releases the matcher couldn't align (framerate differs, or a likely different
-        cut). <b>Auto-match</b> re-runs the video scene-cut matcher (it can rescue runtime-delta cases);
-        or enter a manual ms offset (+ delays the added track, − advances it) and apply.</p>
-      <table>
-        <thead><tr><th>Title</th><th>Δ / reason</th><th>Offset (ms)</th><th></th></tr></thead>
-        <tbody>
-          {movies.map(m => (
-            <tr key={m.tmdb_id}>
-              <td>{m.title}<div className="sub">{m.original_title} ({m.year})</div></td>
-              <td>{m.sync_delta != null ? "Δ " + m.sync_delta.toFixed(2) + "s" : "—"}
-                {m.error && <div className="sub bad">{m.error}</div>}</td>
-              <td><input className="sync" type="number" value={offset[m.tmdb_id] ?? ""}
-                placeholder="0" onChange={e => setOffset({ ...offset, [m.tmdb_id]: e.target.value })} /></td>
-              <td><div className="row">
-                <button className="btn" disabled={busy} onClick={() => run(m.tmdb_id, 0)}>Auto-match</button>
-                <button className="btn sec" disabled={busy} onClick={() => run(m.tmdb_id, parseInt(offset[m.tmdb_id] || "0", 10) || 0)}>Apply offset</button>
-              </div></td>
-            </tr>
-          ))}
-          {movies.length === 0 && <tr><td colSpan={4} className="muted">No sync failures 🎉</td></tr>}
-        </tbody>
-      </table>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <b>Needs review</b><span className="muted">{movies.length} item{movies.length === 1 ? "" : "s"}</span>
+      </div>
+      {movies.length === 0
+        ? <div className="muted">Nothing needs review 🎉</div>
+        : <table>
+            <thead><tr><th>Title</th><th>Reason</th><th>Actions</th></tr></thead>
+            <tbody>
+              {movies.map(m => (
+                <tr key={m.tmdb_id}>
+                  <td><div className="titlecell">
+                    <Poster src={m.poster} alt={m.title} />
+                    <div>{m.title}<div className="sub">{m.original_title} ({m.year})</div>
+                      <Pill s={m.status} /></div>
+                  </div></td>
+                  <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
+                    {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}</td>
+                  <td><div className="row">
+                    <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
+                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
+                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
+                  </div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>}
+      {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
+      {release && <ReleaseModal movie={release} onClose={() => setRelease(null)} onGrabbed={refresh} />}
     </div>
   );
 }
@@ -417,9 +580,10 @@ function Logs() {
 
 // ---------------- App ----------------
 export default function App() {
-  const [tab, setTab] = useState("dashboard");
+  const [tab, setTab] = useState("films");
   const tabs: [string, string][] = [
-    ["dashboard", "Dashboard"], ["sync", "Sync failures"], ["settings", "Settings"], ["logs", "Logs"]];
+    ["films", "Films"], ["series", "Series"], ["review", "Review"],
+    ["settings", "Settings"], ["logs", "Logs"]];
   return (
     <div className="app">
       <header className="top">
@@ -430,8 +594,9 @@ export default function App() {
         {tabs.map(([k, label]) =>
           <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{label}</button>)}
       </nav>
-      {tab === "dashboard" && <Dashboard />}
-      {tab === "sync" && <SyncFailures />}
+      {tab === "films" && <Dashboard />}
+      {tab === "series" && <Series />}
+      {tab === "review" && <Review />}
       {tab === "settings" && <Settings />}
       {tab === "logs" && <Logs />}
     </div>

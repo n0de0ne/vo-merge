@@ -4,10 +4,21 @@ export interface Movie {
   status: string; candidate_title: string | null; candidate_score: number | null;
   candidate_seeders: number | null; dl_hash: string | null; en_file: string | null;
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
-  error: string | null; updated: number;
+  error: string | null; updated: number; poster?: string | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
+}
+export interface Episode {
+  id: string; series_id: number; series_title: string; season: number; episode: number;
+  status: string; candidate_title: string | null; candidate_score: number | null;
+  candidate_seeders: number | null; quality: string | null; poster: string | null;
+  sync_delta: number | null; error: string | null;
+}
+export interface TvStatus { counts: Record<string, number>; }
+export interface Candidate {
+  score: number; seeders: number; size: number; title: string; indexer: string;
+  multi: boolean; link: string; rid: string; tried: boolean;
 }
 
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
@@ -44,4 +55,20 @@ export const api = {
   applyOffset: (id: number, offset_ms: number, lang = "eng") =>
     j<Movie>(`/api/movie/${id}/apply_offset`,
       { method: "POST", body: JSON.stringify({ offset_ms, lang }) }),
+
+  // ---- TV / Series ----
+  tvStatus: () => j<TvStatus>("/api/tv/status"),
+  tvEpisodes: (status?: string) =>
+    j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
+  tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
+  epRetry: (id: string) =>
+    j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  epIgnore: (id: string) =>
+    j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+
+  // ---- Interactive release search ----
+  candidates: (id: number) => j<Candidate[]>(`/api/movie/${id}/candidates`),
+  grab: (id: number, link: string, rid: string, title: string) =>
+    j<Movie>(`/api/movie/${id}/grab`,
+      { method: "POST", body: JSON.stringify({ link, rid, title }) }),
 };
