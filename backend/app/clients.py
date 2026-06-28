@@ -137,6 +137,15 @@ class QBittorrent:
         p = {"category": category} if category else {}
         return self.s.get(f"{self.url}/api/v2/torrents/info", params=p, timeout=30).json()
 
+    def trackers(self, h):
+        """Announce URLs registered on a torrent (skips the DHT/PeX/LSD pseudo-entries)."""
+        try:
+            r = self.s.get(f"{self.url}/api/v2/torrents/trackers", params={"hash": h}, timeout=30)
+            return [t.get("url", "") for t in r.json()
+                    if t.get("url", "").startswith(("http", "udp"))]
+        except Exception:
+            return []
+
     def files(self, torrent_hash):
         return self.s.get(f"{self.url}/api/v2/torrents/files",
                           params={"hash": torrent_hash}, timeout=30).json()

@@ -89,6 +89,51 @@ input.sync { width: 110px; }
   background: #15324f; color: #6fb6ff; border: 1px solid #234d75; vertical-align: middle;
 }
 
+/* toolbar: status filter, search box, grid/list toggle */
+.toolbar select, .search {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 10px; border-radius: 8px; font-size: 13px;
+}
+.search { min-width: 200px; flex: 0 1 280px; }
+.viewtoggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.viewtoggle button { background: transparent; color: var(--muted); border: 0; padding: 7px 12px; cursor: pointer; font-size: 13px; }
+.viewtoggle button.active { background: var(--panel2); color: var(--text); }
+
+/* movie card grid */
+.cardgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.card { display: flex; gap: 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; min-width: 0; }
+.card .poster { width: 58px; height: 87px; flex: 0 0 58px; }
+.card-body { flex: 1 1 auto; min-width: 0; max-width: 100%; display: flex; flex-direction: column; }
+/* every text node in a card must wrap, incl. dotted release names with no spaces */
+.card-body > *, .card-title, .card-body .sub { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.card-title { font-weight: 600; line-height: 1.3; }
+.card-row { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; min-width: 0; }
+.card-row .spacer { flex: 1; }
+
+/* live download progress bar */
+.dlbar { margin-top: 5px; }
+.dlbar-track { height: 6px; background: #0c0f14; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.dlbar-fill { height: 100%; background: #335; transition: width .6s ease; }
+.dlbar-fill.queued { background: #3a4250; }
+.dlbar-fill.stalled { background: #6b4a2c; }
+.dlbar-fill.live { background: linear-gradient(90deg, #2c4a6b, #6fb6ff, #2c4a6b); background-size: 200% 100%; animation: dlmove 1.3s linear infinite; }
+@keyframes dlmove { from { background-position: 200% 0; } to { background-position: 0 0; } }
+.dlbar-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+/* per-row action dropdown (keeps rows from sprawling) */
+.rowmenu { position: relative; display: inline-block; }
+.rowmenu > summary { list-style: none; cursor: pointer; padding: 5px 10px; font-size: 12px; user-select: none; white-space: nowrap; }
+.rowmenu > summary::-webkit-details-marker { display: none; }
+.rowmenu .menu-pop {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 50;
+  display: flex; flex-direction: column; gap: 4px; min-width: 152px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px;
+  box-shadow: 0 10px 28px rgba(0,0,0,.5);
+}
+.rowmenu .menu-pop .btn { width: 100%; text-align: left; padding: 7px 10px; }
+/* let the dropdown escape the card/table panel */
+.panel { overflow: visible; }
+
 /* interactive release list (modal) */
 .rel-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .rel-row {

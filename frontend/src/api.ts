@@ -14,8 +14,13 @@ export interface Episode {
   status: string; candidate_title: string | null; candidate_score: number | null;
   candidate_seeders: number | null; quality: string | null; poster: string | null;
   sync_delta: number | null; error: string | null; progress?: string | null;
+  dl_hash?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
+export interface DL {
+  progress: number; dlspeed: number; eta: number; state: string;
+  seeds: number; size: number; downloaded: number;
+}
 export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
   multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean; info_url?: string | null;
@@ -49,6 +54,7 @@ export const api = {
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
+  downloads: () => j<{ items: Record<string, DL>; error?: string }>("/api/downloads"),
   preview: (id: number, lang = "eng", t = -1) =>
     j<{ video: string; audio: string; start: number; fps: number; duration: number; movie_dur: number }>(
       `/api/movie/${id}/preview?lang=${lang}&t=${t}`),

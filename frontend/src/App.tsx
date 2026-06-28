@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { api, Movie, Status, Episode, Candidate } from "./api";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { api, Movie, Status, Episode, Candidate, DL } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -13,7 +13,44 @@ const fmtBytes = (b: number) => {
   return (b / 1e6).toFixed(0) + " MB";
 };
 
+const fmtSpeed = (b: number) => (!b || b <= 0 ? "" : b / 1e6 >= 1 ? (b / 1e6).toFixed(1) + " MB/s" : (b / 1e3).toFixed(0) + " kB/s");
+const fmtEta = (s: number) => (!s || s <= 0 || s >= 8640000 ? "" : "ETA " + fmtTime(s));
+
 const pad2 = (n: number) => String(n).padStart(2, "0");
+
+// human label for a qB torrent state (distinguishes queued from genuinely stalled)
+const DL_LABEL: Record<string, string> = {
+  metaDL: "fetching metadata", queuedDL: "queued", stalledDL: "stalled",
+  checkingDL: "checking", pausedDL: "paused", allocating: "allocating", moving: "moving",
+};
+// Live download progress bar for an item still in qB. `dl` comes from /api/downloads.
+function DownloadBar({ dl }: { dl?: DL }) {
+  if (!dl) return null;
+  const pct = Math.round((dl.progress || 0) * 100);
+  const st = dl.state || "";
+  const active = (dl.dlspeed || 0) > 0;
+  let label = active ? fmtSpeed(dl.dlspeed) : pct >= 100 ? "done" : (DL_LABEL[st] ?? "waiting");
+  const meta = [label, active ? fmtEta(dl.eta) : "", `${dl.seeds || 0} seeds`].filter(Boolean).join(" · ");
+  const cls = active ? "live" : st === "stalledDL" ? "stalled" : st === "queuedDL" ? "queued" : "";
+  return (
+    <div className="dlbar" title={`${st} · ${pct}% of ${fmtBytes(dl.size)}`}>
+      <div className="dlbar-track"><div className={"dlbar-fill " + cls} style={{ width: pct + "%" }} /></div>
+      <div className="dlbar-meta">{pct}% · {meta}</div>
+    </div>
+  );
+}
+
+// Per-row action menu: a native <details> dropdown so a row never sprawls into many button
+// lines. Children are the action buttons; clicking any one closes the menu.
+function RowMenu({ children, label = "Actions" }: { children: ReactNode; label?: string }) {
+  const ref = useRef<HTMLDetailsElement>(null);
+  return (
+    <details className="rowmenu" ref={ref}>
+      <summary className="btn sec">{label} ▾</summary>
+      <div className="menu-pop" onClick={() => ref.current?.removeAttribute("open")}>{children}</div>
+    </details>
+  );
+}
 
 // poster thumbnail at the start of a row; neutral box if missing
 function Poster({ src, alt }: { src?: string | null; alt: string }) {
@@ -234,11 +271,63 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
   );
 }
 
+// status-appropriate actions for a movie, folded into a dropdown so rows stay compact
+function MovieActions({ m, busy, act, onRelease, onTune }:
+  { m: Movie; busy: boolean; act: (fn: () => Promise<any>) => void;
+    onRelease: (m: Movie) => void; onTune: (m: Movie) => void }) {
+  const B = (label: string, fn: () => void) =>
+    <button className="btn sec" disabled={busy} onClick={fn}>{label}</button>;
+  return (
+    <RowMenu>
+      {["pending", "no_release", "error", "review", "sync_fail", "grabbed", "downloading"].includes(m.status) &&
+        B("Interactive…", () => onRelease(m))}
+      {["pending", "no_release", "error"].includes(m.status) &&
+        B("Auto-search", () => act(() => api.search(m.tmdb_id)))}
+      {["no_release", "error", "sync_fail", "downloading", "merged"].includes(m.status) &&
+        B("Search again", () => act(() => api.research(m.tmdb_id)))}
+      {["grabbed", "downloading", "no_release", "error", "sync_fail"].includes(m.status) &&
+        B("Pick another", () => act(() => api.another(m.tmdb_id)))}
+      {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
+      {m.status === "merged" && B("Tune sync", () => onTune(m))}
+      {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
+      {m.status === "ignored" && B("Unignore", () => act(() => api.unignore(m.tmdb_id)))}
+      {m.status !== "ignored" && m.status !== "merged" && B("Ignore", () => act(() => api.ignore(m.tmdb_id)))}
+    </RowMenu>
+  );
+}
+
+// grid (card) presentation of a movie
+function MovieCard({ m, dl, busy, act, onRelease, onTune }:
+  { m: Movie; dl?: DL; busy: boolean; act: (fn: () => Promise<any>) => void;
+    onRelease: (m: Movie) => void; onTune: (m: Movie) => void }) {
+  return (
+    <div className="card">
+      <Poster src={m.poster} alt={m.title} />
+      <div className="card-body">
+        <div className="card-title">{m.title} <span className="muted">({m.year})</span></div>
+        <div className="sub">→ {m.original_title} · {m.original_lang}{m.quality ? " · " + m.quality : ""}</div>
+        <div className="card-row"><Pill s={m.status} />
+          {m.status === "sync_fail" && m.sync_delta != null && <span className="sub">Δ {m.sync_delta.toFixed(1)}s</span>}
+          <div className="spacer" />
+          <MovieActions m={m} busy={busy} act={act} onRelease={onRelease} onTune={onTune} />
+        </div>
+        {m.status === "downloading" && <DownloadBar dl={dl} />}
+        {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
+        {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
+        {m.error && <div className="sub bad">{m.error}</div>}
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Dashboard ----------------
 function Dashboard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [movies, setMovies] = useState<Movie[]>([]);
   const [filter, setFilter] = useState("");
+  const [q, setQ] = useState("");
+  const [view, setView] = useState<"grid" | "list">(() => (localStorage.getItem("vo_view") as any) || "grid");
+  const [dls, setDls] = useState<Record<string, DL>>({});
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
@@ -248,6 +337,20 @@ function Dashboard() {
     setMovies(await api.movies(filter || undefined));
   }
   useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
+  // poll live download progress more often than the full list
+  useEffect(() => {
+    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
+    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
+  }, []);
+  const setViewP = (v: "grid" | "list") => { setView(v); localStorage.setItem("vo_view", v); };
+
+  const shown = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return movies;
+    return movies.filter(m =>
+      (m.title || "").toLowerCase().includes(s) || (m.original_title || "").toLowerCase().includes(s));
+  }, [movies, q]);
+  const dlOf = (m: Movie) => dls[(m.dl_hash || "").toLowerCase()];
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
@@ -269,61 +372,52 @@ function Dashboard() {
       </div>
 
       <div className="panel">
-        <div className="row" style={{ marginBottom: 10 }}>
+        <div className="row toolbar" style={{ marginBottom: 12 }}>
           <select value={filter} onChange={e => setFilter(e.target.value)}>
             <option value="">all states</option>
             {STATES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
-          <span className="muted">{movies.length} movies</span>
+          <input className="search" placeholder="Search title…" value={q} onChange={e => setQ(e.target.value)} />
+          <span className="muted">{shown.length}{shown.length !== movies.length ? `/${movies.length}` : ""} movies</span>
+          <div className="spacer" />
+          <div className="viewtoggle">
+            <button className={view === "grid" ? "active" : ""} onClick={() => setViewP("grid")} title="Grid view">▦ Grid</button>
+            <button className={view === "list" ? "active" : ""} onClick={() => setViewP("list")} title="List view">☰ List</button>
+          </div>
         </div>
-        <table>
-          <thead><tr>
-            <th>Title</th><th>Status</th><th>Candidate</th><th>Quality</th><th>Actions</th>
-          </tr></thead>
-          <tbody>
-            {movies.map(m => (
-              <tr key={m.tmdb_id}>
-                <td><div className="titlecell">
-                  <Poster src={m.poster} alt={m.title} />
-                  <div>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
-                    {m.error && <div className="sub bad">{m.error}</div>}</div>
-                </div></td>
-                <td><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
-                  <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
-                  {m.status === "merging" && m.progress &&
-                  <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}</td>
-                <td>{m.candidate_title
-                  ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
-                  : <span className="muted">—</span>}</td>
-                <td className="muted">{m.quality || "—"}</td>
-                <td><div className="row">
-                  {/* Interactive: open the release picker to choose a release by hand */}
-                  {["pending","no_release","error","review","sync_fail","grabbed","downloading"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Interactive…</button>}
-                  {/* Auto search: search + auto-grab the top-scored release */}
-                  {["pending","no_release","error"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.search(m.tmdb_id))}>Auto-search</button>}
-                  {/* Search again — re-run the auto search now (keeps the blocklist) */}
-                  {["no_release","error","sync_fail","downloading","merged"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.research(m.tmdb_id))}>Search again</button>}
-                  {/* Pick another version — blocklist current release, grab the next-best */}
-                  {["grabbed","downloading","no_release","error","sync_fail"].includes(m.status) &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>}
-                  {m.status === "merged" &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-sync</button>}
-                  {m.status === "merged" &&
-                    <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>}
-                  {m.status === "sync_fail" &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.sync(m.tmdb_id, 0))}>Re-try sync</button>}
-                  {m.status === "ignored" &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.unignore(m.tmdb_id))}>Unignore</button>}
-                  {m.status !== "ignored" && m.status !== "merged" &&
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>}
-                </div></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+
+        {view === "grid"
+          ? <div className="cardgrid">
+              {shown.map(m => <MovieCard key={m.tmdb_id} m={m} dl={dlOf(m)} busy={busy}
+                act={act} onRelease={setRelease} onTune={setTune} />)}
+            </div>
+          : <table>
+              <thead><tr>
+                <th>Title</th><th>Status</th><th>Candidate</th><th>Quality</th><th>Actions</th>
+              </tr></thead>
+              <tbody>
+                {shown.map(m => (
+                  <tr key={m.tmdb_id}>
+                    <td><div className="titlecell">
+                      <Poster src={m.poster} alt={m.title} />
+                      <div>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
+                        {m.error && <div className="sub bad">{m.error}</div>}</div>
+                    </div></td>
+                    <td style={{ minWidth: 150 }}><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
+                      <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
+                      {m.status === "downloading" && <DownloadBar dl={dlOf(m)} />}
+                      {m.status === "merging" && m.progress &&
+                      <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}</td>
+                    <td>{m.candidate_title
+                      ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
+                      : <span className="muted">—</span>}</td>
+                    <td className="muted">{m.quality || "—"}</td>
+                    <td><MovieActions m={m} busy={busy} act={act} onRelease={setRelease} onTune={setTune} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>}
+        {shown.length === 0 && <div className="muted" style={{ padding: 8 }}>No movies match.</div>}
       </div>
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
       {release && <ReleaseModal title={release.title}
@@ -342,11 +436,14 @@ function Series() {
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [eps, setEps] = useState<Episode[]>([]);
   const [filter, setFilter] = useState("");
+  const [q, setQ] = useState("");
+  const [dls, setDls] = useState<Record<string, DL>>({});
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
   const [relEp, setRelEp] = useState<Episode | null>(null);
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
+  const dlOf = (e: Episode) => dls[(e.dl_hash || "").toLowerCase()];
 
   // group episodes: show -> season -> episodes (+ per-show status tallies)
   const shows = useMemo(() => {
@@ -362,13 +459,21 @@ function Series() {
       return { title, poster: list[0]?.poster, eps: list, byStatus, seasons };
     });
   }, [eps]);
-  const allOpen = shows.length > 0 && open.size >= shows.length;
+  const shownShows = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return s ? shows.filter(sh => sh.title.toLowerCase().includes(s)) : shows;
+  }, [shows, q]);
+  const allOpen = shownShows.length > 0 && open.size >= shownShows.length;
 
   async function refresh() {
     setCounts((await api.tvStatus()).counts);
     setEps(await api.tvEpisodes(filter || undefined));
   }
   useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
+  useEffect(() => {
+    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
+    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
+  }, []);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
@@ -388,17 +493,18 @@ function Series() {
       </div>
 
       <div className="panel">
-        <div className="row" style={{ marginBottom: 10 }}>
+        <div className="row toolbar" style={{ marginBottom: 10 }}>
           <select value={filter} onChange={e => setFilter(e.target.value)}>
             <option value="">all states</option>
             {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
-          <span className="muted">{shows.length} shows · {eps.length} episodes</span>
+          <input className="search" placeholder="Search show…" value={q} onChange={e => setQ(e.target.value)} />
+          <span className="muted">{shownShows.length} shows · {eps.length} episodes</span>
           <div className="spacer" />
-          <button className="btn sec" onClick={() => setOpen(allOpen ? new Set() : new Set(shows.map(s => s.title)))}>
+          <button className="btn sec" onClick={() => setOpen(allOpen ? new Set() : new Set(shownShows.map(s => s.title)))}>
             {allOpen ? "Collapse all" : "Expand all"}</button>
         </div>
-        {shows.map(sh => {
+        {shownShows.map(sh => {
           const isOpen = open.has(sh.title);
           return (
             <div className="showgroup" key={sh.title}>
@@ -422,7 +528,8 @@ function Series() {
                     {seps.map(e => (
                       <tr key={e.id}>
                         <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
-                        <td style={{ width: 110 }}><Pill s={e.status} />
+                        <td style={{ minWidth: 140 }}><Pill s={e.status} />
+                          {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
                           {e.status === "merging" && e.progress &&
                           <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
                           {e.error && <div className="sub bad">{e.error}</div>}</td>
@@ -446,7 +553,7 @@ function Series() {
             </div>
           );
         })}
-        {shows.length === 0 && <div className="muted">No episodes.</div>}
+        {shownShows.length === 0 && <div className="muted">No shows match.</div>}
       </div>
       {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}

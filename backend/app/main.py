@@ -205,6 +205,31 @@ def another(tmdb_id: int):
     return core.get_movie(tmdb_id)
 
 
+@api.get("/downloads")
+def downloads():
+    """Live qB progress for everything in the audio-merge categories, keyed by infohash.
+    Polled by the UI to draw download progress bars without hammering the DB."""
+    cfg = core.load_config()
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    out = {}
+    try:
+        qb.login()
+        for cat in (cfg["qb_category"], cfg["qb_tv_category"]):
+            for t in qb.torrents(cat):
+                out[t["hash"].lower()] = {
+                    "progress": t.get("progress", 0) or 0,
+                    "dlspeed": t.get("dlspeed", 0) or 0,
+                    "eta": t.get("eta", 0) or 0,
+                    "state": t.get("state", ""),
+                    "seeds": t.get("num_complete", t.get("num_seeds", 0)) or 0,
+                    "size": t.get("size", 0) or 0,
+                    "downloaded": t.get("completed", 0) or 0,
+                }
+    except Exception as e:
+        return {"error": str(e), "items": {}}
+    return {"items": out}
+
+
 @api.get("/logs")
 def logs():
     return {"lines": core.tail_log()}

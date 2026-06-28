@@ -26,9 +26,16 @@ DEFAULTS = {
     "multi_indexer_ids": [],               # extra indexers to also search for MULTI (e.g. FR trackers)
     "vo_gap_tag": "vo-gap",
     "qb_category": "audio-merge",
-    "qb_download_dir": "/downloads/audio-merge",   # container view of qB's save path
-    "downloads_mount": "/downloads/audio-merge",   # how THIS container sees the same files
+    # qB's view of the save path. Lives inside the Plex share's hidden .Téléchargements (qB's
+    # /data == /mnt/nvme/Plex), so donors share the library's pool instead of a separate share.
+    "qb_download_dir": "/data/.Téléchargements/completed/audio-merge",
+    "downloads_mount": "/media/.Téléchargements/completed/audio-merge",   # how THIS container sees them
     "media_mount": "/media",                       # this container's view of /mnt/user/Plex
+    # After a successful merge, free the donor download. English/public-tracker donors are
+    # deleted with their files; torrents whose tracker matches `french_trackers` are LEFT
+    # seeding (the operator's seed-manager script handles those).
+    "delete_donor": True,
+    "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -39,7 +46,7 @@ DEFAULTS = {
     "sonarr_key": "",
     "sonarr_vo_gap_tag": "vo-gap",
     "qb_tv_category": "audio-merge-tv",
-    "qb_tv_download_dir": "/downloads/audio-merge-tv",
+    "qb_tv_download_dir": "/data/.Téléchargements/completed/audio-merge-tv",
     "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
     "exclude_french_origin": True,
     "sync_tolerance_s": 2.0,
@@ -58,6 +65,7 @@ DEFAULTS = {
     "finish_interval_min": 10,
     "stall_timeout_min": 5,                # an incomplete download not moving (no seeds/0 speed) for
                                            # this long is dropped + blocklisted -> grab another release
+    "stall_check_interval_min": 3,         # how often the stall sweep runs (independent of merges)
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "enabled": False,                      # master switch; off until configured
 }

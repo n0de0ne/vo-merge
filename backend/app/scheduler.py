@@ -33,12 +33,27 @@ def _finish_job():
         pipeline.FINISH_LOCK.release()
 
 
+def _stall_job():
+    """Fast, lightweight stall sweep — deliberately NOT behind FINISH_LOCK, so seederless
+    downloads get dropped + re-grabbed promptly even while a long merge run is in progress."""
+    try:
+        cfg = core.load_config()
+        if cfg.get("scope_films", True):
+            pipeline.sweep_stalled(cfg)
+        if cfg.get("scope_series"):
+            tv.sweep_stalled(cfg)
+    except Exception as e:
+        core.log(f"stall_job error: {e}")
+
+
 def start():
     cfg = core.load_config()
     _sched.add_job(_search_job, "interval", minutes=cfg["search_interval_min"],
                    id="search", replace_existing=True)
     _sched.add_job(_finish_job, "interval", minutes=cfg["finish_interval_min"],
                    id="finish", replace_existing=True)
+    _sched.add_job(_stall_job, "interval", minutes=cfg.get("stall_check_interval_min", 3),
+                   id="stall", replace_existing=True)
     _sched.start()
     core.log("scheduler started")
 
@@ -47,3 +62,4 @@ def reschedule():
     cfg = core.load_config()
     _sched.reschedule_job("search", trigger="interval", minutes=cfg["search_interval_min"])
     _sched.reschedule_job("finish", trigger="interval", minutes=cfg["finish_interval_min"])
+    _sched.reschedule_job("stall", trigger="interval", minutes=cfg.get("stall_check_interval_min", 3))

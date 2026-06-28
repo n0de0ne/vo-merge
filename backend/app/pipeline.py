@@ -127,6 +127,43 @@ def qb_grab(qb, link, category, savepath):
     return guess
 
 
+def _qb_to_local(p, cfg):
+    """Translate a path as qB reports it (save_path/content_path) into THIS container's view.
+    qB's /data == /mnt/nvme/Plex; ours is /media == /mnt/user/Plex (FUSE superset), so a
+    /data/.Téléchargements/... donor is readable at /media/.Téléchargements/.... Legacy
+    /downloads/* paths are mounted identically in both containers, so they pass through."""
+    if not p:
+        return p
+    if p.startswith("/data/"):
+        return cfg.get("media_mount", "/media") + p[len("/data"):]
+    return p
+
+
+def _tracker_is_french(qb, h, cfg):
+    """True if any of the torrent's announce URLs matches the `french_trackers` keep-list.
+    Those are left seeding (the operator's seed manager owns them); everything else is a
+    throwaway English/public donor we delete after the merge."""
+    keep = [s.lower() for s in cfg.get("french_trackers", []) if s]
+    if not keep or not h:
+        return False
+    return any(any(s in u.lower() for s in keep) for u in qb.trackers(h))
+
+
+def _free_donor(qb, h, cfg, tag=""):
+    """Delete a finished donor download (with its files) unless it's a French-tracker torrent
+    we keep seeding. Best-effort; never raises into the merge flow."""
+    if not (cfg.get("delete_donor", True) and h):
+        return
+    try:
+        if _tracker_is_french(qb, h, cfg):
+            core.log(f"donor {tag}: French tracker -> left seeding ({str(h)[:12]})")
+            return
+        qb.delete([h], delete_files=True)
+        core.log(f"donor {tag}: deleted with files ({str(h)[:12]})")
+    except Exception as e:
+        core.log(f"donor {tag}: delete failed ({str(h)[:12]}): {e}")
+
+
 def _clients(cfg):
     return (Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"]),
             Radarr(cfg["radarr_url"], cfg["radarr_key"]),
@@ -313,6 +350,24 @@ def drop_stalled(mv, t, cfg):
     core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
                     dl_hash=None, dl_id=None, en_file=None, error=None, progress="")
     search_movie(tmdb_id, cfg)
+
+
+def sweep_stalled(cfg=None):
+    """Drop seederless / non-progressing movie downloads and grab another release. Runs on its
+    OWN fast timer, NOT inside the finish/merge loop, so a long merge backlog never delays it."""
+    cfg = cfg or core.load_config()
+    if not cfg["enabled"]:
+        return
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    try:
+        qb.login()
+        by_hash = {t["hash"]: t for t in qb.torrents(cfg["qb_category"])}
+    except Exception as e:
+        core.log(f"sweep: qB error {e}"); return
+    for mv in core.get_movies("downloading"):
+        t = by_hash.get(mv.get("dl_hash"))
+        if t and (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
+            drop_stalled(mv, t, cfg)
 
 
 def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
@@ -651,6 +706,12 @@ def finish_movie(tmdb_id, cfg=None):
         except Exception as e:
             core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan queued; Plex scan skipped: {e}")
         mirror_to_en(dest, cfg)        # add to the -EN library + refresh that section now
+        if mv.get("dl_hash"):          # donor served its purpose -> free the space
+            try:
+                qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+                _free_donor(qb, mv["dl_hash"], cfg, tag=f"movie {tmdb_id}")
+            except Exception as e:
+                core.log(f"finish {tmdb_id}: donor cleanup skipped: {e}")
     except Exception as e:
         core.set_status(tmdb_id, "error", error=f"finish: {e}")
 
@@ -696,8 +757,10 @@ def stage_finish(cfg=None):
             if _is_stalled(t, cfg):
                 drop_stalled(mv, t, cfg)
             continue
-        # qB save dir was <qb_download_dir>/<tmdb>; we see it under downloads_mount/<tmdb>
-        local = os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
+        # locate the donor: prefer qB's reported path (works for both the legacy /downloads
+        # layout and the new .Téléchargements one), fall back to <downloads_mount>/<tmdb>.
+        save = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
+        local = save if (save and os.path.exists(save)) else os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
         vid = _find_video(local) if os.path.isdir(local) else (local if os.path.exists(local) else None)
         if not vid:
             core.log(f"stage_finish {mv['tmdb_id']}: download complete but no video found in {local}")

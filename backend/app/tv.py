@@ -10,7 +10,8 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       mirror_to_en, MERGE_LOCK, FR_DUB, EN_OK, EN_AUDIO, RES, SRC)
+                       mirror_to_en, _qb_to_local, _free_donor, MERGE_LOCK, FR_DUB, EN_OK,
+                       EN_AUDIO, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -456,6 +457,27 @@ def _drop_stalled_eps(eps, t, cfg):
              f"{len(eps)} ep(s), re-searching")
 
 
+def sweep_stalled(cfg=None):
+    """Drop seederless / non-progressing episode + pack downloads and re-search. Own fast timer,
+    independent of the merge loop, so the merge backlog never delays stall handling."""
+    cfg = cfg or core.load_config()
+    if not (cfg["enabled"] and cfg["scope_series"]):
+        return
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    try:
+        qb.login()
+        torrents = {t["hash"]: t for t in qb.torrents(cfg["qb_tv_category"])}
+    except Exception as e:
+        core.log(f"tv sweep: qB error {e}"); return
+    by_hash = defaultdict(list)
+    for e in core.get_episodes("downloading"):
+        by_hash[e.get("dl_hash")].append(e)
+    for h, eps in by_hash.items():
+        t = torrents.get(h)
+        if t and (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
+            _drop_stalled_eps(eps, t, cfg)
+
+
 def stage_finish(cfg=None):
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
@@ -485,7 +507,7 @@ def stage_finish(cfg=None):
                 _drop_stalled_eps(eps, t, cfg)
             continue
         save = (t.get("content_path") or t.get("save_path") or "")
-        local = save.replace(cfg["qb_tv_download_dir"], cfg["qb_tv_download_dir"], 1)  # same mount
+        local = _qb_to_local(save, cfg)         # qB's /data path -> our /media view
         # index EVERY downloaded video file by (season,episode) — parse handles anime layouts
         root = local if os.path.isdir(local) else os.path.dirname(local)
         files = {}
@@ -516,6 +538,11 @@ def stage_finish(cfg=None):
         if not merged_any:
             core.log(f"tv finish: {t['name'][:50]} complete but no files mapped to episodes "
                      f"(parsed {sorted(files.keys())[:6]})")
+        # a season pack feeds many episodes: only free the donor once EVERY episode it serves
+        # has reached a terminal state (merged/ignored). Otherwise keep it for the rest.
+        served = [e for e in core.get_episodes() if e.get("dl_hash") == h]
+        if served and all(e["status"] in ("merged", "ignored") for e in served):
+            _free_donor(qb, h, cfg, tag=f"tv {t['name'][:40]}")
     # resume episode merges interrupted by a restart/crash (stuck 'merging', not updated recently)
     import time as _t
     for e in core.get_episodes("merging"):
