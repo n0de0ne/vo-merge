@@ -63,6 +63,22 @@ input.sync { width: 110px; }
 
 /* poster thumbnails (Sonarr/Radarr-style rows) */
 .titlecell { display: flex; gap: 12px; align-items: flex-start; }
+.libsection { font-size: 13px; font-weight: 600; letter-spacing: .03em; color: var(--text);
+  margin: 16px 2px 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.libsection:first-child { margin-top: 4px; }
+/* series/anime grid view: poster cards that expand full-width on click */
+.showcardgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; align-items: start; }
+.showcard { border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); overflow: hidden; }
+.showcard.open { grid-column: 1 / -1; }
+.showcard-head { display: flex; gap: 10px; padding: 10px; cursor: pointer; }
+.showcard-head:hover { filter: brightness(1.08); }
+.showcard-head .poster { width: 52px; height: 78px; flex: 0 0 52px; }
+.showcard-meta { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.showcard-title { font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
+.showcard-meta .chips { gap: 4px; }
+.showcard-meta .pill { font-size: 10px; padding: 2px 6px; }
+.showcard-detail { border-top: 1px solid var(--border); padding: 2px 10px 8px; }
+
 .showgroup { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; overflow: hidden; }
 .showhead { display: flex; align-items: center; gap: 10px; padding: 8px 10px; cursor: pointer; background: var(--panel2); }
 .showhead:hover { filter: brightness(1.08); }

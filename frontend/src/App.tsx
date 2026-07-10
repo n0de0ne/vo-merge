@@ -432,11 +432,12 @@ function Dashboard() {
 const TV_STATES = ["pending","searching","no_release","grabbed","downloading",
   "ready","merging","merged","sync_fail","error","ignored"];
 
-function Series() {
-  const [counts, setCounts] = useState<Record<string, number>>({});
+function Series({ anime }: { anime: boolean }) {
   const [eps, setEps] = useState<Episode[]>([]);
   const [filter, setFilter] = useState("");
   const [q, setQ] = useState("");
+  const [view, setView] = useState<"grid" | "list">(() => (localStorage.getItem("vo_tv_view") as any) || "list");
+  const setViewP = (v: "grid" | "list") => { setView(v); localStorage.setItem("vo_tv_view", v); };
   const [dls, setDls] = useState<Record<string, DL>>({});
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -445,10 +446,17 @@ function Series() {
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
   const dlOf = (e: Episode) => dls[(e.dl_hash || "").toLowerCase()];
 
+  // only this tab's kind (anime vs standard TV)
+  const kindEps = useMemo(() => eps.filter(e => ((e.series_type || "") === "anime") === anime), [eps, anime]);
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const e of kindEps) c[e.status] = (c[e.status] || 0) + 1;
+    return c;
+  }, [kindEps]);
   // group episodes: show -> season -> episodes (+ per-show status tallies)
   const shows = useMemo(() => {
     const m = new Map<string, Episode[]>();
-    for (const e of eps) { let a = m.get(e.series_title); if (!a) { a = []; m.set(e.series_title, a); } a.push(e); }
+    for (const e of kindEps) { let a = m.get(e.series_title); if (!a) { a = []; m.set(e.series_title, a); } a.push(e); }
     return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([title, list]) => {
       const byStatus: Record<string, number> = {};
       for (const e of list) byStatus[e.status] = (byStatus[e.status] || 0) + 1;
@@ -458,7 +466,7 @@ function Series() {
       for (const [, seps] of seasons) seps.sort((a, b) => a.episode - b.episode);
       return { title, poster: list[0]?.poster, eps: list, byStatus, seasons };
     });
-  }, [eps]);
+  }, [kindEps]);
   const shownShows = useMemo(() => {
     const s = q.trim().toLowerCase();
     return s ? shows.filter(sh => sh.title.toLowerCase().includes(s)) : shows;
@@ -466,7 +474,6 @@ function Series() {
   const allOpen = shownShows.length > 0 && open.size >= shownShows.length;
 
   async function refresh() {
-    setCounts((await api.tvStatus()).counts);
     setEps(await api.tvEpisodes(filter || undefined));
   }
   useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
@@ -477,11 +484,83 @@ function Series() {
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
+  // seasons + episodes detail, shared by the list rows and the grid cards
+  const renderSeasons = (sh: typeof shows[number]) => sh.seasons.map(([season, seps]) => (
+    <div className="seasonblock" key={season}>
+      <div className="seasonhead">Season {season} <span className="muted">· {seps.length}</span>
+        <button className="btn sec" style={{ marginLeft: 8, padding: "2px 8px", fontSize: 11 }}
+          onClick={() => setRelSeason({ seriesId: seps[0].series_id, season, title: sh.title })}>
+          Search pack…</button></div>
+      <table><tbody>
+        {seps.map(e => (
+          <tr key={e.id}>
+            <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
+            <td style={{ minWidth: 140 }}><Pill s={e.status} />
+              {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
+              {e.status === "merging" && e.progress &&
+              <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
+              {e.error && <div className="sub bad">{e.error}</div>}</td>
+            <td>{e.candidate_title
+              ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
+              : <span className="muted">—</span>}</td>
+            <td className="muted" style={{ width: 90 }}>{e.quality || "—"}</td>
+            <td><div className="row">
+              {!["ignored", "merged"].includes(e.status) &&
+                <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Interactive…</button>}
+              {["pending", "no_release", "error", "sync_fail"].includes(e.status) &&
+                <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
+              {!["ignored", "merged"].includes(e.status) &&
+                <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>}
+            </div></td>
+          </tr>
+        ))}
+      </tbody></table>
+    </div>
+  ));
+
+  const statusPills = (sh: typeof shows[number]) => Object.entries(sh.byStatus).map(([s, n]) =>
+    <span className={`pill ${s}`} key={s}>{n} {s.replace("_", " ")}</span>);
+
+  // list row (accordion)
+  const renderShow = (sh: typeof shows[number]) => {
+    const isOpen = open.has(sh.title);
+    return (
+      <div className="showgroup" key={sh.title}>
+        <div className="showhead" onClick={() => toggle(sh.title)}>
+          <span className="caret">{isOpen ? "▾" : "▸"}</span>
+          <Poster src={sh.poster} alt={sh.title} />
+          <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
+          <div className="spacer" />
+          <span className="chips">{statusPills(sh)}</span>
+        </div>
+        {isOpen && renderSeasons(sh)}
+      </div>
+    );
+  };
+
+  // grid poster card; expands full-width when opened
+  const renderShowCard = (sh: typeof shows[number]) => {
+    const isOpen = open.has(sh.title);
+    return (
+      <div className={"showcard" + (isOpen ? " open" : "")} key={sh.title}>
+        <div className="showcard-head" onClick={() => toggle(sh.title)}>
+          <Poster src={sh.poster} alt={sh.title} />
+          <div className="showcard-meta">
+            <div className="showcard-title">{sh.title}</div>
+            <div className="sub">{sh.eps.length} ep</div>
+            <div className="chips">{statusPills(sh)}</div>
+          </div>
+        </div>
+        {isOpen && <div className="showcard-detail">{renderSeasons(sh)}</div>}
+      </div>
+    );
+  };
+
   return (
     <>
       <div className="panel">
         <div className="row">
-          <div><b>Series pipeline</b> <span className="muted">episode VO merges</span></div>
+          <div><b>{anime ? "🎌 Anime pipeline" : "📺 TV Shows pipeline"}</b> <span className="muted">episode VO merges</span></div>
           <div className="spacer" />
           <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
         </div>
@@ -498,62 +577,24 @@ function Series() {
             <option value="">all states</option>
             {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
-          <input className="search" placeholder="Search show…" value={q} onChange={e => setQ(e.target.value)} />
-          <span className="muted">{shownShows.length} shows · {eps.length} episodes</span>
+          <input className="search" placeholder={anime ? "Search anime…" : "Search show…"} value={q} onChange={e => setQ(e.target.value)} />
+          <span className="muted">{shownShows.length} shows · {kindEps.length} episodes</span>
           <div className="spacer" />
+          {(counts.error ?? 0) > 0 &&
+            <button className="btn sec" disabled={busy} onClick={() => act(api.tvRetryErrors)}
+              title="Blocklist the failed release, drop its donor, and re-search">
+              ↻ Retry {counts.error} errors</button>}
           <button className="btn sec" onClick={() => setOpen(allOpen ? new Set() : new Set(shownShows.map(s => s.title)))}>
             {allOpen ? "Collapse all" : "Expand all"}</button>
+          <div className="viewtoggle">
+            <button className={view === "grid" ? "active" : ""} onClick={() => setViewP("grid")} title="Grid view">▦ Grid</button>
+            <button className={view === "list" ? "active" : ""} onClick={() => setViewP("list")} title="List view">☰ List</button>
+          </div>
         </div>
-        {shownShows.map(sh => {
-          const isOpen = open.has(sh.title);
-          return (
-            <div className="showgroup" key={sh.title}>
-              <div className="showhead" onClick={() => toggle(sh.title)}>
-                <span className="caret">{isOpen ? "▾" : "▸"}</span>
-                <Poster src={sh.poster} alt={sh.title} />
-                <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
-                <div className="spacer" />
-                <span className="chips">
-                  {Object.entries(sh.byStatus).map(([s, n]) =>
-                    <span className={`pill ${s}`} key={s}>{n} {s.replace("_", " ")}</span>)}
-                </span>
-              </div>
-              {isOpen && sh.seasons.map(([season, seps]) => (
-                <div className="seasonblock" key={season}>
-                  <div className="seasonhead">Season {season} <span className="muted">· {seps.length}</span>
-                    <button className="btn sec" style={{ marginLeft: 8, padding: "2px 8px", fontSize: 11 }}
-                      onClick={() => setRelSeason({ seriesId: seps[0].series_id, season, title: sh.title })}>
-                      Search pack…</button></div>
-                  <table><tbody>
-                    {seps.map(e => (
-                      <tr key={e.id}>
-                        <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
-                        <td style={{ minWidth: 140 }}><Pill s={e.status} />
-                          {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
-                          {e.status === "merging" && e.progress &&
-                          <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
-                          {e.error && <div className="sub bad">{e.error}</div>}</td>
-                        <td>{e.candidate_title
-                          ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
-                          : <span className="muted">—</span>}</td>
-                        <td className="muted" style={{ width: 90 }}>{e.quality || "—"}</td>
-                        <td><div className="row">
-                          {!["ignored", "merged"].includes(e.status) &&
-                            <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Interactive…</button>}
-                          {["pending", "no_release", "error"].includes(e.status) &&
-                            <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
-                          {!["ignored", "merged"].includes(e.status) &&
-                            <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>}
-                        </div></td>
-                      </tr>
-                    ))}
-                  </tbody></table>
-                </div>
-              ))}
-            </div>
-          );
-        })}
-        {shownShows.length === 0 && <div className="muted">No shows match.</div>}
+        {view === "grid"
+          ? <div className="showcardgrid">{shownShows.map(renderShowCard)}</div>
+          : shownShows.map(renderShow)}
+        {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
       </div>
       {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
@@ -752,7 +793,7 @@ function Logs() {
 export default function App() {
   const [tab, setTab] = useState("films");
   const tabs: [string, string][] = [
-    ["films", "Films"], ["series", "Series"], ["review", "Review"],
+    ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"], ["review", "Review"],
     ["settings", "Settings"], ["logs", "Logs"]];
   return (
     <div className="app">
@@ -765,7 +806,8 @@ export default function App() {
           <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{label}</button>)}
       </nav>
       {tab === "films" && <Dashboard />}
-      {tab === "series" && <Series />}
+      {tab === "anime" && <Series anime key="anime" />}
+      {tab === "series" && <Series anime={false} key="series" />}
       {tab === "review" && <Review />}
       {tab === "settings" && <Settings />}
       {tab === "logs" && <Logs />}

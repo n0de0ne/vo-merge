@@ -14,7 +14,7 @@ export interface Episode {
   status: string; candidate_title: string | null; candidate_score: number | null;
   candidate_seeders: number | null; quality: string | null; poster: string | null;
   sync_delta: number | null; error: string | null; progress?: string | null;
-  dl_hash?: string | null;
+  dl_hash?: string | null; series_type?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {
@@ -67,6 +67,7 @@ export const api = {
   tvEpisodes: (status?: string) =>
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
+  tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   epRetry: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>

@@ -164,6 +164,23 @@ def _free_donor(qb, h, cfg, tag=""):
         core.log(f"donor {tag}: delete failed ({str(h)[:12]}): {e}")
 
 
+def inflight_downloads(cfg):
+    """How many downloads vo-merge currently has in qB across both categories (a season pack
+    counts as one). This is the flow-control number that caps new grabs."""
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+    return len(qb.hashes(cfg["qb_category"])) + len(qb.hashes(cfg["qb_tv_category"]))
+
+
+def grab_budget(cfg):
+    """Remaining download slots before hitting max_inflight_downloads. 0 = don't grab this cycle.
+    Fails safe: if qB can't be reached we return 0 (never flood when we can't see the queue)."""
+    cap = cfg.get("max_inflight_downloads", 5)
+    try:
+        return max(0, cap - inflight_downloads(cfg))
+    except Exception as e:
+        core.log(f"grab_budget: qB unreachable ({e}) -> holding"); return 0
+
+
 def _clients(cfg):
     return (Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"]),
             Radarr(cfg["radarr_url"], cfg["radarr_key"]),
@@ -721,7 +738,11 @@ def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not cfg["enabled"]:
         return
-    cap = cfg.get("max_search_per_run", 25); n = 0
+    budget = grab_budget(cfg)                      # flow control: cap downloads in flight
+    if budget <= 0:
+        core.log(f"search films: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
+        return
+    cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0
     for mv in core.get_movies("pending"):
         search_movie(mv["tmdb_id"], cfg); n += 1
         if n >= cap:

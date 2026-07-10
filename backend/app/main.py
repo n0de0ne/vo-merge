@@ -325,7 +325,14 @@ def tv_season_grab(series_id: int, season: int, body: GrabIn):
 
 @api.post("/episode/{ep_id}/retry")
 def ep_retry(ep_id: str):
-    core.set_ep_status(ep_id, "pending", error=None); return {"ok": True}
+    from . import tv
+    tv.retry_episode(ep_id); return {"ok": True}
+
+
+@api.post("/tv/retry_errors")
+def tv_retry_errors():
+    from . import tv
+    return {"ok": True, "retried": tv.retry_errors()}
 
 
 @api.post("/episode/{ep_id}/ignore")

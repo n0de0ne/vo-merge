@@ -21,16 +21,28 @@ def _search_job():
 def _finish_job():
     if not pipeline.FINISH_LOCK.acquire(blocking=False):
         return                       # a finish cycle is already running
+    refill = False
     try:
         cfg = core.load_config()
         if cfg.get("scope_films", True):
             pipeline.stage_finish(cfg)
         if cfg.get("scope_series"):
             tv.stage_finish(cfg)
+        refill = True
     except Exception as e:
         core.log(f"finish_job error: {e}")
     finally:
         pipeline.FINISH_LOCK.release()
+    # merges freed slots + deleted donors -> top the download queue back up to the in-flight cap
+    if refill:
+        try:
+            cfg = core.load_config()
+            if cfg.get("scope_films", True):
+                pipeline.stage_search(cfg)
+            if cfg.get("scope_series"):
+                tv.stage_search(cfg)
+        except Exception as e:
+            core.log(f"finish refill error: {e}")
 
 
 def _stall_job():

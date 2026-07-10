@@ -67,6 +67,10 @@ DEFAULTS = {
                                            # this long is dropped + blocklisted -> grab another release
     "stall_check_interval_min": 3,         # how often the stall sweep runs (independent of merges)
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
+    "max_inflight_downloads": 5,           # flow control: never have more than this many downloads
+                                           # in qB at once (a season pack counts as one). vo-merge
+                                           # won't grab another until a merge finishes + donor is
+                                           # freed, dropping the count below the cap.
     "enabled": False,                      # master switch; off until configured
 }
 
@@ -170,19 +174,20 @@ def init_tv():
             error TEXT, updated REAL,
             dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
         _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
-                                     "poster": "TEXT", "progress": "TEXT", "added_langs": "TEXT"})
+                                     "poster": "TEXT", "progress": "TEXT", "added_langs": "TEXT",
+                                     "series_type": "TEXT DEFAULT 'standard'"})
 
 
 def upsert_episode(e: dict):
     cols = ["id", "series_id", "series_title", "tvdb_id", "season", "episode",
-            "french_path", "quality", "poster"]
+            "french_path", "quality", "poster", "series_type"]
     with db() as c:
         ex = c.execute("SELECT status FROM episodes WHERE id=?", (e["id"],)).fetchone()
         if ex:
-            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,poster=?,updated=?
+            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,poster=?,series_type=?,updated=?
                          WHERE id=?""",
                       (e["series_title"], e["tvdb_id"], e["french_path"], e["quality"],
-                       e.get("poster"), time.time(), e["id"]))
+                       e.get("poster"), e.get("series_type", "standard"), time.time(), e["id"]))
         else:
             c.execute(f"INSERT INTO episodes ({','.join(cols)},updated) "
                       f"VALUES ({','.join('?'*len(cols))},?)",

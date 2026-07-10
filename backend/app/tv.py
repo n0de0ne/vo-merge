@@ -10,8 +10,8 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       mirror_to_en, _qb_to_local, _free_donor, MERGE_LOCK, FR_DUB, EN_OK,
-                       EN_AUDIO, RES, SRC)
+                       mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_LOCK, FR_DUB,
+                       EN_OK, EN_AUDIO, RES, SRC)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -91,7 +91,7 @@ def scan(cfg=None):
                 "series_title": s["title"], "tvdb_id": s.get("tvdbId"),
                 "season": season, "episode": ep, "french_path": _media(path, cfg),
                 "quality": mi.get("resolution") or (f.get("quality", {}).get("quality", {}) or {}).get("name"),
-                "poster": poster,
+                "poster": poster, "series_type": s.get("seriesType", "standard"),
             })
             n += 1
     core.log(f"tv scan: {n} episodes missing English (pilot={sorted(pilot) or 'all'})")
@@ -269,6 +269,46 @@ def episode_candidates(ep_id, cfg=None):
     return out
 
 
+def retry_episode(ep_id, cfg=None):
+    """Proper retry for an errored/failed episode: blocklist the release that failed, drop its
+    donor from qB (only if no other live episode still needs that hash), clear the grab fields,
+    and re-queue for a fresh search."""
+    import json as _json
+    cfg = cfg or core.load_config()
+    e = core.get_episode(ep_id)
+    if not e:
+        return False
+    h = e.get("dl_hash")
+    tried = _json.loads(e.get("tried") or "[]")
+    if e.get("dl_id") and e["dl_id"] not in tried:
+        tried.append(e["dl_id"])
+    if h:
+        live = [x for x in core.get_episodes()
+                if (x.get("dl_hash") == h and x["id"] != ep_id
+                    and x["status"] not in ("error", "no_release", "ignored", "merged"))]
+        if not live:
+            try:
+                qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+                qb.delete([h], delete_files=True)
+                core.log(f"retry {ep_id}: dropped failed donor {str(h)[:12]}")
+            except Exception as ex:
+                core.log(f"retry {ep_id}: donor drop failed: {ex}")
+    core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried),
+                       dl_hash=None, dl_id=None, en_file=None, progress="")
+    return True
+
+
+def retry_errors(cfg=None):
+    """Retry every errored episode (bulk). Returns how many were re-queued."""
+    cfg = cfg or core.load_config()
+    n = 0
+    for e in core.get_episodes("error"):
+        if retry_episode(e["id"], cfg):
+            n += 1
+    core.log(f"tv retry-all: re-queued {n} errored episodes")
+    return n
+
+
 def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
     """Grab a user-chosen release for a single episode (interactive)."""
     cfg = cfg or core.load_config()
@@ -288,13 +328,22 @@ def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
         return
+    budget = grab_budget(cfg)                        # flow control: cap downloads in flight (shared with films)
+    if budget <= 0:
+        core.log(f"tv search: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
+        return
     pend = core.get_episodes("pending")
-    cap = cfg.get("max_search_per_run", 25); n = 0   # ramp gradually, don't flood indexers
+    cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0   # ramp gradually, don't flood indexers
     # group by (series, season)
     by_season = defaultdict(list)
     for e in pend:
         by_season[(e["series_id"], e["series_title"], e["season"])].append(e)
-    for (sid, title, season), eps in by_season.items():
+    # anime first: fill the Anime library ahead of standard TV
+    def _order(item):
+        (sid, title, season), eps = item
+        is_anime = any((e.get("series_type") or "") == "anime" for e in eps)
+        return (0 if is_anime else 1, title, season)
+    for (sid, title, season), eps in sorted(by_season.items(), key=_order):
         if n >= cap:
             break
         if len(eps) >= cfg["tv_pack_threshold"]:
@@ -493,7 +542,11 @@ def stage_finish(cfg=None):
     by_hash = defaultdict(list)
     for e in downloading:
         by_hash[e.get("dl_hash")].append(e)
-    for h, eps in by_hash.items():
+    # merge anime packs first (priority on the Anime library)
+    def _order(item):
+        h, eps = item
+        return 0 if any((e.get("series_type") or "") == "anime" for e in eps) else 1
+    for h, eps in sorted(by_hash.items(), key=_order):
         t = torrents.get(h)
         if not t:
             # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
