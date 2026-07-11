@@ -36,6 +36,7 @@ DEFAULTS = {
     # seeding (the operator's seed-manager script handles those).
     "delete_donor": True,
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
+    "no_seed_public": True,                        # public donors: stop at 100%, never seed
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval

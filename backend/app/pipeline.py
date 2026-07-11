@@ -369,6 +369,37 @@ def drop_stalled(mv, t, cfg):
     search_movie(tmdb_id, cfg)
 
 
+def no_seed_public(cfg=None):
+    """Public donors never seed: STOP every completed public (qB private=false) torrent
+    in both vo-merge categories. A stopped donor's files stay on disk, so the merge
+    still consumes it and _free_donor deletes it afterwards — this just closes the
+    seeding window while a completed donor waits for its merge slot. Do NOT use
+    setShareLimits here: qB's limit-reached action on this box is 'remove torrent AND
+    delete content', which destroys the donor before the merge (verified live
+    2026-07-11 — the capped donor was deleted and its episodes re-queued).
+    French-tracker torrents are left seeding as usual."""
+    cfg = cfg or core.load_config()
+    if not cfg.get("no_seed_public", True):
+        return
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    try:
+        qb.login()
+        tors = qb.torrents(cfg["qb_category"]) + qb.torrents(cfg["qb_tv_category"])
+    except Exception as e:
+        core.log(f"no_seed_public: qB error {e}"); return
+    stop = [t["hash"] for t in tors
+            if t.get("private") is False and t.get("hash")
+            and (t.get("progress", 0) or 0) >= 1.0
+            and t.get("state") not in ("stoppedUP", "pausedUP")
+            and not _tracker_is_french(qb, t["hash"], cfg)]
+    if stop:
+        try:
+            qb.stop(stop)
+            core.log(f"no-seed: stopped {len(stop)} completed public donor(s)")
+        except Exception as e:
+            core.log(f"no_seed_public: stop failed: {e}")
+
+
 def sweep_stalled(cfg=None):
     """Drop seederless / non-progressing movie downloads and grab another release. Runs on its
     OWN fast timer, NOT inside the finish/merge loop, so a long merge backlog never delays it."""

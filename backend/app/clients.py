@@ -137,6 +137,16 @@ class QBittorrent:
         p = {"category": category} if category else {}
         return self.s.get(f"{self.url}/api/v2/torrents/info", params=p, timeout=30).json()
 
+    def stop(self, hashes):
+        """Stop (pause) torrents. NEVER cap share limits instead — qB's limit-reached
+        action can be 'remove torrent + delete content', destroying an unmerged donor."""
+        if not hashes:
+            return
+        r = self.s.post(f"{self.url}/api/v2/torrents/stop",
+                        data={"hashes": "|".join(hashes)},
+                        headers={"Referer": self.url}, timeout=30)
+        r.raise_for_status()
+
     def trackers(self, h):
         """Announce URLs registered on a torrent (skips the DHT/PeX/LSD pseudo-entries)."""
         try:

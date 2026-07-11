@@ -50,6 +50,7 @@ def _stall_job():
     downloads get dropped + re-grabbed promptly even while a long merge run is in progress."""
     try:
         cfg = core.load_config()
+        pipeline.no_seed_public(cfg)
         if cfg.get("scope_films", True):
             pipeline.sweep_stalled(cfg)
         if cfg.get("scope_series"):
