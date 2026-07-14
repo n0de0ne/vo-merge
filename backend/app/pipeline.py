@@ -405,21 +405,34 @@ def ai_health_check(cfg=None):
             _WEDGE_SINCE["ts"] = time.time()
     else:
         _WEDGE_SINCE["ts"] = None
-    # (b) new error / review records (aggregated; each record pages once ever)
+    # (b) new error / review records — per-record seen-set so only NEW ones page,
+    # and a standing backlog never re-pages when one more record errors
+    seen_path = os.path.join(core.CONFIG_DIR, "ai_seen_records.json")
+    try:
+        seen = set(json.load(open(seen_path)))
+    except Exception:
+        seen = set()
     news = []
     for st in ("error", "review"):
         for m in core.get_movies(st):
+            rk = f"movie:{m['tmdb_id']}:{st}"
+            if rk in seen: continue
+            seen.add(rk)
             news.append({"type": "movie", "status": st, "id": m["tmdb_id"],
                          "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
         for e in core.get_episodes(st):
+            rk = f"episode:{e['id']}:{st}"
+            if rk in seen: continue
+            seen.add(rk)
             news.append({"type": "episode", "status": st, "id": e["id"],
                          "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
                          "error": (e.get("error") or "")[:200]})
     if news:
-        key = ",".join(sorted(str(n["id"]) for n in news))
+        json.dump(sorted(seen), open(seen_path, "w"))
+        key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
         core.ticket("errors-review",
-                    f"{len(news)} record(s) in error/review",
-                    {"records": news[:60]}, key=key)
+                    f"{len(news)} NEW record(s) in error/review",
+                    {"records": news[:60], "total_new": len(news)}, key=key)
 
 
 def no_seed_public(cfg=None):
