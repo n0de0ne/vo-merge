@@ -37,6 +37,7 @@ DEFAULTS = {
     "delete_donor": True,
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "no_seed_public": True,                        # public donors: stop at 100%, never seed
+    "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -103,6 +104,38 @@ def log(msg: str):
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
     print(line, flush=True)
+
+
+def ticket(kind, summary, context=None, key=None):
+    """File an issue ticket for the host's AI dispatcher (an Unraid user script cron
+    that runs the Claude Code CLI on each ticket). Tickets land in /config/ai-tickets/
+    which the host reads as appdata/vo-merge/ai-tickets/. A (kind,key) pair is filed
+    only once (persisted in ai_tickets_filed.json) so a standing condition doesn't
+    re-page after being handled."""
+    try:
+        seen_path = os.path.join(CONFIG_DIR, "ai_tickets_filed.json")
+        try:
+            seen = set(json.load(open(seen_path)))
+        except Exception:
+            seen = set()
+        k = f"{kind}:{key or ''}"
+        if k in seen:
+            return
+        d = os.path.join(CONFIG_DIR, "ai-tickets")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{kind}.json")
+        if os.path.exists(path):
+            return                            # same kind already awaiting dispatch
+        with open(path, "w") as f:
+            json.dump({"app": "vo-merge", "kind": kind, "summary": summary,
+                       "context": context or {},
+                       "ts": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                      f, ensure_ascii=False, indent=1, default=str)
+        seen.add(k)
+        json.dump(sorted(seen)[-3000:], open(seen_path, "w"))
+        log(f"AI-TICKET {kind}: {summary[:70]}")
+    except Exception as e:
+        log(f"ticket() failed: {e}")
 
 
 def tail_log(n=300):

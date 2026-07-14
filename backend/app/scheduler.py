@@ -51,6 +51,7 @@ def _stall_job():
     try:
         cfg = core.load_config()
         pipeline.no_seed_public(cfg)
+        pipeline.ai_health_check(cfg)
         if cfg.get("scope_films", True):
             pipeline.sweep_stalled(cfg)
         if cfg.get("scope_series"):

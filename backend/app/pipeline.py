@@ -369,6 +369,59 @@ def drop_stalled(mv, t, cfg):
     search_movie(tmdb_id, cfg)
 
 
+_WEDGE_SINCE = {"ts": None}
+
+
+def ai_health_check(cfg=None):
+    """Page the on-call AI (core.ticket -> host dispatcher runs Claude Code) when the
+    pipeline is stuck: (a) the in-flight cap is saturated for >2h with NOTHING in
+    'downloading' state — dead/orphaned donors are holding every slot (the 2026-07-12
+    two-day deadlock); (b) records newly landed in error or review."""
+    cfg = cfg or core.load_config()
+    if not cfg.get("ai_tickets", True):
+        return
+    # (a) cap saturated but pipeline idle
+    try:
+        cap = int(cfg.get("max_inflight_downloads", 5))
+        stuck = cap > 0 and inflight_downloads(cfg) >= cap and \
+            not core.get_movies("downloading") and not core.get_episodes("downloading")
+    except Exception:
+        stuck = False
+    if stuck:
+        if _WEDGE_SINCE["ts"] is None:
+            _WEDGE_SINCE["ts"] = time.time()
+        elif time.time() - _WEDGE_SINCE["ts"] > 7200:
+            tors = []
+            try:
+                qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+                tors = [{"hash": t["hash"], "state": t["state"],
+                         "progress": round(t.get("progress", 0), 2), "name": t["name"][:60]}
+                        for t in qb.torrents(cfg["qb_category"]) + qb.torrents(cfg["qb_tv_category"])]
+            except Exception:
+                pass
+            core.ticket("cap-wedged",
+                        "in-flight cap saturated >2h with nothing downloading (dead donors hold the slots)",
+                        {"torrents": tors}, key=time.strftime("%Y-%m-%d"))
+            _WEDGE_SINCE["ts"] = time.time()
+    else:
+        _WEDGE_SINCE["ts"] = None
+    # (b) new error / review records (aggregated; each record pages once ever)
+    news = []
+    for st in ("error", "review"):
+        for m in core.get_movies(st):
+            news.append({"type": "movie", "status": st, "id": m["tmdb_id"],
+                         "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
+        for e in core.get_episodes(st):
+            news.append({"type": "episode", "status": st, "id": e["id"],
+                         "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
+                         "error": (e.get("error") or "")[:200]})
+    if news:
+        key = ",".join(sorted(str(n["id"]) for n in news))
+        core.ticket("errors-review",
+                    f"{len(news)} record(s) in error/review",
+                    {"records": news[:60]}, key=key)
+
+
 def no_seed_public(cfg=None):
     """Public donors never seed: STOP every completed public (qB private=false) torrent
     in both vo-merge categories. A stopped donor's files stay on disk, so the merge
