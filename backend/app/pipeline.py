@@ -164,11 +164,63 @@ def _free_donor(qb, h, cfg, tag=""):
         core.log(f"donor {tag}: delete failed ({str(h)[:12]}): {e}")
 
 
+# donor-ownership states: ACTIVE records are consuming their donor (counts toward the
+# in-flight cap); review/sync_fail keep the donor for manual resync but must NOT hold a
+# grab slot — counting raw qB hashes caused two dead-donor cap deadlocks (2026-07-12,
+# 2026-07-15: merged/review/sync_fail owners saturated the cap for days).
+ACTIVE_STATES = ("downloading", "ready", "merging")
+KEEP_DONOR_STATES = ACTIVE_STATES + ("review", "sync_fail")
+
+
+def _dl_hashes(states):
+    hs = set()
+    for st in states:
+        for m in core.get_movies(st):
+            if m.get("dl_hash"): hs.add(str(m["dl_hash"]).lower())
+        for e in core.get_episodes(st):
+            if e.get("dl_hash"): hs.add(str(e["dl_hash"]).lower())
+    return hs
+
+
 def inflight_downloads(cfg):
-    """How many downloads vo-merge currently has in qB across both categories (a season pack
-    counts as one). This is the flow-control number that caps new grabs."""
+    """How many grab slots are occupied = qB torrents (both categories) tied to an ACTIVE
+    pipeline record (a season pack counts once). Torrents added <10 min ago count
+    unconditionally — the record write may still be in flight right after a grab."""
     qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
-    return len(qb.hashes(cfg["qb_category"])) + len(qb.hashes(cfg["qb_tv_category"]))
+    tors = qb.torrents(cfg["qb_category"]) + qb.torrents(cfg["qb_tv_category"])
+    now = time.time()
+    hashes = {t["hash"].lower() for t in tors if t.get("hash")}
+    recent = {t["hash"].lower() for t in tors if t.get("hash")
+              and now - (t.get("added_on") or 0) < 600}
+    return len((hashes & _dl_hashes(ACTIVE_STATES)) | recent)
+
+
+def sweep_orphan_donors(cfg=None):
+    """Delete donor torrents (with files) that no record in KEEP_DONOR_STATES owns — the
+    owner merged already, errored, or vanished, so nothing will ever consume the donor
+    and it only eats disk. Review/sync_fail-owned donors are kept for manual resync.
+    30-min age grace covers a grab whose record write is still in flight."""
+    cfg = cfg or core.load_config()
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        tors = qb.torrents(cfg["qb_category"]) + qb.torrents(cfg["qb_tv_category"])
+    except Exception as e:
+        core.log(f"orphan sweep: qB error {e}"); return
+    if not tors:
+        return
+    keep = _dl_hashes(KEEP_DONOR_STATES)
+    now = time.time()
+    for t in tors:
+        h = (t.get("hash") or "").lower()
+        if not h or h in keep:
+            continue
+        if now - (t.get("added_on") or now) < 1800:
+            continue
+        try:
+            qb.delete([h], delete_files=True)
+            core.log(f"orphan donor deleted (no active/review owner): {t.get('name','')[:50]}")
+        except Exception as e:
+            core.log(f"orphan sweep: delete {h[:12]} failed: {e}")
 
 
 def grab_budget(cfg):
