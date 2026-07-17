@@ -304,6 +304,8 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
         return []
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     otitle = mv["original_title"] or mv["title"]; year = mv["year"]
+    if not _toks(otitle):                 # non-Latin original title (JP/KR/etc.) tokenizes to
+        otitle = mv["title"]              # nothing -> query+match on Radarr's English title instead
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
     try:
