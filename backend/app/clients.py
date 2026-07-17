@@ -194,6 +194,48 @@ class Plex:
                 done = True   # a folder can live in >1 section (original + -EN) -> refresh all
         return done
 
+    def _search(self, query, want_type):
+        r = requests.get(f"{self.url}/search", params={"query": query, "X-Plex-Token": self.token},
+                         headers={"Accept": "application/json"}, timeout=15)
+        return [m for m in r.json().get("MediaContainer", {}).get("Metadata", [])
+                if m.get("type") == want_type]
+
+    def _children(self, rating_key):
+        r = requests.get(f"{self.url}/library/metadata/{rating_key}/children",
+                         params={"X-Plex-Token": self.token},
+                         headers={"Accept": "application/json"}, timeout=15)
+        return r.json().get("MediaContainer", {}).get("Metadata", [])
+
+    def _rating_key(self, title, year=None, season=None, episode=None):
+        """Resolve a movie or episode to its Plex ratingKey (None if not found)."""
+        if season is None:                                   # movie
+            for m in self._search(title, "movie"):
+                if not year or abs(int(m.get("year") or 0) - int(year)) <= 1:
+                    return m.get("ratingKey")
+            return None
+        shows = self._search(title, "show")                  # episode: show -> season -> episode
+        if not shows:
+            return None
+        seasons = self._children(shows[0].get("ratingKey"))
+        sk = next((s.get("ratingKey") for s in seasons if str(s.get("index")) == str(season)), None)
+        if not sk:
+            return None
+        eps = self._children(sk)
+        return next((e.get("ratingKey") for e in eps if str(e.get("index")) == str(episode)), None)
+
+    def refresh_analyze(self, folder, title, year=None, season=None, episode=None):
+        """Partial-scan `folder` (registers new files/symlinks) AND `analyze` the specific item.
+        A plain scan does NOT re-read a file's audio streams when it's replaced IN PLACE (same
+        name) — only analyze does. Returns the ratingKey analysed (None if the item wasn't found)."""
+        try:
+            self.scan_path(folder)
+        except Exception:
+            pass
+        rk = self._rating_key(title, year, season, episode)
+        if rk:
+            self.analyze(rk)
+        return rk
+
     def ping(self):
         r = requests.get(f"{self.url}/identity",
                          params={"X-Plex-Token": self.token}, timeout=15)

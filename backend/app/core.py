@@ -21,6 +21,8 @@ DEFAULTS = {
     "qb_pass": "",
     "plex_url": "http://10.0.1.5:32400",
     "plex_token": "",
+    "plex2_url": "",                       # optional replica PMS (e.g. http://10.0.1.2:32400)
+    "plex2_token": "",                     # replica's own token (usually a different account)
     "plex_media_prefix": "/data",          # how Plex sees what this app mounts at /media
     "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
     "multi_indexer_ids": [],               # extra indexers to also search for MULTI (e.g. FR trackers)

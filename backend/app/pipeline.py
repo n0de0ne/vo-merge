@@ -813,9 +813,32 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
     core.log(f"resync {tmdb_id}: shifted {len(shift_ids)} {shift_pfx} track(s) {offset_ms:+d}ms")
     try:
         plex_dir = os.path.dirname(f).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-        Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
+        plex_refresh(cfg, plex_dir, mv.get("title"), year=mv.get("year"))
     except Exception:
         pass
+
+
+def _plex_targets(cfg):
+    """Every configured PMS: the master, plus the optional replica (plex2_*)."""
+    out = [Plex(cfg["plex_url"], cfg["plex_token"])]
+    if cfg.get("plex2_url"):
+        out.append(Plex(cfg["plex2_url"], cfg.get("plex2_token", "")))
+    return out
+
+
+def plex_refresh(cfg, folder, title, year=None, season=None, episode=None):
+    """Refresh + analyze an item on ALL configured PMS (master + replica), so a freshly grafted
+    audio track shows up on both. A plain scan won't re-read streams after an in-place remux —
+    analyze does. Best-effort per server; never raises into the merge flow."""
+    res = []
+    for p in _plex_targets(cfg):
+        host = p.url.split("//")[-1]
+        try:
+            rk = p.refresh_analyze(folder, title, year=year, season=season, episode=episode)
+            res.append(f"{host}={'analyzed' if rk else 'scan-only'}")
+        except Exception as e:
+            res.append(f"{host}=ERR:{str(e)[:40]}")
+    return res
 
 
 EN_LIBS = {"Films": "Films-EN", "Series": "Series-EN", "Anime": "Anime-EN"}
@@ -837,7 +860,9 @@ def mirror_to_en(libfile, cfg=None):
             os.makedirs(os.path.dirname(link), exist_ok=True)
             os.symlink(os.path.relpath(libfile, os.path.dirname(link)), link)
         en_dir = os.path.dirname(link).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-        Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(en_dir)
+        for p in _plex_targets(cfg):          # new symlink -> a scan makes each PMS read it fresh
+            try: p.scan_path(en_dir)
+            except Exception: pass
         core.log(f"mirror: EN symlink + Plex scan for {en_top}/{parts[1]}")
     except Exception as e:
         core.log(f"mirror EN failed for {libfile}: {e}")
@@ -866,13 +891,11 @@ def finish_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "merged", merged_file=dest)
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
-        # tell Plex to re-read the changed file so the new audio track shows up
-        try:
-            plex_dir = libdir.replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-            Plex(cfg["plex_url"], cfg["plex_token"]).scan_path(plex_dir)
-            core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan + Plex scan ({plex_dir}) queued")
-        except Exception as e:
-            core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan queued; Plex scan skipped: {e}")
+        # re-read the changed file's streams on every PMS (analyze — a plain scan won't refresh
+        # audio after an in-place remux)
+        plex_dir = libdir.replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
+        res = plex_refresh(cfg, plex_dir, mv.get("title"), year=mv.get("year"))
+        core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan + Plex refresh {res}")
         mirror_to_en(dest, cfg)        # add to the -EN library + refresh that section now
         if mv.get("dl_hash"):          # donor served its purpose -> free the space
             try:
