@@ -83,18 +83,46 @@ merged / review / sync_fail / error / ignored.
 
 ## Stalled-download handling
 
-`_is_stalled(t, cfg)`: incomplete + active > `stall_timeout_min` + `dlspeed==0` + (no swarm
-seeds or qB state in stalledDL/error/missingFiles/metaDL). When stalled: delete from qB,
+`_is_stalled(t, cfg)`: incomplete + active > `stall_timeout_min` (default **5**) + `dlspeed==0` +
+(no swarm seeds or qB state in stalledDL/error/missingFiles/metaDL). **Absolute cap:** a download
+active past `dl_max_age_min` (default 720 = 12h) is dropped too, even if it's still trickling —
+a release that can't finish in that long isn't worth the slot. When stalled: delete from qB,
 **blocklist that release** (add `dl_id` to `tried`), re-search for another (better-seeded)
 release; give up to `no_release` after `max_sync_retries`. Movies: `drop_stalled`; TV
-season-packs: `_drop_stalled_eps`.
+season-packs: `_drop_stalled_eps`. A download that **completes but yields no usable video** is
+NOT left stuck in `downloading`: movies call `reject_and_retry`, TV calls `_drop_stalled_eps`
+(both blocklist the release and re-search), unless the path just isn't visible yet (mount race).
+
+## AI-assisted review (round-trip)
+
+A record landing in `error`/`review`/`sync_fail` is auto-escalated to the host AI dispatcher and
+its outcome is written back so failures surface for a human:
+
+1. **Auto-page** — `pipeline.ai_health_check` (stall sweep, every 3 min) files an `errors-review`
+   ticket for NEW records and stamps them `ai_status='pending'` (+`ai_at`). Manual escalation:
+   `POST /api/movie/{id}/ai` and `POST /api/episode/{id}/ai` (the Review tab's 🤖 button).
+2. **Act** — the host Unraid cron runs the Claude Code CLI on the ticket; the agent acts via the
+   REST actions embedded in the ticket (`/sync`, `/another`, `/research`, `/ignore`, `/retry`, …).
+3. **Report back** — the agent POSTs `/api/movie/{id}/ai_result` or `/api/episode/{id}/ai_result`
+   with `{status: resolved|failed|needs_human, verdict, action_taken}`. This stamps `ai_status`/
+   `ai_verdict`/`ai_at` and **leaves the pipeline `status` untouched** (so the specific failure is
+   preserved and no re-page loop is triggered). No host-script change is needed — the callback is
+   just another action in the ticket.
+4. **Manual review** — records with `ai_status` `failed`/`needs_human` are highlighted at the top
+   of the **Review tab** (movies + TV episodes). If the dispatcher never calls back within
+   `ai_stale_min` (default 60) while still in a problem state, `ai_health_check` flips it to
+   `needs_human` — catching a silently crashed AI.
+
+New DB columns: `ai_status`, `ai_verdict`, `ai_at` on both `movies` and `episodes` (via
+`_ensure_cols`). Gated by the existing `ai_tickets` flag.
 
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
 Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads),
-`stall_timeout_min`, `search_interval_min`/`finish_interval_min`, `enabled` (master switch).
+`stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`, `enabled`
+(master switch), `ai_tickets`/`ai_stale_min` (AI-review escalation, see below).
 Secrets are masked in the GET /api/settings response.
 
 ### Paths / mounts (all three must line up)

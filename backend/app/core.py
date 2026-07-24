@@ -40,6 +40,8 @@ DEFAULTS = {
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "no_seed_public": True,                        # public donors: stop at 100%, never seed
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
+    "ai_stale_min": 60,                            # if the AI doesn't report back within this many
+                                                   # minutes, flag the item for manual review
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -70,6 +72,8 @@ DEFAULTS = {
     "stall_timeout_min": 5,                # an incomplete download not moving (no seeds/0 speed) for
                                            # this long is dropped + blocklisted -> grab another release
     "stall_check_interval_min": 3,         # how often the stall sweep runs (independent of merges)
+    "dl_max_age_min": 720,                 # absolute cap: a download active this long (even if slowly
+                                           # trickling) is dropped + blocklisted -> grab another release
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "max_inflight_downloads": 5,           # flow control: never have more than this many downloads
                                            # in qB at once (a season pack counts as one). vo-merge
@@ -189,7 +193,9 @@ def init_db():
         )""")
         _ensure_cols(c, "movies", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
                                    "added_langs": "TEXT", "poster": "TEXT", "progress": "TEXT",
-                                   "merged_at": "REAL"})
+                                   "merged_at": "REAL",
+                                   # AI-review round-trip: status the host dispatcher reports back
+                                   "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL"})
 
 
 def _ensure_cols(c, table, cols):
@@ -216,7 +222,9 @@ def init_tv():
             dl_id TEXT, tried TEXT, attempts INTEGER DEFAULT 0 )""")
         _ensure_cols(c, "episodes", {"dl_id": "TEXT", "tried": "TEXT", "attempts": "INTEGER DEFAULT 0",
                                      "poster": "TEXT", "progress": "TEXT", "added_langs": "TEXT",
-                                     "series_type": "TEXT DEFAULT 'standard'", "merged_at": "REAL"})
+                                     "series_type": "TEXT DEFAULT 'standard'", "merged_at": "REAL",
+                                     # AI-review round-trip (see movies table)
+                                     "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL"})
 
 
 def upsert_episode(e: dict):

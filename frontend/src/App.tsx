@@ -18,6 +18,45 @@ const fmtEta = (s: number) => (!s || s <= 0 || s >= 8640000 ? "" : "ETA " + fmtT
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
+// Poll `fn` every `ms`, but ONLY while the tab is visible. Browsers throttle background-tab
+// timers, so a tab left open would silently go stale (the "won't update without a reload"
+// complaint). We pause while hidden and fire an immediate refresh the moment the tab is
+// focused again. `deps` re-arms the loop (e.g. when a filter changes).
+function usePoll(fn: () => void, ms: number, deps: any[] = []) {
+  const saved = useRef(fn);
+  saved.current = fn;
+  useEffect(() => {
+    let alive = true;
+    const run = () => { if (alive && !document.hidden) saved.current(); };
+    run();
+    const id = setInterval(run, ms);
+    const onVis = () => { if (!document.hidden) run(); };   // instant refresh on return
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    return () => {
+      alive = false; clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+    };
+    /* eslint-disable-next-line */
+  }, [ms, ...deps]);
+}
+
+// tiny "this view auto-refreshes" indicator
+function LiveDot() {
+  return <span className="livedot" title="Auto-refreshing while this tab is visible">live</span>;
+}
+
+// small secondary pill for the AI-review status of an item (orthogonal to the pipeline status)
+const AI_LABEL: Record<string, string> = {
+  pending: "🤖 AI working", resolved: "🤖 AI resolved",
+  failed: "🤖 AI couldn't fix", needs_human: "🤖 needs you",
+};
+function AiPill({ s }: { s?: string | null }) {
+  if (!s) return null;
+  return <span className={`pill ai_${s}`}>{AI_LABEL[s] ?? s}</span>;
+}
+
 // human label for a qB torrent state (distinguishes queued from genuinely stalled)
 const DL_LABEL: Record<string, string> = {
   metaDL: "fetching metadata", queuedDL: "queued", stalledDL: "stalled",
@@ -209,7 +248,7 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
 }
 
 const STATES = ["pending","searching","no_release","grabbed","downloading",
-  "ready","merging","merged","sync_fail","error","ignored"];
+  "ready","merging","merged","review","sync_fail","error","ignored"];
 
 function Pill({ s }: { s: string }) {
   return <span className={`pill ${s}`}>{s.replace("_", " ")}</span>;
@@ -352,19 +391,10 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const [logLines, setLogLines] = useState<string[]>([]);
   const [err, setErr] = useState("");
 
-  useEffect(() => {
-    const pull = () => api.dashboard().then(x => { setD(x); setErr(""); })
-      .catch(e => setErr(e.message || "dashboard unavailable"));
-    pull(); const t = setInterval(pull, 6000); return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const pull = () => api.downloads().then(x => setDls(x.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const pull = () => api.logs().then(x => setLogLines(x.lines.slice(-14))).catch(() => {});
-    pull(); const t = setInterval(pull, 10000); return () => clearInterval(t);
-  }, []);
+  usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
+    .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
+  usePoll(() => api.downloads().then(x => setDls(x.items || {})).catch(() => {}), 4000);
+  usePoll(() => api.logs().then(x => setLogLines(x.lines.slice(-14))).catch(() => {}), 10000);
 
   if (!d) return <div className="panel muted">{err || "loading overview…"}</div>;
 
@@ -406,7 +436,8 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       <div className="dash-cols">
         <div className="panel">
           <div className="row" style={{ marginBottom: 8 }}><b>Active now</b>
-            <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span></div>
+            <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span>
+            <div className="spacer" /><LiveDot /></div>
           {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
           {d.active.map(a => (
             <div className="dashrow" key={a.key}>
@@ -436,8 +467,12 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                   <div className="dashrow-title">{a.title}</div>
                   {a.error && <div className="sub bad" title={a.error}>{a.error}</div>}
                   {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                  {a.ai_verdict && <div className="sub" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
                 </div>
-                <Pill s={a.status} />
+                <div className="col-end">
+                  <Pill s={a.status} />
+                  <AiPill s={a.ai_status} />
+                </div>
               </div>
             ))}
           </div>
@@ -490,12 +525,9 @@ function Films() {
     setStatus(await api.status());
     setMovies(await api.movies(filter || undefined));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
+  usePoll(refresh, 8000, [filter]);
   // poll live download progress more often than the full list
-  useEffect(() => {
-    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
+  usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
   const setViewP = (v: "grid" | "list") => { setView(v); localStorage.setItem("vo_view", v); };
 
   const shown = useMemo(() => {
@@ -630,11 +662,8 @@ function Series({ anime }: { anime: boolean }) {
   async function refresh() {
     setEps(await api.tvEpisodes(filter || undefined));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
-  useEffect(() => {
-    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
+  usePoll(refresh, 8000, [filter]);
+  usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
@@ -650,10 +679,12 @@ function Series({ anime }: { anime: boolean }) {
           <tr key={e.id}>
             <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
             <td style={{ minWidth: 140 }}><Pill s={e.status} />
+              {e.ai_status && <AiPill s={e.ai_status} />}
               {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
               {e.status === "merging" && e.progress &&
               <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
-              {e.error && <div className="sub bad">{e.error}</div>}</td>
+              {e.error && <div className="sub bad">{e.error}</div>}
+              {e.ai_verdict && <div className="sub" title={e.ai_verdict}>🤖 {e.ai_verdict}</div>}</td>
             <td>{e.candidate_title
               ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
               : <span className="muted">—</span>}</td>
@@ -763,60 +794,111 @@ function Series({ anime }: { anime: boolean }) {
 }
 
 // ---------------- Review (needs attention) ----------------
+// The single place a human resolves problems: movies in review/sync_fail/error AND TV episodes
+// in sync_fail/error, each showing what the on-call AI made of it. Items the AI couldn't fix
+// (failed / needs_human) float to the top — that highlighted band is the manual-review queue.
+const aiUnfixed = (s?: string | null) => s === "failed" || s === "needs_human";
+
 function Review() {
   const [movies, setMovies] = useState<Movie[]>([]);
+  const [eps, setEps] = useState<Episode[]>([]);
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
-  const [ai, setAi] = useState<Record<number, string>>({});
-
-  async function sendToAI(m: Movie) {
-    setAi(s => ({ ...s, [m.tmdb_id]: "…" }));
-    try {
-      const r = await api.aiSend(m.tmdb_id);
-      setAi(s => ({ ...s, [m.tmdb_id]: r.queued ? "queued ✓" : "failed" }));
-    } catch { setAi(s => ({ ...s, [m.tmdb_id]: "failed" })); }
-  }
+  const [relEp, setRelEp] = useState<Episode | null>(null);
+  const [ai, setAi] = useState<Record<string, string>>({});
 
   async function refresh() {
-    const [r, s] = await Promise.all([api.movies("review"), api.movies("sync_fail")]);
-    setMovies([...r, ...s]);
+    const [rv, sf, er, allEps] = await Promise.all([
+      api.movies("review"), api.movies("sync_fail"), api.movies("error"), api.tvEpisodes(),
+    ]);
+    setMovies([...rv, ...sf, ...er]);
+    setEps(allEps.filter(e =>
+      ["error", "sync_fail"].includes(e.status) || aiUnfixed(e.ai_status)));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, []);
+  usePoll(refresh, 8000);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  async function sendAI(k: string, call: () => Promise<{ queued: boolean }>) {
+    setAi(s => ({ ...s, [k]: "…" }));
+    try { const r = await call(); setAi(s => ({ ...s, [k]: r.queued ? "queued ✓" : "failed" })); }
+    catch { setAi(s => ({ ...s, [k]: "failed" })); }
+    refresh();
+  }
+
+  type Row = { kind: "movie"; m: Movie } | { kind: "episode"; e: Episode };
+  const rows: Row[] = [
+    ...movies.map(m => ({ kind: "movie" as const, m })),
+    ...eps.map(e => ({ kind: "episode" as const, e })),
+  ];
+  const aiOf = (r: Row) => r.kind === "movie" ? r.m.ai_status : r.e.ai_status;
+  rows.sort((a, b) => (aiUnfixed(aiOf(b)) ? 1 : 0) - (aiUnfixed(aiOf(a)) ? 1 : 0));
+  const needHuman = rows.filter(r => aiUnfixed(aiOf(r))).length;
+
+  const aiCell = (status?: string | null, verdict?: string | null, k?: string) =>
+    status ? <><AiPill s={status} />{verdict && <div className="sub" title={verdict}>{verdict}</div>}</>
+           : <span className="muted">not sent</span>;
 
   return (
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>
-        <b>Needs review</b><span className="muted">{movies.length} item{movies.length === 1 ? "" : "s"}</span>
+        <b>Needs review</b>
+        <span className="muted">{rows.length} item{rows.length === 1 ? "" : "s"}
+          {needHuman > 0 && <> · <span className="bad">{needHuman} the AI couldn’t fix</span></>}</span>
+        <div className="spacer" /><LiveDot />
       </div>
-      {movies.length === 0
+      {rows.length === 0
         ? <div className="muted">Nothing needs review 🎉</div>
         : <table>
-            <thead><tr><th>Title</th><th>Reason</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Title</th><th>Reason</th><th>AI review</th><th>Actions</th></tr></thead>
             <tbody>
-              {movies.map(m => (
-                <tr key={m.tmdb_id}>
-                  <td><div className="titlecell">
-                    <Poster src={m.poster} alt={m.title} />
-                    <div>{m.title}<div className="sub">{m.original_title} ({m.year})</div>
-                      <Pill s={m.status} /></div>
-                  </div></td>
-                  <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
-                    {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}</td>
-                  <td><div className="row">
-                    <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
-                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
-                    <button className="btn sec" disabled={busy || ai[m.tmdb_id] === "…" || ai[m.tmdb_id] === "queued ✓"}
-                      title="File a ticket for the on-call AI agent — it will inspect this item and resync, pick another release, or report back"
-                      onClick={() => sendToAI(m)}>
-                      🤖 {ai[m.tmdb_id] ?? "Send to AI"}</button>
-                  </div></td>
-                </tr>
-              ))}
+              {rows.map(r => {
+                if (r.kind === "movie") {
+                  const m = r.m, k = `m${m.tmdb_id}`;
+                  return (
+                    <tr key={k} className={aiUnfixed(m.ai_status) ? "needshuman" : ""}>
+                      <td><div className="titlecell">
+                        <Poster src={m.poster} alt={m.title} />
+                        <div>{m.title}<div className="sub">{m.original_title} ({m.year})</div>
+                          <Pill s={m.status} /></div>
+                      </div></td>
+                      <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
+                        {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}</td>
+                      <td>{aiCell(m.ai_status, m.ai_verdict)}</td>
+                      <td><div className="row">
+                        <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
+                        <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
+                        <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
+                        <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
+                        <button className="btn sec" disabled={busy || ai[k] === "…" || ai[k] === "queued ✓"}
+                          title="File a ticket for the on-call AI agent — it inspects this item and resyncs, picks another release, or reports back"
+                          onClick={() => sendAI(k, () => api.aiSend(m.tmdb_id))}>🤖 {ai[k] ?? "Send to AI"}</button>
+                      </div></td>
+                    </tr>
+                  );
+                }
+                const e = r.e, k = `e${e.id}`;
+                return (
+                  <tr key={k} className={aiUnfixed(e.ai_status) ? "needshuman" : ""}>
+                    <td><div className="titlecell">
+                      <Poster src={e.poster} alt={e.series_title} />
+                      <div>{e.series_title} <span className="muted">S{pad2(e.season)}E{pad2(e.episode)}</span>
+                        <div className="sub">episode</div><Pill s={e.status} /></div>
+                    </div></td>
+                    <td>{e.error ? <span className="bad">{e.error}</span> : <span className="muted">—</span>}
+                      {e.sync_delta != null && <div className="sub">Δ {e.sync_delta.toFixed(2)}s</div>}</td>
+                    <td>{aiCell(e.ai_status, e.ai_verdict)}</td>
+                    <td><div className="row">
+                      <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Search…</button>
+                      <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>
+                      <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>
+                      <button className="btn sec" disabled={busy || ai[k] === "…" || ai[k] === "queued ✓"}
+                        title="File a ticket for the on-call AI agent"
+                        onClick={() => sendAI(k, () => api.epAiSend(e.id))}>🤖 {ai[k] ?? "Send to AI"}</button>
+                    </div></td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>}
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
@@ -824,6 +906,10 @@ function Review() {
         load={() => api.candidates(release.tmdb_id)}
         onGrab={c => api.grab(release.tmdb_id, c.link, c.rid, c.title)}
         onClose={() => setRelease(null)} onGrabbed={refresh} />}
+      {relEp && <ReleaseModal title={`${relEp.series_title} S${pad2(relEp.season)}E${pad2(relEp.episode)}`}
+        load={() => api.episodeCandidates(relEp.id)}
+        onGrab={c => api.episodeGrab(relEp.id, c.link, c.rid, c.title)}
+        onClose={() => setRelEp(null)} onGrabbed={refresh} />}
     </div>
   );
 }
@@ -944,7 +1030,8 @@ function Logs() {
   const [lines, setLines] = useState<string[]>([]);
   const [auto, setAuto] = useState(true);
   async function refresh() { setLines((await api.logs()).lines); }
-  useEffect(() => { refresh(); if (!auto) return; const t = setInterval(refresh, 5000); return () => clearInterval(t); }, [auto]);
+  useEffect(() => { refresh(); /* always load once on mount */ /* eslint-disable-next-line */ }, []);
+  usePoll(() => { if (auto) refresh().catch(() => {}); }, 5000, [auto]);
   return (
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>

@@ -46,6 +46,20 @@ td .sub { color: var(--muted); font-size: 12px; }
 .pill.downloading, .pill.merging { background: #15324f; color: #6fb6ff; }
 .pill.no_release, .pill.ignored { background: #2a313b; color: #9aa6b4; }
 .pill.pending, .pill.searching, .pill.grabbed, .pill.ready { background: #3a3622; color: #e6d27a; }
+.pill.review { background: #3a2a4a; color: #c9a6ff; }
+/* AI-review status (secondary pill, orthogonal to pipeline status) */
+.pill.ai_pending { background: #16324a; color: #6fb6ff; }
+.pill.ai_resolved { background: #14432a; color: #5ee9a0; }
+.pill.ai_failed, .pill.ai_needs_human { background: #4a1d33; color: #ff9ecb; }
+/* live-refresh indicator */
+.livedot { color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.livedot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #5ee9a0; animation: livepulse 2s ease-in-out infinite; }
+@keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+/* review rows the AI couldn't fix — the human's queue, pulled visually forward */
+tr.needshuman > td { background: rgba(74, 29, 51, .35); }
+tr.needshuman > td:first-child { box-shadow: inset 3px 0 0 #ff5ea0; }
+/* stacked pills at a dashboard row's end */
+.col-end { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .form-grid { display: grid; grid-template-columns: 200px 1fr auto; gap: 10px 14px; align-items: center; }
 .form-grid label { color: var(--muted); }
 .form-grid input[type=text], .form-grid input[type=password], .form-grid input[type=number], .form-grid select {

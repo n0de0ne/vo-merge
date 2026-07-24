@@ -1,5 +1,5 @@
 """FastAPI app: REST API + serves the built React SPA."""
-import os, subprocess
+import os, subprocess, time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -232,9 +232,88 @@ def movie_to_ai(tmdb_id: int):
              "POST /movie/{id}/research — search again (keeps blocklist)",
              "POST /movie/{id}/ignore — give up on this title",
          ],
+         "report_back": (
+             f"When done, POST /movie/{tmdb_id}/ai_result with "
+             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
+             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue "
+             "(needs_human = a person must decide)."),
          "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md"},
         force=True)
+    if queued:
+        core.set_status(tmdb_id, mv["status"], ai_status="pending", ai_at=time.time())
     return {"ok": True, "queued": bool(queued)}
+
+
+@api.post("/episode/{ep_id}/ai")
+def episode_to_ai(ep_id: str):
+    """TV mirror of movie_to_ai: escalate one episode to the host AI dispatcher."""
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    record = {k: e.get(k) for k in
+              ("id", "series_title", "season", "episode", "status", "error", "sync_delta",
+               "sync_offset_ms", "candidate_title", "candidate_score", "candidate_seeders",
+               "attempts", "tried", "french_path", "en_file", "quality", "dl_hash")}
+    summary = f"operator escalated from Review: {e['series_title']} S{e['season']:02d}E{e['episode']:02d} — {e['status']}"
+    if e.get("error"):
+        summary += f": {e['error']}"
+    queued = core.ticket(
+        f"review-e{ep_id}", summary,
+        {"record": record,
+         "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+         "actions": [
+             "GET  /episode/{id}/candidates — list releases (incl. already-tried)",
+             "POST /episode/{id}/retry — blocklist current release, drop donor, re-search",
+             "POST /episode/{id}/ignore — give up on this episode",
+         ],
+         "report_back": (
+             f"When done, POST /episode/{ep_id}/ai_result with "
+             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
+             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue."),
+         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md"},
+        force=True)
+    if queued:
+        core.set_ep_status(ep_id, e["status"], ai_status="pending", ai_at=time.time())
+    return {"ok": True, "queued": bool(queued)}
+
+
+class AiResultIn(BaseModel):
+    status: str                       # resolved | failed | needs_human
+    verdict: str | None = None
+    action_taken: str | None = None
+
+
+_AI_STATUSES = ("resolved", "failed", "needs_human")
+
+
+@api.post("/movie/{tmdb_id}/ai_result")
+def movie_ai_result(tmdb_id: int, body: AiResultIn):
+    """The host AI dispatcher reports back on a record it was paged about. Stores the verdict
+    (leaving the pipeline status untouched) so 'failed'/'needs_human' surface in the Review tab
+    for a human, and 'resolved' shows the item was handled."""
+    if body.status not in _AI_STATUSES:
+        raise HTTPException(422, f"status must be one of {_AI_STATUSES}")
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    core.set_status(tmdb_id, mv["status"], ai_status=body.status,
+                    ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
+    core.log(f"ai_result movie {tmdb_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    return {"ok": True}
+
+
+@api.post("/episode/{ep_id}/ai_result")
+def episode_ai_result(ep_id: str, body: AiResultIn):
+    """TV mirror of movie_ai_result."""
+    if body.status not in _AI_STATUSES:
+        raise HTTPException(422, f"status must be one of {_AI_STATUSES}")
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    core.set_ep_status(ep_id, e["status"], ai_status=body.status,
+                       ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
+    core.log(f"ai_result episode {ep_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    return {"ok": True}
 
 
 @api.get("/downloads")
@@ -309,13 +388,15 @@ def dashboard():
 
         attention = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
                       "status": r["status"], "error": r["error"],
-                      "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"]}
+                      "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"],
+                      "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"]}
                      for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qn}) "
                                         "ORDER BY updated DESC LIMIT 8", ATTN)]
         attention += [{"kind": "episode", "key": f"e{r['id']}",
                        "title": f"{r['series_title']} S{r['season']:02d}E{r['episode']:02d}",
                        "status": r["status"], "error": r["error"],
-                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"]}
+                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"],
+                       "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"]}
                       for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
                                          "ORDER BY updated DESC LIMIT 8", ATTN)]
         attention = sorted(attention, key=lambda x: x["ts"] or 0, reverse=True)[:8]

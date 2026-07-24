@@ -5,6 +5,7 @@ export interface Movie {
   candidate_seeders: number | null; dl_hash: string | null; en_file: string | null;
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
   error: string | null; updated: number; poster?: string | null; progress?: string | null;
+  ai_status?: string | null; ai_verdict?: string | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
@@ -15,6 +16,7 @@ export interface Episode {
   candidate_seeders: number | null; quality: string | null; poster: string | null;
   sync_delta: number | null; error: string | null; progress?: string | null;
   dl_hash?: string | null; series_type?: string | null;
+  ai_status?: string | null; ai_verdict?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {
@@ -32,6 +34,7 @@ export interface DashActive {
 export interface DashAttention {
   kind: string; key: string; title: string; status: string; error?: string | null;
   sync_delta?: number | null; poster?: string | null; ts: number;
+  ai_status?: string | null; ai_verdict?: string | null;
 }
 export interface DashRecent {
   kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
@@ -74,6 +77,8 @@ export const api = {
   unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
+  epAiSend: (id: string) =>
+    j<{ ok: boolean; queued: boolean }>(`/api/episode/${encodeURIComponent(id)}/ai`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
   downloads: () => j<{ items: Record<string, DL>; error?: string }>("/api/downloads"),

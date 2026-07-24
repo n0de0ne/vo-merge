@@ -100,10 +100,17 @@ def scan(cfg=None):
 
 # ------------------------------------------------------------------ SEARCH + GRAB (hybrid)
 def _grab(link, savepath, cfg):
-    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
-    qb.login()
-    qb.create_category(cfg["qb_tv_category"], cfg["qb_tv_download_dir"])
-    return qb_grab(qb, link, cfg["qb_tv_category"], savepath)
+    """Fetch + add a torrent to qB, returning the confirmed infohash — or None on any failure
+    (network/login/fetch). Never raises: a single grab failure must not abort a whole search
+    cycle, and callers guard the None so a null hash is never assigned to an episode."""
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+        qb.login()
+        qb.create_category(cfg["qb_tv_category"], cfg["qb_tv_download_dir"])
+        return qb_grab(qb, link, cfg["qb_tv_category"], savepath)
+    except Exception as ex:
+        core.log(f"tv _grab failed ({savepath}): {ex}")
+        return None
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
@@ -220,6 +227,8 @@ def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
     advertises (e.g. an 'S01+02' pack also claims S02, so it isn't re-grabbed separately)."""
     cfg = cfg or core.load_config()
     h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_S{season:02d}", cfg)
+    if not h:
+        raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
     seasons = _pack_seasons(title, season)
     n = _assign_pack(series_id, seasons, h, rid, title)
     core.log(f"tv grab SEASON {series_id} (seasons {sorted(seasons) if seasons else 'ALL'}): {n} eps <- {title}")
@@ -316,6 +325,8 @@ def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
     if not e:
         return 0
     h = _grab(link, f"{cfg['qb_tv_download_dir']}/{ep_id.replace(':', '_')}", cfg)
+    if not h:
+        raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
     core.set_ep_status(ep_id, "downloading", dl_hash=h, dl_id=rid, candidate_title=title, error=None)
     # if the picked release is a multi-season pack, claim those seasons' gap episodes too
     seasons = _pack_seasons(title, e["season"])
@@ -352,6 +363,14 @@ def stage_search(cfg=None):
             if best:
                 sc, seed, rtitle, link = best
                 h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
+                if not h:
+                    # grab failed -> mark these eps error (NOT a null-hash download, which would
+                    # loop grab -> reconcile-to-pending -> re-grab forever)
+                    for e in eps:
+                        core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+                    core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
+                    n += 1
+                    continue
                 seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
                 claimed = _assign_pack(sid, seasons, h, None, rtitle)
                 core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
@@ -370,6 +389,11 @@ def stage_search(cfg=None):
                 continue
             sc, seed, rtitle, link = best
             h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
+            if not h:
+                core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+                core.log(f"tv grab EP '{q}': grab failed -> error")
+                n += 1
+                continue
             core.set_ep_status(e["id"], "downloading", dl_hash=h,
                                candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
             core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
@@ -603,6 +627,12 @@ def stage_finish(cfg=None):
                 pack_hint = res
             merged_any = True
         if not merged_any:
+            if os.path.isdir(root) and not files:
+                # complete, dir present, but ZERO parseable video -> dead release: don't hold the
+                # slot forever; blocklist it for these episodes and re-search a better release.
+                core.log(f"tv finish: {t['name'][:50]} complete but no video files -> blocklisting, re-searching")
+                _drop_stalled_eps(eps, t, cfg)
+                continue
             core.log(f"tv finish: {t['name'][:50]} complete but no files mapped to episodes "
                      f"(parsed {sorted(files.keys())[:6]})")
         # a season pack feeds many episodes: only free the donor once EVERY episode it serves

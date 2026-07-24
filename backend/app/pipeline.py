@@ -384,10 +384,14 @@ def grab(tmdb_id, link, cfg=None):
 def _is_stalled(t, cfg):
     """A qB torrent is 'stalled' = incomplete, active a while, NOT currently downloading, and
     has no seed source (or qB flags it stalled/errored). Progress level doesn't matter: a
-    0-seed download that isn't moving will never finish, whether it's at 5% or 95%."""
+    0-seed download that isn't moving will never finish, whether it's at 5% or 95%.
+    An incomplete download that has been active past `dl_max_age_min` is ALSO dropped, even
+    if it's still trickling bytes — a release that can't finish in that long isn't worth the slot."""
     if (t.get("progress", 0) or 0) >= 1.0:
         return False
-    if (t.get("time_active", 0) or 0) < cfg.get("stall_timeout_min", 30) * 60:
+    if (t.get("time_active", 0) or 0) >= cfg.get("dl_max_age_min", 720) * 60:
+        return True                               # absolute cap: too old regardless of speed/seeds
+    if (t.get("time_active", 0) or 0) < cfg.get("stall_timeout_min", 5) * 60:
         return False                              # give it time to find peers first
     if (t.get("dlspeed", 0) or 0) > 0:
         return False                              # still pulling bytes -> not stalled
@@ -459,25 +463,29 @@ def ai_health_check(cfg=None):
             _WEDGE_SINCE["ts"] = time.time()
     else:
         _WEDGE_SINCE["ts"] = None
-    # (b) new error / review records — per-record seen-set so only NEW ones page,
-    # and a standing backlog never re-pages when one more record errors
+    # (b) new error / review / sync_fail records — per-record seen-set so only NEW ones page,
+    # and a standing backlog never re-pages when one more record errors. Each newly-paged record
+    # is stamped ai_status='pending' so the UI shows "AI working" until the agent reports back.
+    now = time.time()
     seen_path = os.path.join(core.CONFIG_DIR, "ai_seen_records.json")
     try:
         seen = set(json.load(open(seen_path)))
     except Exception:
         seen = set()
     news = []
-    for st in ("error", "review"):
+    for st in ("error", "review", "sync_fail"):
         for m in core.get_movies(st):
             rk = f"movie:{m['tmdb_id']}:{st}"
             if rk in seen: continue
             seen.add(rk)
+            core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
             news.append({"type": "movie", "status": st, "id": m["tmdb_id"],
                          "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
         for e in core.get_episodes(st):
             rk = f"episode:{e['id']}:{st}"
             if rk in seen: continue
             seen.add(rk)
+            core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
             news.append({"type": "episode", "status": st, "id": e["id"],
                          "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
                          "error": (e.get("error") or "")[:200]})
@@ -485,8 +493,41 @@ def ai_health_check(cfg=None):
         json.dump(sorted(seen), open(seen_path, "w"))
         key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
         core.ticket("errors-review",
-                    f"{len(news)} NEW record(s) in error/review",
-                    {"records": news[:60], "total_new": len(news)}, key=key)
+                    f"{len(news)} NEW record(s) in error/review/sync_fail",
+                    {"records": news[:60], "total_new": len(news),
+                     "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+                     "report_back": (
+                         "After handling each record, POST its outcome so it leaves the operator's "
+                         "manual-review queue: movies -> /movie/{id}/ai_result, episodes -> "
+                         "/episode/{id}/ai_result, body {\"status\":\"resolved|failed|needs_human\","
+                         "\"verdict\":\"one line\",\"action_taken\":\"what you did\"}. "
+                         "Use needs_human when a person must decide."),
+                     "actions": [
+                         "GET /movie/{id}/candidates | POST /movie/{id}/sync {\"offset_ms\":0} | "
+                         "/movie/{id}/another | /movie/{id}/research | /movie/{id}/ignore",
+                         "POST /episode/{id}/retry | /episode/{id}/ignore | GET /episode/{id}/candidates"]},
+                    key=key)
+
+    # staleness: a record we sent to the AI that never got a callback within ai_stale_min and is
+    # STILL in a problem state -> the dispatcher likely crashed/failed silently. Flag it for a human.
+    stale_cut = now - cfg.get("ai_stale_min", 60) * 60
+    verdict = f"AI did not respond within {cfg.get('ai_stale_min', 60)}m — needs manual review"
+    try:
+        with core.db() as c:
+            stale_m = [dict(r) for r in c.execute(
+                "SELECT tmdb_id, status FROM movies WHERE ai_status='pending' AND ai_at < ? "
+                "AND status IN ('error','review','sync_fail')", (stale_cut,))]
+            stale_e = [dict(r) for r in c.execute(
+                "SELECT id, status FROM episodes WHERE ai_status='pending' AND ai_at < ? "
+                "AND status IN ('error','sync_fail')", (stale_cut,))]
+        for m in stale_m:
+            core.set_status(m["tmdb_id"], m["status"], ai_status="needs_human", ai_verdict=verdict)
+        for e in stale_e:
+            core.set_ep_status(e["id"], e["status"], ai_status="needs_human", ai_verdict=verdict)
+        if stale_m or stale_e:
+            core.log(f"ai staleness: {len(stale_m) + len(stale_e)} record(s) had no AI callback -> needs_human")
+    except Exception as ex:
+        core.log(f"ai staleness check failed: {ex}")
 
 
 def no_seed_public(cfg=None):
@@ -923,6 +964,14 @@ def stage_search(cfg=None):
             break
 
 
+def _owns(paths, tmdb):
+    """Does the concatenated qB path string belong to this movie? Savepath is exactly
+    `{qb_download_dir}/{tmdb_id}`, so match a whole `/{tmdb}` segment — a bare substring test
+    would let `/1234` false-match tmdb 123 and mis-reconcile a genuinely-gone download."""
+    s = f"/{tmdb}"
+    return f"{s}/" in paths or paths.rstrip("/").endswith(s)
+
+
 def stage_finish(cfg=None):
     """Poll qB for completed audio-merge downloads, resolve the EN file, merge."""
     cfg = cfg or core.load_config()
@@ -939,12 +988,12 @@ def stage_finish(cfg=None):
     for mv in core.get_movies("downloading"):
         tmdb = str(mv["tmdb_id"])
         t = by_hash.get(mv.get("dl_hash"))
-        if not t:   # fall back: match by save/content path containing /<tmdb>
+        if not t:   # fall back: match by save/content path owning the /<tmdb> segment
             t = next((x for x in torrents
-                      if f"/{tmdb}" in (x.get("save_path", "") + x.get("content_path", ""))), None)
+                      if _owns(x.get("save_path", "") + x.get("content_path", ""), tmdb)), None)
         if not t:
             # torrent vanished from qB (removed/failed) -> re-queue so it searches again
-            if f"/{tmdb}" not in all_paths:
+            if not _owns(all_paths, tmdb):
                 core.set_status(mv["tmdb_id"], "pending", dl_hash=None, dl_id=None, en_file=None, error=None)
                 core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued")
             continue
@@ -956,9 +1005,17 @@ def stage_finish(cfg=None):
         # layout and the new .Téléchargements one), fall back to <downloads_mount>/<tmdb>.
         save = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
         local = save if (save and os.path.exists(save)) else os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
-        vid = _find_video(local) if os.path.isdir(local) else (local if os.path.exists(local) else None)
+        exists = os.path.exists(local)
+        vid = (_find_video(local) if os.path.isdir(local) else local) if exists else None
         if not vid:
-            core.log(f"stage_finish {mv['tmdb_id']}: download complete but no video found in {local}")
+            if not exists:
+                # download path not visible yet (mount race / path lag) — leave it, retry next cycle
+                core.log(f"stage_finish {mv['tmdb_id']}: complete but path {local} not visible yet -> waiting")
+                continue
+            # complete but genuinely no usable video (wrong layout / archive-only) -> don't sit here
+            # forever holding a slot: blocklist this release and grab another (sync_fail after retries).
+            core.log(f"stage_finish {mv['tmdb_id']}: complete but no video in {local} -> blocklisting, re-searching")
+            reject_and_retry(mv["tmdb_id"], "download complete but no video file", cfg)
             continue
         core.set_status(mv["tmdb_id"], "ready", en_file=vid)
         merge_movie(mv["tmdb_id"], cfg)
