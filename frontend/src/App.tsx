@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL } from "./api";
+import { api, Movie, Status, Episode, Candidate, DL, Dash } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -320,8 +320,162 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
   );
 }
 
-// ---------------- Dashboard ----------------
-function Dashboard() {
+// ---------------- Overview (landing dashboard) ----------------
+const fmtAgo = (ts: number, now: number) => {
+  const d = Math.max(0, now - ts);
+  if (d < 90) return "just now";
+  if (d < 5400) return Math.round(d / 60) + " min ago";
+  if (d < 129600) return Math.round(d / 3600) + " h ago";
+  return Math.round(d / 86400) + " d ago";
+};
+const fmtIn = (ts: number, now: number) => {
+  const d = ts - now;
+  if (d <= 45) return "now";
+  if (d < 5400) return "in " + Math.round(d / 60) + " min";
+  return "in " + Math.round(d / 3600) + " h";
+};
+
+function Tile({ label, value, sub, tone, onClick }:
+  { label: string; value: ReactNode; sub?: ReactNode; tone?: "good" | "warn" | "bad"; onClick?: () => void }) {
+  return (
+    <div className={"tile" + (tone ? " " + tone : "") + (onClick ? " click" : "")} onClick={onClick}>
+      <div className="t-label">{label}</div>
+      <div className="t-num">{value}</div>
+      {sub && <div className="t-sub">{sub}</div>}
+    </div>
+  );
+}
+
+function Overview({ goto }: { goto: (tab: string) => void }) {
+  const [d, setD] = useState<Dash | null>(null);
+  const [dls, setDls] = useState<Record<string, DL>>({});
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    const pull = () => api.dashboard().then(x => { setD(x); setErr(""); })
+      .catch(e => setErr(e.message || "dashboard unavailable"));
+    pull(); const t = setInterval(pull, 6000); return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    const pull = () => api.downloads().then(x => setDls(x.items || {})).catch(() => {});
+    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    const pull = () => api.logs().then(x => setLogLines(x.lines.slice(-14))).catch(() => {});
+    pull(); const t = setInterval(pull, 10000); return () => clearInterval(t);
+  }, []);
+
+  if (!d) return <div className="panel muted">{err || "loading overview…"}</div>;
+
+  const n = (c: Record<string, number>, ...ss: string[]) => ss.reduce((a, s) => a + (c[s] || 0), 0);
+  const both = (...ss: string[]) => n(d.movies, ...ss) + n(d.episodes, ...ss);
+  const merged = both("merged");
+  const attention = both("review", "sync_fail", "error");
+  const backlog = both("pending", "searching", "no_release");
+  const downloading = d.active.filter(a => a.status === "downloading");
+  const merging = d.active.filter(a => a.status === "merging");
+  const totalSpeed = Object.values(dls).reduce((a, x) => a + (x.dlspeed || 0), 0);
+  const diskPct = d.disk ? Math.round((1 - d.disk.free / d.disk.total) * 100) : null;
+  const dlOf = (a: { dl_hash?: string | null }) => dls[(a.dl_hash || "").toLowerCase()];
+
+  return (
+    <>
+      {!d.enabled &&
+        <div className="panel warnbar">⏸ Pipeline is <b>disabled</b> — nothing will be searched, grabbed or merged.
+          <button className="btn sec" style={{ marginLeft: 10 }} onClick={() => goto("settings")}>Settings</button></div>}
+
+      <div className="tilegrid">
+        <Tile label="Merged" value={merged} tone="good"
+          sub={<>{d.merged_24h} in 24 h · {d.merged_7d} in 7 d</>} />
+        <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
+          sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
+          tone={d.inflight == null ? "warn" : undefined} />
+        <Tile label="Merging" value={merging.length}
+          sub={merging.length ? merging[0].title : "idle"} />
+        <Tile label="Attention" value={attention} tone={attention ? "bad" : undefined}
+          onClick={() => goto("review")}
+          sub={<>{both("review")} review · {both("sync_fail")} sync · {both("error")} error</>} />
+        <Tile label="Backlog" value={backlog}
+          sub={<>{both("pending")} pending · {both("no_release")} no release</>} />
+        {d.disk &&
+          <Tile label="Donor disk" value={fmtBytes(d.disk.free)} tone={diskPct! >= 90 ? "bad" : diskPct! >= 80 ? "warn" : undefined}
+            sub={<>free · {diskPct}% used</>} />}
+      </div>
+
+      <div className="dash-cols">
+        <div className="panel">
+          <div className="row" style={{ marginBottom: 8 }}><b>Active now</b>
+            <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span></div>
+          {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
+          {d.active.map(a => (
+            <div className="dashrow" key={a.key}>
+              <Poster src={a.poster} alt={a.title} />
+              <div className="dashrow-main">
+                <div className="dashrow-title">{a.title}
+                  {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
+                {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
+                {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
+                {a.status === "merging" && a.progress &&
+                  <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
+              </div>
+              <Pill s={a.status} />
+            </div>
+          ))}
+        </div>
+
+        <div>
+          <div className="panel">
+            <div className="row" style={{ marginBottom: 8 }}><b>Needs attention</b>
+              {attention > 0 && <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
+                onClick={() => goto("review")}>Open review →</button>}</div>
+            {d.attention.length === 0 && <div className="muted">All clear 🎉</div>}
+            {d.attention.map(a => (
+              <div className="dashrow" key={a.key}>
+                <div className="dashrow-main">
+                  <div className="dashrow-title">{a.title}</div>
+                  {a.error && <div className="sub bad" title={a.error}>{a.error}</div>}
+                  {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                </div>
+                <Pill s={a.status} />
+              </div>
+            ))}
+          </div>
+
+          <div className="panel">
+            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b></div>
+            {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
+            {d.recent.map((r, i) => (
+              <div className="dashrow" key={i}>
+                <div className="dashrow-main">
+                  <div className="dashrow-title">{r.title}
+                    {r.langs && <span className="lang-badge">{r.langs}</span>}</div>
+                </div>
+                <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 8 }}><b>Activity</b>
+          <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
+            onClick={() => goto("logs")}>Full log →</button></div>
+        <pre className="logs mini">{logLines.join("")}</pre>
+        <div className="chips" style={{ marginTop: 10 }}>
+          <span className="chip">grab <b>{d.grab_mode}</b></span>
+          {d.next_runs.search != null && <span className="chip">next search <b>{fmtIn(d.next_runs.search, d.now)}</b></span>}
+          {d.next_runs.finish != null && <span className="chip">next merge check <b>{fmtIn(d.next_runs.finish, d.now)}</b></span>}
+          {d.next_runs.stall != null && <span className="chip">next stall sweep <b>{fmtIn(d.next_runs.stall, d.now)}</b></span>}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ---------------- Films ----------------
+function Films() {
   const [status, setStatus] = useState<Status | null>(null);
   const [movies, setMovies] = useState<Movie[]>([]);
   const [filter, setFilter] = useState("");
@@ -791,8 +945,9 @@ function Logs() {
 
 // ---------------- App ----------------
 export default function App() {
-  const [tab, setTab] = useState("films");
+  const [tab, setTab] = useState("overview");
   const tabs: [string, string][] = [
+    ["overview", "Overview"],
     ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"], ["review", "Review"],
     ["settings", "Settings"], ["logs", "Logs"]];
   return (
@@ -805,7 +960,8 @@ export default function App() {
         {tabs.map(([k, label]) =>
           <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{label}</button>)}
       </nav>
-      {tab === "films" && <Dashboard />}
+      {tab === "overview" && <Overview goto={setTab} />}
+      {tab === "films" && <Films />}
       {tab === "anime" && <Series anime key="anime" />}
       {tab === "series" && <Series anime={false} key="series" />}
       {tab === "review" && <Review />}

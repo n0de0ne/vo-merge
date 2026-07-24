@@ -25,6 +25,26 @@ export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
   multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean; info_url?: string | null;
 }
+export interface DashActive {
+  kind: string; key: string; title: string; sub?: string | null; status: string;
+  progress?: string | null; dl_hash?: string | null; poster?: string | null; count: number;
+}
+export interface DashAttention {
+  kind: string; key: string; title: string; status: string; error?: string | null;
+  sync_delta?: number | null; poster?: string | null; ts: number;
+}
+export interface DashRecent {
+  kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
+}
+export interface Dash {
+  enabled: boolean; grab_mode: string; scope_series: boolean;
+  movies: Record<string, number>; episodes: Record<string, number>;
+  active: DashActive[]; attention: DashAttention[]; recent: DashRecent[];
+  merged_24h: number; merged_7d: number;
+  inflight: number | null; inflight_cap: number;
+  disk: { path: string; total: number; free: number } | null;
+  next_runs: Record<string, number>; now: number;
+}
 
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
   const r = await fetch(url, {
@@ -36,6 +56,7 @@ async function j<T>(url: string, opts?: RequestInit): Promise<T> {
 
 export const api = {
   status: () => j<Status>("/api/status"),
+  dashboard: () => j<Dash>("/api/dashboard"),
   movies: (status?: string) =>
     j<Movie[]>("/api/movies" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   settings: () => j<Record<string, any>>("/api/settings"),

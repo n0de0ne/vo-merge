@@ -235,6 +235,109 @@ def logs():
     return {"lines": core.tail_log()}
 
 
+@api.get("/dashboard")
+def dashboard():
+    """Everything the Overview tab needs in one call. Blocks degrade independently
+    (qB unreachable -> inflight=None, disk stat failure -> disk=None) — never a 500."""
+    import shutil, time
+    cfg = core.load_config()
+    now = time.time()
+    ACTIVE = ("grabbed", "downloading", "ready", "merging")
+    ATTN = ("review", "sync_fail", "error")
+    order = {s: i for i, s in enumerate(("merging", "downloading", "ready", "grabbed"))}
+    qa, qn = ",".join("?" * len(ACTIVE)), ",".join("?" * len(ATTN))
+    with core.db() as c:
+        mcounts = {r["status"]: r["n"] for r in c.execute(
+            "SELECT status, COUNT(*) n FROM movies GROUP BY status")}
+        ecounts = {r["status"]: r["n"] for r in c.execute(
+            "SELECT status, COUNT(*) n FROM episodes GROUP BY status")}
+
+        active = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
+                   "sub": r["candidate_title"], "status": r["status"], "progress": r["progress"],
+                   "dl_hash": r["dl_hash"], "poster": r["poster"], "count": 1}
+                  for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qa})", ACTIVE)]
+        # episodes: fold season-pack siblings (same torrent + status) into one row
+        packs = {}
+        for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qa}) "
+                           "ORDER BY series_title, season, episode", ACTIVE):
+            e = dict(r)
+            k = (e["series_title"], e["season"], e["status"], e["dl_hash"] or e["id"])
+            g = packs.setdefault(k, {"e": e, "eps": [], "progress": None})
+            g["eps"].append(e["episode"])
+            g["progress"] = g["progress"] or e.get("progress")
+        for g in packs.values():
+            e, eps = g["e"], sorted(g["eps"])
+            rng = f"E{eps[0]:02d}" + (f"–E{eps[-1]:02d}" if len(eps) > 1 else "")
+            active.append({"kind": "episode", "key": f"e{e['id']}",
+                           "title": f"{e['series_title']} S{e['season']:02d} {rng}",
+                           "sub": e["candidate_title"], "status": e["status"],
+                           "progress": g["progress"], "dl_hash": e["dl_hash"],
+                           "poster": e["poster"], "count": len(eps)})
+        active.sort(key=lambda x: (order.get(x["status"], 9), x["title"]))
+
+        attention = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
+                      "status": r["status"], "error": r["error"],
+                      "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"]}
+                     for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qn}) "
+                                        "ORDER BY updated DESC LIMIT 8", ATTN)]
+        attention += [{"kind": "episode", "key": f"e{r['id']}",
+                       "title": f"{r['series_title']} S{r['season']:02d}E{r['episode']:02d}",
+                       "status": r["status"], "error": r["error"],
+                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"]}
+                      for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
+                                         "ORDER BY updated DESC LIMIT 8", ATTN)]
+        attention = sorted(attention, key=lambda x: x["ts"] or 0, reverse=True)[:8]
+
+        recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],
+                   "poster": r["poster"], "ts": r["merged_at"] or r["updated"]}
+                  for r in c.execute("SELECT * FROM movies WHERE status='merged' "
+                                     "ORDER BY COALESCE(merged_at, updated) DESC LIMIT 10")]
+        recent += [{"kind": "episode",
+                    "title": f"{r['series_title']} S{r['season']:02d}E{r['episode']:02d}",
+                    "langs": r["added_langs"], "poster": r["poster"],
+                    "ts": r["merged_at"] or r["updated"]}
+                   for r in c.execute("SELECT * FROM episodes WHERE status='merged' "
+                                      "ORDER BY COALESCE(merged_at, updated) DESC LIMIT 10")]
+        recent = sorted(recent, key=lambda x: x["ts"] or 0, reverse=True)[:10]
+
+        def merged_since(secs):
+            return sum(c.execute(f"SELECT COUNT(*) n FROM {t} WHERE status='merged' "
+                                 "AND COALESCE(merged_at, updated) >= ?",
+                                 (now - secs,)).fetchone()["n"] for t in ("movies", "episodes"))
+        merged_24h, merged_7d = merged_since(86400), merged_since(7 * 86400)
+
+    try:
+        inflight = pipeline.inflight_downloads(cfg)
+    except Exception:
+        inflight = None                       # qB unreachable — tile shows "?"
+
+    disk = None
+    try:
+        p = cfg.get("downloads_mount") or cfg.get("media_mount") or "/media"
+        while p and p != "/" and not os.path.isdir(p):
+            p = os.path.dirname(p)            # dir may not exist until the first grab
+        u = shutil.disk_usage(p)
+        disk = {"path": p, "total": u.total, "free": u.free}
+    except Exception:
+        pass
+
+    next_runs = {}
+    try:
+        for job in scheduler._sched.get_jobs():
+            if job.next_run_time:
+                next_runs[job.id] = job.next_run_time.timestamp()
+    except Exception:
+        pass
+
+    return {"enabled": cfg["enabled"], "grab_mode": cfg["grab_mode"],
+            "scope_series": bool(cfg.get("scope_series")),
+            "movies": mcounts, "episodes": ecounts,
+            "active": active, "attention": attention, "recent": recent,
+            "merged_24h": merged_24h, "merged_7d": merged_7d,
+            "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
+            "disk": disk, "next_runs": next_runs, "now": now}
+
+
 # ----- live sync editor -----
 def _audio_index(path, lang):
     from .offdet import audio_langs
