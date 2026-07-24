@@ -205,6 +205,38 @@ def another(tmdb_id: int):
     return core.get_movie(tmdb_id)
 
 
+@api.post("/movie/{tmdb_id}/ai")
+def movie_to_ai(tmdb_id: int):
+    """Operator pressed 'Send to AI' on a Review item: file a ticket for the host's
+    AI dispatcher with the full record + how to act on it, so the on-call agent can
+    manage the item end-to-end (resync, pick another release, or report back)."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    record = {k: mv.get(k) for k in
+              ("tmdb_id", "title", "original_title", "year", "original_lang", "status",
+               "error", "sync_delta", "sync_offset_ms", "candidate_title",
+               "candidate_score", "candidate_seeders", "attempts", "tried",
+               "french_path", "en_file", "merged_file", "quality", "dl_hash")}
+    summary = f"operator escalated from Review: {mv['title']} ({mv['year']}) — {mv['status']}"
+    if mv.get("error"):
+        summary += f": {mv['error']}"
+    queued = core.ticket(
+        f"review-m{tmdb_id}", summary,
+        {"record": record,
+         "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+         "actions": [
+             "GET  /movie/{id}/candidates — list releases (incl. already-tried)",
+             "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
+             "POST /movie/{id}/another — blocklist current release, grab next best",
+             "POST /movie/{id}/research — search again (keeps blocklist)",
+             "POST /movie/{id}/ignore — give up on this title",
+         ],
+         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md"},
+        force=True)
+    return {"ok": True, "queued": bool(queued)}
+
+
 @api.get("/downloads")
 def downloads():
     """Live qB progress for everything in the audio-merge categories, keyed by infohash.

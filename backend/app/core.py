@@ -108,12 +108,14 @@ def log(msg: str):
     print(line, flush=True)
 
 
-def ticket(kind, summary, context=None, key=None):
+def ticket(kind, summary, context=None, key=None, force=False):
     """File an issue ticket for the host's AI dispatcher (an Unraid user script cron
     that runs the Claude Code CLI on each ticket). Tickets land in /config/ai-tickets/
     which the host reads as appdata/vo-merge/ai-tickets/. A (kind,key) pair is filed
     only once (persisted in ai_tickets_filed.json) so a standing condition doesn't
-    re-page after being handled."""
+    re-page after being handled. force=True (operator-initiated, e.g. the Review tab's
+    Send-to-AI button) skips the once-only guard and overwrites a pending same-kind
+    ticket. Returns True if a ticket was filed."""
     try:
         seen_path = os.path.join(CONFIG_DIR, "ai_tickets_filed.json")
         try:
@@ -121,13 +123,13 @@ def ticket(kind, summary, context=None, key=None):
         except Exception:
             seen = set()
         k = f"{kind}:{key or ''}"
-        if k in seen:
-            return
+        if k in seen and not force:
+            return False
         d = os.path.join(CONFIG_DIR, "ai-tickets")
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, f"{kind}.json")
-        if os.path.exists(path):
-            return                            # same kind already awaiting dispatch
+        if os.path.exists(path) and not force:
+            return False                      # same kind already awaiting dispatch
         with open(path, "w") as f:
             json.dump({"app": "vo-merge", "kind": kind, "summary": summary,
                        "context": context or {},
@@ -136,8 +138,10 @@ def ticket(kind, summary, context=None, key=None):
         seen.add(k)
         json.dump(sorted(seen)[-3000:], open(seen_path, "w"))
         log(f"AI-TICKET {kind}: {summary[:70]}")
+        return True
     except Exception as e:
         log(f"ticket() failed: {e}")
+        return False
 
 
 def tail_log(n=300):

@@ -73,6 +73,7 @@ export const api = {
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
   unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
+  aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),
   logs: () => j<{ lines: string[] }>("/api/logs"),
   downloads: () => j<{ items: Record<string, DL>; error?: string }>("/api/downloads"),

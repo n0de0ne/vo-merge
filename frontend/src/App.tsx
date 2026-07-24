@@ -768,6 +768,15 @@ function Review() {
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
+  const [ai, setAi] = useState<Record<number, string>>({});
+
+  async function sendToAI(m: Movie) {
+    setAi(s => ({ ...s, [m.tmdb_id]: "…" }));
+    try {
+      const r = await api.aiSend(m.tmdb_id);
+      setAi(s => ({ ...s, [m.tmdb_id]: r.queued ? "queued ✓" : "failed" }));
+    } catch { setAi(s => ({ ...s, [m.tmdb_id]: "failed" })); }
+  }
 
   async function refresh() {
     const [r, s] = await Promise.all([api.movies("review"), api.movies("sync_fail")]);
@@ -801,6 +810,10 @@ function Review() {
                     <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
                     <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
+                    <button className="btn sec" disabled={busy || ai[m.tmdb_id] === "…" || ai[m.tmdb_id] === "queued ✓"}
+                      title="File a ticket for the on-call AI agent — it will inspect this item and resync, pick another release, or report back"
+                      onClick={() => sendToAI(m)}>
+                      🤖 {ai[m.tmdb_id] ?? "Send to AI"}</button>
                   </div></td>
                 </tr>
               ))}
