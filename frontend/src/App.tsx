@@ -734,7 +734,9 @@ function Series({ anime }: { anime: boolean }) {
       <table><tbody>
         {seps.map(e => (
           <tr key={e.id}>
-            <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
+            <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}
+              {e.aired && <div className="sub" title="the numbering releases use for this episode">
+                aired {e.aired}</div>}</td>
             <td style={{ minWidth: 140 }}><Pill s={e.status} />
               {e.ai_status && <AiPill s={e.ai_status} />}
               {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
@@ -946,7 +948,8 @@ function Review() {
                     <td><div className="titlecell">
                       <Poster src={e.poster} alt={e.series_title} />
                       <div>{e.series_title} <span className="muted">S{pad2(e.season)}E{pad2(e.episode)}</span>
-                        <div className="sub">episode</div><Pill s={e.status} /></div>
+                        <div className="sub">{e.aired ? `episode · released as ${e.aired}` : "episode"}</div>
+                        <Pill s={e.status} /></div>
                     </div></td>
                     <td>{e.error ? <span className="bad">{e.error}</span> : <span className="muted">—</span>}
                       {e.sync_delta != null && <div className="sub">Δ {e.sync_delta.toFixed(2)}s</div>}

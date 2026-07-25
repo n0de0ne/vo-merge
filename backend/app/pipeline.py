@@ -570,7 +570,11 @@ def ai_health_check(cfg=None):
                          "of both files (fps/duration/audio tracks), the log lines for it, and for "
                          "episodes every donor file with the (season,episode) the parser read plus "
                          "the series' episode list. Read this before acting; it usually IS the "
-                         "diagnosis and saves shelling into the container."),
+                         "diagnosis and saves shelling into the container. The episode context also "
+                         "carries a `numbering` block (library S/E vs the release's S/E and absolute "
+                         "number): vo-merge now translates aired<->absolute itself from Sonarr, so "
+                         "`translated: true` means the search and the donor mapping already use the "
+                         "aired numbering and a plain /retry is the right move."),
                      "actions": [
                          "GET  /movie|episode/{id}/candidates — scored releases (incl. already-tried)",
                          "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
@@ -579,8 +583,11 @@ def ai_health_check(cfg=None):
                          "donor->base ratio = donor_fps/base_fps (25/23.976=1.0427083 film->PAL, "
                          "23.976/25=0.9590410 PAL->film). Use when fps are known but detection failed.",
                          "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map ONE donor file "
-                         "to this episode and queue the merge. THE fix for absolute-vs-aired-season "
-                         "numbering packs: read /context, work out the mapping, call this per episode.",
+                         "to this episode and queue the merge. Aired-vs-absolute numbering is now "
+                         "handled automatically (Sonarr's absoluteEpisodeNumber), so reach for this "
+                         "only when the automatic mapping can't apply — Sonarr has no absolute "
+                         "numbers for the series, or the pack numbers its files some third way. "
+                         "Read /context, work out the mapping, call this per episode.",
                          "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query, returns "
                          "links. For titles the built-in query never matches, try the original / "
                          "romaji / English / alternate-transliteration name, or drop the year. Then "

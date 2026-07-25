@@ -5,7 +5,7 @@ audio onto each French episode (best video kept), in place.
 
 Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scope_series.
 """
-import os, re, subprocess, shutil
+import os, re, subprocess, shutil, time
 from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
@@ -54,6 +54,91 @@ def _media(path, cfg):          # Sonarr /data path -> our /media mount
 
 def _toks(s):
     return set(re.findall(r'[a-z0-9]+', (s or '').lower()))
+
+
+# ------------------------------------------------- NUMBERING (aired <-> absolute)
+# Anime libraries are routinely filed with ABSOLUTE numbering flattened into S01 (E01…E51…)
+# while releases use AIRED seasons (absolute 51 == S04E15). Neither side is wrong — they are
+# two numbering schemes for the same episode — but with no translation table a donor file can
+# never map to the library record, and the search composes a query (`… S01E51`) that no
+# indexer can ever match, so it falls back to the S01 pack and re-grabs it forever.
+# Sonarr already knows both numbers for every episode (`absoluteEpisodeNumber`), so we read
+# the table from there and translate wherever a (season, episode) pair from one side meets a
+# pair from the other: donor->library mapping, search queries, and pack claiming.
+#
+# The S01 direction is unambiguous by construction: within aired season 1 the absolute number
+# IS the episode number (season 1 starts at absolute 1), so translating an S01 key is the
+# identity right up to the point where the library's flattened numbering runs past season 1 —
+# exactly where the mismatch begins. Anything else is only consulted after a direct match has
+# already failed, so a correct mapping can never be displaced by a translated one.
+_NUM_CACHE = {}                  # series_id -> (expires_at, aired2abs, abs2aired)
+_NUM_TTL = 3600.0
+
+
+def _numbering(series_id, cfg=None):
+    """(aired2abs, abs2aired) for a series, from Sonarr. Two empty dicts when the series has no
+    absolute numbering (plain TV) or Sonarr is unreachable — callers then just match directly."""
+    hit = _NUM_CACHE.get(series_id)
+    if hit and hit[0] > time.time():
+        return hit[1], hit[2]
+    aired2abs, abs2aired = {}, {}
+    try:
+        cfg = cfg or core.load_config()
+        son = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        for e in son.episodes(series_id) or []:
+            a, s, n = e.get("absoluteEpisodeNumber"), e.get("seasonNumber"), e.get("episodeNumber")
+            if a is None or s is None or n is None or int(s) == 0:
+                continue                        # specials carry no usable absolute number
+            aired2abs[(int(s), int(n))] = int(a)
+            abs2aired.setdefault(int(a), (int(s), int(n)))
+    except Exception as ex:
+        core.log(f"tv numbering {series_id}: {ex}")
+        return {}, {}                           # transient failure -> don't cache it
+    _NUM_CACHE[series_id] = (time.time() + _NUM_TTL, aired2abs, abs2aired)
+    return aired2abs, abs2aired
+
+
+def _release_se(ep, cfg=None):
+    """The (season, episode) a RELEASE would use for this library episode. Identity for plain TV
+    and for anime already filed by aired season; the aired pair for an absolute-as-S01 record
+    (library E51 -> S04E15). Only S01 records are translated — see the note above."""
+    s, n = int(ep["season"]), int(ep["episode"])
+    if s != 1:
+        return s, n
+    _, abs2aired = _numbering(ep["series_id"], cfg)
+    return abs2aired.get(n, (s, n))
+
+
+def _abs_num(ep, cfg=None):
+    """This library episode's absolute number, whichever scheme it happens to be filed under
+    (aired S04E15 and absolute-as-S01 E51 are both absolute 51). None for plain TV."""
+    aired2abs, abs2aired = _numbering(ep["series_id"], cfg)
+    if not aired2abs:
+        return None
+    s, n = int(ep["season"]), int(ep["episode"])
+    a = aired2abs.get((s, n))
+    if a is not None:
+        return a
+    return n if (s == 1 and n in abs2aired) else None    # already filed absolutely
+
+
+def _alt_keys(series_id, s, e, cfg=None):
+    """Library keys a donor file's parsed (season, episode) could ALSO mean under the other
+    numbering scheme, likeliest first. Aired (4,15) is absolute 51, which an absolute-as-S01
+    library files as (1,51); a donor numbered absolutely, (1,51), means aired (4,15).
+    Empty for a series Sonarr gives no absolute numbers for."""
+    aired2abs, abs2aired = _numbering(series_id, cfg)
+    if not aired2abs:
+        return []
+    out = []
+    a = aired2abs.get((s, e))
+    if a is not None and (1, a) != (s, e):
+        out.append((1, a))                      # aired release -> absolute-as-S01 library
+    if s == 1:
+        alt = abs2aired.get(e)
+        if alt and alt != (s, e):
+            out.append(alt)                     # absolute-numbered release -> aired library
+    return out
 
 
 # ------------------------------------------------------------------ SCAN
@@ -114,8 +199,22 @@ def _grab(link, savepath, cfg):
         return None
 
 
-def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
-    """Return best (score, seeders, title, link) for an English release, or None."""
+SEASON_TOK = re.compile(r'(?:(?<![a-z0-9])s|season\s*|saison\s*)0*\d{1,2}(?!\d)', re.I)
+
+
+def _abs_match(title, absn):
+    """True if `title` is an absolute-numbered anime single for this episode ('Show - 51
+    [1080p]', 'Show ep51'). Titles carrying ANY season token are excluded: 'Show S03 - 17'
+    is a season pack whose bare number means something else entirely."""
+    if not absn or SEASON_TOK.search(title or ""):
+        return False
+    return bool(re.search(rf'(?:\s-\s|\bep\.?\s*|\be)0*{int(absn)}\b', title, re.I))
+
+
+def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None):
+    """Return best (score, seeders, title, link) for an English release, or None.
+    `absn` = this episode's absolute number, so an anime release that numbers absolutely
+    ('Title - 51') still matches a search for its aired S04E15."""
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
         results = pro.search(query, cfg["en_indexer_ids"])
@@ -137,7 +236,10 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None):
                 continue
         else:
             m = SXXEXX.search(t)
-            if not (m and int(m.group(1)) == season and int(m.group(2)) == ep):
+            if m:
+                if not (int(m.group(1)) == season and int(m.group(2)) == ep):
+                    continue
+            elif not _abs_match(t, absn):
                 continue
         sc = min(int(r.get("seeders") or 0), 100)
         if RES.search(t): sc += 20
@@ -157,16 +259,22 @@ def season_candidates(series_id, season, cfg=None):
     if not eps:
         return []
     title = eps[0]["series_title"]
+    # An absolute-as-S01 anime library files several AIRED seasons under one library season, so
+    # accept a pack for any season this group actually spans (and drop the Sxx from the query
+    # when it spans more than one — a bare title surfaces the per-season and complete packs).
+    rseasons = sorted({_release_se(e, cfg)[0] for e in eps}) or [season]
+    query = f"{title} S{rseasons[0]:02d}" if len(rseasons) == 1 else title
     import json as _json
     tried = set()
     for e in eps:
         tried |= set(_json.loads(e.get("tried") or "[]"))
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
-        results = pro.search(f"{title} S{season:02d}", cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+        results = pro.search(query, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
         core.log(f"season_candidates: {e}"); return []
     qt = _toks(title); out = []
+    seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
         if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
@@ -174,8 +282,8 @@ def season_candidates(series_id, season, cfg=None):
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
         m = SXXEXX.search(t)
-        is_pack = (not m) and bool(re.search(rf"(s0?{season}\b|season\s*0?{season}\b|complete|int[eé]grale)", tl))
-        is_ep = bool(m and int(m.group(1)) == season)
+        is_pack = (not m) and bool(re.search(rf"({seas_re}|complete|int[eé]grale)", tl))
+        is_ep = bool(m and int(m.group(1)) in rseasons)
         if not (is_pack or is_ep):
             continue
         sc = min(int(r.get("seeders") or 0), 100)
@@ -195,7 +303,10 @@ def season_candidates(series_id, season, cfg=None):
 def _pack_seasons(title, default_season):
     """Seasons a release title advertises. None = ALL seasons (complete/intégrale). Only expands
     beyond {default_season} on a clear multi-season signal (range like S01-S03, or list like
-    S01+02) — otherwise a single season, to avoid over-claiming."""
+    S01+02) — otherwise a single season, to avoid over-claiming. A lone season token in the
+    title wins over `default_season`: an absolute-as-S01 library asks for "season 1" but the
+    pack the user picked may say S04, and claiming S01's episodes with it is the bug that
+    re-grabs the same pack forever."""
     t = title or ""
     if re.search(r'(?<![a-z])(complete|int[eé]grale|integrale)(?![a-z])', t, re.I):
         return None
@@ -208,15 +319,21 @@ def _pack_seasons(title, default_season):
     if lm:
         seasons.add(int(lm.group(1)))
         seasons.update(int(x) for x in re.findall(r'\d{1,2}', lm.group(2)))
+    if not seasons:
+        lone = {int(x) for x in re.findall(r'(?:(?<![a-z0-9])s|season\s*|saison\s*)0*(\d{1,2})(?!\d)', t, re.I)}
+        if len(lone) == 1:
+            return lone
     return seasons or {default_season}
 
 
-def _assign_pack(series_id, seasons, h, rid, title):
+def _assign_pack(series_id, seasons, h, rid, title, cfg=None):
     """Tag a grabbed pack onto every gap episode of the series in `seasons` (None = all seasons)
-    so a multi-season download isn't separately re-grabbed season-by-season. Returns count."""
+    so a multi-season download isn't separately re-grabbed season-by-season. Seasons are matched
+    on the RELEASE numbering, so an S04 pack claims the absolute-as-S01 records it actually
+    contains (E51…) instead of every one of them / none at all. Returns count."""
     eps = [e for e in core.get_episodes()
            if e["series_id"] == series_id and e["status"] not in ("merged", "ignored", "downloading")
-           and (seasons is None or e["season"] in seasons)]
+           and (seasons is None or _release_se(e, cfg)[0] in seasons)]
     for e in eps:
         core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
                            candidate_title=title, error=None)
@@ -231,7 +348,7 @@ def grab_season(series_id, season, link, rid=None, title=None, cfg=None):
     if not h:
         raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
     seasons = _pack_seasons(title, season)
-    n = _assign_pack(series_id, seasons, h, rid, title)
+    n = _assign_pack(series_id, seasons, h, rid, title, cfg)
     core.log(f"tv grab SEASON {series_id} (seasons {sorted(seasons) if seasons else 'ALL'}): {n} eps <- {title}")
     return n
 
@@ -244,7 +361,9 @@ def episode_candidates(ep_id, cfg=None):
     e = core.get_episode(ep_id)
     if not e:
         return []
-    title, season, ep = e["series_title"], e["season"], e["episode"]
+    title = e["series_title"]
+    season, ep = _release_se(e, cfg)          # search by the numbering releases actually use
+    absn = _abs_num(e, cfg)
     import json as _json
     tried = set(_json.loads(e.get("tried") or "[]"))
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
@@ -262,6 +381,8 @@ def episode_candidates(ep_id, cfg=None):
             continue
         m = SXXEXX.search(t)
         is_ep = bool(m and int(m.group(1)) == season and int(m.group(2)) == ep)
+        if not is_ep and not m:               # absolute-numbered anime single ('Title - 51')
+            is_ep = _abs_match(t, absn)
         is_pack = (not m) and bool(re.search(rf"(s0?{season}\b|season\s*0?{season}\b|complete|int[eé]grale)", tl))
         if not (is_ep or is_pack):
             continue
@@ -330,8 +451,8 @@ def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
         raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
     core.set_ep_status(ep_id, "downloading", dl_hash=h, dl_id=rid, candidate_title=title, error=None)
     # if the picked release is a multi-season pack, claim those seasons' gap episodes too
-    seasons = _pack_seasons(title, e["season"])
-    extra = _assign_pack(e["series_id"], seasons, h, rid, title) if (seasons is None or len(seasons) > 1) else 0
+    seasons = _pack_seasons(title, _release_se(e, cfg)[0])
+    extra = _assign_pack(e["series_id"], seasons, h, rid, title, cfg) if (seasons is None or len(seasons) > 1) else 0
     core.log(f"tv grab EP(interactive) {ep_id}: {title} -> {1 + extra} ep(s)")
     return 1 + extra
 
@@ -346,10 +467,13 @@ def stage_search(cfg=None):
         return
     pend = core.get_episodes("pending")
     cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0   # ramp gradually, don't flood indexers
-    # group by (series, season)
+    # Group by the season a RELEASE would use, not the season the library filed it under. An
+    # absolute-as-S01 anime library otherwise lumps every episode into one S01 group, searches
+    # "Title S01", and re-grabs the S01 pack that can only ever satisfy E01–E14.
+    rel = {e["id"]: _release_se(e, cfg) for e in pend}
     by_season = defaultdict(list)
     for e in pend:
-        by_season[(e["series_id"], e["series_title"], e["season"])].append(e)
+        by_season[(e["series_id"], e["series_title"], rel[e["id"]][0])].append(e)
     # anime first: fill the Anime library ahead of standard TV
     def _order(item):
         (sid, title, season), eps = item
@@ -373,7 +497,7 @@ def stage_search(cfg=None):
                     n += 1
                     continue
                 seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
-                claimed = _assign_pack(sid, seasons, h, None, rtitle)
+                claimed = _assign_pack(sid, seasons, h, None, rtitle, cfg)
                 core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
                          f"(seasons {sorted(seasons) if seasons else 'ALL'})")
                 n += 1
@@ -382,8 +506,9 @@ def stage_search(cfg=None):
         for e in eps:
             if n >= cap:
                 break
-            q = f"{title} S{e['season']:02d}E{e['episode']:02d}"
-            best = _search(q, cfg, season=e["season"], ep=e["episode"])
+            rs, rn = rel[e["id"]]
+            q = f"{title} S{rs:02d}E{rn:02d}"
+            best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg))
             if not best or best[0] < cfg["min_seeders"]:
                 core.set_ep_status(e["id"], "no_release",
                                    candidate_title=(best[2] if best else None))
@@ -664,15 +789,26 @@ def promote_completed(cfg=None):
         gap = {(x["season"], x["episode"]): x for x in core.get_episodes()
                if x["series_id"] == sid and x["status"] not in ("merged", "ignored")}
         claimed = 0
+        taken = set()
         for (s, ep), vid in sorted(files.items()):
             tgt = gap.get((s, ep))
-            if not tgt or tgt["status"] in ("ready", "merging"):
+            if not tgt:
+                # the release and the library may number the same episode differently (anime
+                # absolute-as-S01 vs aired seasons) — translate before giving up
+                for k in _alt_keys(sid, s, ep, cfg):
+                    tgt = gap.get(k)
+                    if tgt:
+                        core.log(f"tv promote: donor S{s:02d}E{ep:02d} -> {tgt['id']} "
+                                 f"(aired/absolute numbering)")
+                        break
+            if not tgt or tgt["id"] in taken or tgt["status"] in ("ready", "merging"):
                 continue                       # already queued or being merged — don't disturb
             # conditional on the status we just read: if the worker claimed it in between,
             # this fails and we leave the live merge alone (never re-queue a merging episode)
             if core.claim_episode(tgt["id"], tgt["status"], "ready", en_file=vid,
                                   dl_hash=t["hash"], dl_id=eps[0].get("dl_id"),
                                   progress="queued for merge"):
+                taken.add(tgt["id"])
                 claimed += 1
         if claimed:
             queued += claimed
@@ -682,15 +818,17 @@ def promote_completed(cfg=None):
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")
             _drop_stalled_eps(eps, t, cfg)
         else:
-            # Files parsed but none matched a gap episode — almost always a numbering mismatch
-            # (absolute vs season, e.g. a "Complete Collection S01-S04" pack). This used to log
-            # forever while the pack squatted a slot; surface it for review/AI instead.
+            # Files parsed but none matched a gap episode, even after aired<->absolute
+            # translation — the pack genuinely doesn't contain these episodes (wrong season,
+            # or Sonarr has no absolute numbers to translate with). This used to log forever
+            # while the pack squatted a slot; surface it for review/AI instead.
+            want = sorted({_release_se(e, cfg) for e in eps})[:6]
             for e in eps:
                 core.set_ep_status(e["id"], "error", progress="",
                                    error=f"download complete but no episode files matched "
-                                         f"(parsed {sorted(files.keys())[:6]})")
+                                         f"(parsed {sorted(files.keys())[:6]}, wanted {want})")
             core.log(f"tv promote: {t['name'][:50]} complete but no files mapped to episodes "
-                     f"(parsed {sorted(files.keys())[:6]}) -> error")
+                     f"(parsed {sorted(files.keys())[:6]}, wanted {want}) -> error")
     if queued:
         MERGE_WAKE.set()
     return queued

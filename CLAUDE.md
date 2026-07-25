@@ -155,9 +155,44 @@ NOT left stuck in `downloading`: movies call `reject_and_retry`, TV calls `_drop
 Completed-download dead-ends all now terminate instead of looping forever in `downloading`:
 - **path never becomes visible** (mount race) — retried `NOT_VISIBLE_MAX` (10) promote passes,
   then `error`.
-- **TV: files parsed but none map to a gap episode** — nearly always a numbering mismatch
-  (absolute vs season, e.g. a "Complete Collection S01–S04" pack). Sets the episodes `error`
-  with the parsed keys in the message, so it surfaces in Review/AI instead of squatting a slot.
+- **TV: files parsed but none map to a gap episode** — after aired↔absolute translation has been
+  tried (below), the pack genuinely doesn't hold these episodes. Sets the episodes `error` with
+  the parsed keys *and* the wanted keys in the message, so it surfaces in Review/AI instead of
+  squatting a slot.
+
+## Episode numbering: aired ↔ absolute (anime)
+
+Anime libraries are routinely filed with **absolute numbering flattened into S01** (E01…E51…)
+while releases use **aired seasons** (absolute 51 = S04E15). Neither side is wrong — they're two
+numbering schemes for the same episode — but with no translation table:
+- no donor file can map (`S04E15.mkv` vs a library record keyed `(1, 51)`), and
+- the search composes `Title S01E51`, which no indexer can match, so it falls back to the S01
+  pack and **re-grabs the same pack forever** — every episode past S01's real length errors out.
+
+Sonarr already knows both numbers (`absoluteEpisodeNumber` on `/api/v3/episode?seriesId=`), so
+`tv.py` reads the table (cached per series, 1 h; a Sonarr failure is *not* cached) and translates
+at every point where one side's `(season, episode)` meets the other's:
+
+| Helper | Used by |
+|---|---|
+| `_numbering(sid)` → `(aired2abs, abs2aired)` | everything below; two empty dicts for plain TV |
+| `_release_se(ep)` → the S/E a **release** uses | `stage_search` grouping + query, `_assign_pack`, `season_candidates`, `episode_candidates` |
+| `_abs_num(ep)` | matching absolute-numbered singles (`Title - 51`) via `_abs_ep_re` |
+| `_alt_keys(sid, s, e)` → library keys a donor file could also mean | `promote_completed`'s gap lookup |
+
+Two properties keep this from inventing mappings:
+- **Only S01 records are read as possibly-absolute.** Within aired season 1 the absolute number
+  *is* the episode number, so translating an S01 key is the identity right up to where the
+  library's flattened numbering runs past season 1 — exactly where the mismatch starts.
+- **`_alt_keys` is consulted only after a direct match failed**, so a correct direct mapping can
+  never be displaced by a translated one. No absolute numbers (plain TV) or Sonarr unreachable →
+  every helper returns the identity and behaviour is exactly as before.
+
+`_pack_seasons` also takes a **lone season token in the release title over the caller's default**
+(an absolute-as-S01 library asks for "season 1" but the pack says S04), and `_assign_pack` claims
+by *release* season — so an S04 pack claims E37…E52 rather than all of S01 or nothing at all.
+`GET /api/episode/{id}/context` returns a `numbering` block and `/api/tv/episodes` stamps an
+`aired` field, so both the AI and the UI can see which scheme a record is filed under.
 
 ## AI-assisted review (round-trip)
 
@@ -192,7 +227,7 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 
 | Endpoint | Fixes |
 |---|---|
-| `POST /episode/{id}/assign {path}` | **Absolute-vs-aired-season packs.** Maps ONE donor file to one episode and queues the merge. The agent reads `/context`, works out the mapping, calls this per episode. Previously impossible — this whole failure class was unfixable via the API. |
+| `POST /episode/{id}/assign {path}` | **Numbering the automatic aired↔absolute translation can't cover** (Sonarr has no absolute numbers, or the pack numbers its files a third way). Maps ONE donor file to one episode and queues the merge. The agent reads `/context`, works out the mapping, calls this per episode. |
 | `POST /movie\|episode/{id}/set_sync {offset_ms, drift}` | Applies a **known** offset and/or rate stretch with no detection (`drift` = donor_fps/base_fps; 1.0427083 = film→PAL). `_merge_*_impl` honours a stored `sync_drift` when the offset is manual. |
 | `POST /search_releases {query}` | The `no_release` backlog. The built-in search composes its own query from the library title, so a title it never matches can never be found however often it re-searches. This runs an arbitrary Prowlarr query (original/romaji/alternate title, no year) and returns links to `/grab`. |
 | `POST /movie\|episode/{id}/unfixable {reason}` | Terminal give-up **with a recorded reason** (sets `ignored` + `ai_status=needs_human`), so it doesn't read as an unexamined skip. |

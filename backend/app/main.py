@@ -295,9 +295,19 @@ def episode_to_ai(ep_id: str):
         f"review-e{ep_id}", summary,
         {"record": record,
          "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+         "diagnose_first": (
+             f"GET /episode/{ep_id}/context — the record, a probe of both files, the log lines, "
+             "every donor file with the (season,episode) the parser read, the series' episode "
+             "list, and a `numbering` block (library S/E vs the release's S/E and absolute "
+             "number). vo-merge translates aired<->absolute itself from Sonarr, so "
+             "`translated: true` means search and donor mapping already use the aired numbering."),
          "actions": [
              "GET  /episode/{id}/candidates — list releases (incl. already-tried)",
              "POST /episode/{id}/retry — blocklist current release, drop donor, re-search",
+             "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map one donor file to this "
+             "episode and queue the merge (when automatic numbering translation can't apply)",
+             "POST /episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a known "
+             "offset / rate stretch with no detection",
              "POST /episode/{id}/ignore — give up on this episode",
          ],
          "report_back": (
@@ -509,17 +519,27 @@ def episode_context(ep_id: str):
                         if f.lower().endswith(tv.VIDEXT):
                             full = os.path.join(r, f)
                             s, ep = tv._parse_se(os.path.relpath(full, root))
-                            files.append({"file": full, "parsed_season": s, "parsed_episode": ep})
+                            files.append({"file": full, "parsed_season": s, "parsed_episode": ep,
+                                          "maps_to": tv._alt_keys(e["series_id"], s, ep, cfg)
+                                                     if s is not None else []})
         except Exception as ex:
             files = [{"error": str(ex)}]
     siblings = [{"id": x["id"], "season": x["season"], "episode": x["episode"],
                  "status": x["status"], "french_path": x.get("french_path")}
                 for x in core.get_episodes() if x["series_id"] == e["series_id"]]
+    rs, rn = tv._release_se(e, cfg)
     return {"record": e,
             "library_file": _probe_brief(e.get("french_path")),
             "donor_file": _probe_brief(e.get("en_file")),
             "donor_files": files,
             "series_episodes": sorted(siblings, key=lambda x: (x["season"], x["episode"])),
+            # aired <-> absolute translation, so a numbering mismatch reads off the record:
+            # the library files this episode as S{season}E{episode}, releases number it
+            # S{release_season}E{release_episode} (absolute {absolute}).
+            "numbering": {"library_season": e["season"], "library_episode": e["episode"],
+                          "release_season": rs, "release_episode": rn,
+                          "absolute": tv._abs_num(e, cfg),
+                          "translated": (rs, rn) != (e["season"], e["episode"])},
             "log": [l for l in core.tail_log(800) if ep_id in l][-40:]}
 
 
@@ -762,7 +782,20 @@ def tv_status():
 
 @api.get("/tv/episodes")
 def tv_episodes(status: str | None = None):
-    return core.get_episodes(status)
+    """Episode rows, each stamped with the numbering a RELEASE uses for it (`aired`) when that
+    differs from the library's — an absolute-as-S01 anime record is filed E51 but released as
+    S04E15, and without saying so the UI shows a season/episode no indexer has ever heard of."""
+    from . import tv
+    cfg = core.load_config()
+    rows = core.get_episodes(status)
+    for e in rows:
+        try:
+            rs, rn = tv._release_se(e, cfg)          # cached per series; identity for plain TV
+        except Exception:
+            continue
+        if (rs, rn) != (e["season"], e["episode"]):
+            e["aired"] = f"S{rs:02d}E{rn:02d}"
+    return rows
 
 
 @api.post("/tv/scan")

@@ -17,6 +17,7 @@ export interface Episode {
   sync_delta: number | null; error: string | null; progress?: string | null;
   dl_hash?: string | null; series_type?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  aired?: string | null;   // "S04E15" when releases number this episode differently
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {
