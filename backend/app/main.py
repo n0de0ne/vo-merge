@@ -350,6 +350,206 @@ def episode_ai_result(ep_id: str, body: AiResultIn):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- AI ACTIONS
+# The dispatcher could diagnose failures but barely act on them: it could retry,
+# ignore, or re-search, and nothing else. These give it hands for the failure
+# classes it actually meets — numbering mismatches, known rate stretches, and
+# titles the built-in query never matches.
+
+class AssignIn(BaseModel):
+    path: str                       # donor video file to graft audio from
+
+
+@api.post("/episode/{ep_id}/assign")
+def episode_assign(ep_id: str, body: AssignIn):
+    """Point an episode at a SPECIFIC downloaded file and queue it for merging.
+
+    This is the fix for the commonest TV dead-end: a pack downloads fine but its
+    files are numbered differently than the library expects (absolute vs aired
+    season — e.g. library S01E44 vs release S03E08), so nothing auto-maps. The
+    agent (or a human) works out the mapping and states it here, one call per
+    episode."""
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    if not os.path.isfile(body.path):
+        raise HTTPException(400, f"no such file: {body.path}")
+    if not body.path.lower().endswith((".mkv", ".mp4", ".m4v", ".avi", ".ts")):
+        raise HTTPException(400, "not a video file")
+    core.set_ep_status(ep_id, "ready", en_file=body.path, error=None,
+                       progress="queued for merge (assigned)")
+    pipeline.MERGE_WAKE.set()
+    core.log(f"assign {ep_id}: {os.path.basename(body.path)} -> merge queue")
+    return {"ok": True, "queued": True}
+
+
+class SetSyncIn(BaseModel):
+    offset_ms: int = 0
+    drift: float | None = None      # rate ratio, e.g. 1.0427083 for 23.976->25 PAL
+
+
+def _set_sync(kind: str, rec, ident, body: SetSyncIn):
+    if body.drift is not None and not (0.9 <= body.drift <= 1.11):
+        raise HTTPException(422, "drift must be a rate ratio near 1.0 (0.9–1.11)")
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    setter(ident, rec["status"], sync_offset_ms=int(body.offset_ms),
+           sync_drift=body.drift, error=None)
+    return setter
+
+
+@api.post("/movie/{tmdb_id}/set_sync")
+def movie_set_sync(tmdb_id: int, body: SetSyncIn):
+    """Apply a KNOWN offset and/or rate stretch, then re-merge — no detection.
+    `drift` is the donor->base rate ratio the mux applies (25/23.976 = 1.0427083
+    for a PAL library file vs a film-rate release). Use when detection fails but
+    the correct ratio is known from the two framerates."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    _set_sync("movie", mv, tmdb_id, body)
+    core.log(f"set_sync {tmdb_id}: offset={body.offset_ms}ms drift={body.drift}")
+    pipeline.merge_movie(tmdb_id)
+    return core.get_movie(tmdb_id)
+
+
+@api.post("/episode/{ep_id}/set_sync")
+def episode_set_sync(ep_id: str, body: SetSyncIn):
+    """TV mirror of movie_set_sync."""
+    from . import tv
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    _set_sync("episode", e, ep_id, body)
+    core.log(f"set_sync {ep_id}: offset={body.offset_ms}ms drift={body.drift}")
+    tv.merge_ready_episode(ep_id)
+    return core.get_episode(ep_id)
+
+
+class FindIn(BaseModel):
+    query: str
+    indexers: list[int] | None = None
+
+
+@api.post("/search_releases")
+def search_releases(body: FindIn):
+    """Run an ARBITRARY Prowlarr query and return the raw results.
+
+    The built-in search composes its own query from the library title, so a title
+    that never matches (alternate romanisation, different release name, wrong year)
+    can never be found no matter how often it re-searches — the single biggest
+    bucket in the backlog. This lets the caller supply the query itself and then
+    act on a result with the existing /grab endpoints."""
+    cfg = core.load_config()
+    ids = body.indexers if body.indexers is not None else \
+        cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", [])
+    try:
+        results = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"]).search(body.query, ids)
+    except Exception as e:
+        raise HTTPException(502, f"prowlarr: {e}")
+    out = []
+    for r in results:
+        link = pipeline._pick_link(r)
+        out.append({"title": r.get("title", ""), "seeders": r.get("seeders") or 0,
+                    "size": r.get("size") or 0, "indexer": r.get("indexer"),
+                    "link": link, "info_url": r.get("infoUrl"),
+                    "rid": pipeline._hash_from_magnet(link) or r.get("guid") or r.get("title")})
+    out.sort(key=lambda x: -x["seeders"])
+    core.log(f"search_releases '{body.query[:60]}': {len(out)} result(s)")
+    return {"query": body.query, "count": len(out), "results": out[:60]}
+
+
+def _probe_brief(path):
+    if not path or not os.path.exists(path):
+        return None
+    p = pipeline.probe(path)
+    if not p:
+        return {"path": path, "error": "probe failed"}
+    return {"path": path, "dur": p.get("dur"), "fps": p.get("fps"),
+            "audio": [{"id": a["id"], "lang": a["lang"], "codec": a.get("codec"),
+                       "ch": a.get("ch"), "name": a.get("name")} for a in p.get("auds", [])]}
+
+
+@api.get("/movie/{tmdb_id}/context")
+def movie_context(tmdb_id: int):
+    """Everything needed to diagnose one movie in a single call — the record, a
+    probe of both files (framerate/duration/audio tracks), and the log lines that
+    mention it. Saves the agent from shelling into the container."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    key = str(tmdb_id)
+    return {"record": mv,
+            "library_file": _probe_brief(mv.get("french_path")),
+            "donor_file": _probe_brief(mv.get("en_file")),
+            "log": [l for l in core.tail_log(800) if key in l][-40:]}
+
+
+@api.get("/episode/{ep_id}/context")
+def episode_context(ep_id: str):
+    """Episode mirror of movie_context, plus the two things a numbering mismatch
+    needs: every video file in the donor download with the (season, episode) the
+    parser read from it, and the series' episodes with their statuses. Comparing
+    those two lists IS the diagnosis."""
+    from . import tv
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    cfg = core.load_config()
+    files = []
+    if e.get("dl_hash"):
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            t = next((x for x in qb.torrents(cfg["qb_tv_category"])
+                      if x["hash"] == e["dl_hash"]), None)
+            if t:
+                local = pipeline._qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
+                root = local if os.path.isdir(local) else os.path.dirname(local)
+                for r, _, fs in os.walk(root):
+                    for f in fs:
+                        if f.lower().endswith(tv.VIDEXT):
+                            full = os.path.join(r, f)
+                            s, ep = tv._parse_se(os.path.relpath(full, root))
+                            files.append({"file": full, "parsed_season": s, "parsed_episode": ep})
+        except Exception as ex:
+            files = [{"error": str(ex)}]
+    siblings = [{"id": x["id"], "season": x["season"], "episode": x["episode"],
+                 "status": x["status"], "french_path": x.get("french_path")}
+                for x in core.get_episodes() if x["series_id"] == e["series_id"]]
+    return {"record": e,
+            "library_file": _probe_brief(e.get("french_path")),
+            "donor_file": _probe_brief(e.get("en_file")),
+            "donor_files": files,
+            "series_episodes": sorted(siblings, key=lambda x: (x["season"], x["episode"])),
+            "log": [l for l in core.tail_log(800) if ep_id in l][-40:]}
+
+
+class UnfixableIn(BaseModel):
+    reason: str
+
+
+@api.post("/movie/{tmdb_id}/unfixable")
+def movie_unfixable(tmdb_id: int, body: UnfixableIn):
+    """Give up on a title permanently, with the reason recorded. Distinct from
+    /ignore: this states WHY, so it doesn't look like an unexamined skip."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    core.set_status(tmdb_id, "ignored", error=f"unfixable: {body.reason}",
+                    ai_status="needs_human", ai_verdict=body.reason, ai_at=time.time())
+    core.log(f"unfixable {tmdb_id}: {body.reason[:80]}")
+    return {"ok": True}
+
+
+@api.post("/episode/{ep_id}/unfixable")
+def episode_unfixable(ep_id: str, body: UnfixableIn):
+    """Episode mirror of movie_unfixable."""
+    if not core.get_episode(ep_id):
+        raise HTTPException(404, "unknown episode")
+    core.set_ep_status(ep_id, "ignored", error=f"unfixable: {body.reason}",
+                       ai_status="needs_human", ai_verdict=body.reason, ai_at=time.time())
+    core.log(f"unfixable {ep_id}: {body.reason[:80]}")
+    return {"ok": True}
+
+
 @api.get("/downloads")
 def downloads():
     """Live qB progress for everything in the audio-merge categories, keyed by infohash.

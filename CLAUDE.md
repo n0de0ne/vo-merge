@@ -170,6 +170,21 @@ its outcome is written back so failures surface for a human:
 New DB columns: `ai_status`, `ai_verdict`, `ai_at` on both `movies` and `episodes` (via
 `_ensure_cols`). Gated by the existing `ai_tickets` flag.
 
+### What the agent can actually DO (the action surface)
+
+Diagnosis was never the bottleneck — acting was. Every ticket now advertises these, and
+`GET /api/movie|episode/{id}/context` is the "read this first" call: it returns the record, a
+probe of both files (fps/duration/audio tracks), the matching log lines, and — for episodes —
+**every donor file with the (season, episode) `_parse_se` read from it, plus the series' episode
+list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
+
+| Endpoint | Fixes |
+|---|---|
+| `POST /episode/{id}/assign {path}` | **Absolute-vs-aired-season packs.** Maps ONE donor file to one episode and queues the merge. The agent reads `/context`, works out the mapping, calls this per episode. Previously impossible — this whole failure class was unfixable via the API. |
+| `POST /movie\|episode/{id}/set_sync {offset_ms, drift}` | Applies a **known** offset and/or rate stretch with no detection (`drift` = donor_fps/base_fps; 1.0427083 = film→PAL). `_merge_*_impl` honours a stored `sync_drift` when the offset is manual. |
+| `POST /search_releases {query}` | The `no_release` backlog. The built-in search composes its own query from the library title, so a title it never matches can never be found however often it re-searches. This runs an arbitrary Prowlarr query (original/romaji/alternate title, no year) and returns links to `/grab`. |
+| `POST /movie\|episode/{id}/unfixable {reason}` | Terminal give-up **with a recorded reason** (sets `ignored` + `ai_status=needs_human`), so it doesn't read as an unexamined skip. |
+
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
 Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,

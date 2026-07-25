@@ -540,10 +540,28 @@ def ai_health_check(cfg=None):
                          "/episode/{id}/ai_result, body {\"status\":\"resolved|failed|needs_human\","
                          "\"verdict\":\"one line\",\"action_taken\":\"what you did\"}. "
                          "Use needs_human when a person must decide."),
+                     "diagnose_first": (
+                         "GET /movie/{id}/context or /episode/{id}/context — the record, a probe "
+                         "of both files (fps/duration/audio tracks), the log lines for it, and for "
+                         "episodes every donor file with the (season,episode) the parser read plus "
+                         "the series' episode list. Read this before acting; it usually IS the "
+                         "diagnosis and saves shelling into the container."),
                      "actions": [
-                         "GET /movie/{id}/candidates | POST /movie/{id}/sync {\"offset_ms\":0} | "
-                         "/movie/{id}/another | /movie/{id}/research | /movie/{id}/ignore",
-                         "POST /episode/{id}/retry | /episode/{id}/ignore | GET /episode/{id}/candidates"]},
+                         "GET  /movie|episode/{id}/candidates — scored releases (incl. already-tried)",
+                         "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
+                         "POST /movie|episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — "
+                         "apply a KNOWN offset and/or rate stretch with no detection. drift is the "
+                         "donor->base ratio = donor_fps/base_fps (25/23.976=1.0427083 film->PAL, "
+                         "23.976/25=0.9590410 PAL->film). Use when fps are known but detection failed.",
+                         "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map ONE donor file "
+                         "to this episode and queue the merge. THE fix for absolute-vs-aired-season "
+                         "numbering packs: read /context, work out the mapping, call this per episode.",
+                         "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query, returns "
+                         "links. For titles the built-in query never matches, try the original / "
+                         "romaji / English / alternate-transliteration name, or drop the year. Then "
+                         "act on a result with POST /movie|episode/{id}/grab {\"link\":...}.",
+                         "POST /movie|episode/{id}/another | /research | /retry | /ignore",
+                         "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
                     key=key)
 
     # staleness: a record we sent to the AI that never got a callback within ai_stale_min and is
@@ -794,7 +812,12 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         mirror_to_en(fr, cfg)
         return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
-    drift = None
+    # A manually-set offset skips detection. Honour a stored stretch ratio too, so a
+    # known rate correction (e.g. a PAL 1.0427 ratio) can be applied by hand via
+    # /set_sync when detection can't measure it.
+    drift = (mv.get("sync_drift") or None) if offset else None
+    if drift and abs(drift - 1.0) < 1e-6:
+        drift = None
     if not offset and cfg.get("auto_sync", True):
         core.set_status(tmdb_id, "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(

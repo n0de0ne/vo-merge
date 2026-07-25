@@ -475,7 +475,10 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         mirror_to_en(fr, cfg)
         _plex_ep_refresh(ep, cfg)
         return
-    drift = None
+    # manual offset skips detection; honour a stored stretch ratio (see pipeline)
+    drift = (ep.get("sync_drift") or None) if offset else None
+    if drift and abs(drift - 1.0) < 1e-6:
+        drift = None
     if not offset and cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
