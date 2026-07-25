@@ -82,6 +82,8 @@ DEFAULTS = {
                                            # merge queue (cheap qB poll; keeps the UI honest)
     "dl_max_age_min": 720,                 # absolute cap: a download active this long (even if slowly
                                            # trickling) is dropped + blocklisted -> grab another release
+    "meta_timeout_min": 2,                 # a magnet still fetching metadata after this long is dead
+                                           # (no peer ever answered) -> drop it without the full wait
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
     "max_parallel_merges": 1,              # how many merges may run at once. Merging is CPU/iGPU
                                            # heavy (sync detection + remux) — 1 is safest; raise it

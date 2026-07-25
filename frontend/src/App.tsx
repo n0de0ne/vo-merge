@@ -1088,6 +1088,8 @@ function Settings() {
         <span className="muted">how often finished downloads join the merge queue</span>
         <label>Stall timeout (min)</label>{Text("stall_timeout_min", "number")}
         <span className="muted">idle+seedless this long → drop &amp; try another release</span>
+        <label>Metadata timeout (min)</label>{Text("meta_timeout_min", "number")}
+        <span className="muted">dead magnet ("fetching metadata", no seeds) → dropped this fast</span>
         <label>Max download age (min)</label>{Text("dl_max_age_min", "number")}
         <span className="muted">absolute cap; even a slow trickle is dropped past this</span>
         <label>Stall check (min)</label>{Text("stall_check_interval_min", "number")}<span />

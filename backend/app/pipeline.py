@@ -419,22 +419,47 @@ def grab(tmdb_id, link, cfg=None):
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
 
 
+# qB states that mean "this will not finish on its own". pausedDL/stoppedDL are here
+# because nothing in vo-merge can resume a torrent — a paused donor would otherwise hold
+# its slot forever. forcedMetaDL is the force-started spelling of metaDL.
+DEAD_DL_STATES = ("stalledDL", "error", "missingFiles", "metaDL", "forcedMetaDL",
+                  "pausedDL", "stoppedDL")
+NO_META_STATES = ("metaDL", "forcedMetaDL")
+
+
+def _swarm_seeds(t):
+    """Seed count, tolerating qB's -1 = 'not scraped yet'. Reading num_complete naively
+    makes an unknown swarm (-1) look like a *seeded* one, so a genuinely dead torrent
+    never trips the 0-seed test."""
+    for k in ("num_complete", "num_seeds"):
+        v = t.get(k)
+        if isinstance(v, int) and v >= 0:
+            return v
+    return 0
+
+
 def _is_stalled(t, cfg):
     """A qB torrent is 'stalled' = incomplete, active a while, NOT currently downloading, and
-    has no seed source (or qB flags it stalled/errored). Progress level doesn't matter: a
+    has no seed source (or qB flags it dead). Progress level doesn't matter: a
     0-seed download that isn't moving will never finish, whether it's at 5% or 95%.
     An incomplete download that has been active past `dl_max_age_min` is ALSO dropped, even
     if it's still trickling bytes — a release that can't finish in that long isn't worth the slot."""
     if (t.get("progress", 0) or 0) >= 1.0:
         return False
-    if (t.get("time_active", 0) or 0) >= cfg.get("dl_max_age_min", 720) * 60:
+    age = t.get("time_active", 0) or 0
+    if age >= cfg.get("dl_max_age_min", 720) * 60:
         return True                               # absolute cap: too old regardless of speed/seeds
-    if (t.get("time_active", 0) or 0) < cfg.get("stall_timeout_min", 5) * 60:
+    state = t.get("state") or ""
+    # A magnet with no metadata yet has nothing to wait for: no peer has ever answered, so
+    # there is no download to be slow. Waiting the full stall timeout just parks a dead
+    # magnet in a grab slot (the "0% · fetching metadata · 0 seeds" pileup).
+    if state in NO_META_STATES and age >= cfg.get("meta_timeout_min", 2) * 60:
+        return True
+    if age < cfg.get("stall_timeout_min", 5) * 60:
         return False                              # give it time to find peers first
     if (t.get("dlspeed", 0) or 0) > 0:
         return False                              # still pulling bytes -> not stalled
-    seeds = t.get("num_complete", t.get("num_seeds", 0)) or 0   # full-swarm seed count
-    return (seeds == 0) or t.get("state") in ("stalledDL", "error", "missingFiles", "metaDL")
+    return (_swarm_seeds(t) == 0) or state in DEAD_DL_STATES
 
 
 def drop_stalled(mv, t, cfg):

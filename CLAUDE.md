@@ -131,9 +131,21 @@ So we don't measure the stretch, we **hypothesis-test** it:
 ## Stalled-download handling
 
 `_is_stalled(t, cfg)`: incomplete + active > `stall_timeout_min` (default **5**) + `dlspeed==0` +
-(no swarm seeds or qB state in stalledDL/error/missingFiles/metaDL). **Absolute cap:** a download
+(no swarm seeds or qB state in `DEAD_DL_STATES`). **Absolute cap:** a download
 active past `dl_max_age_min` (default 720 = 12h) is dropped too, even if it's still trickling —
-a release that can't finish in that long isn't worth the slot. When stalled: delete from qB,
+a release that can't finish in that long isn't worth the slot.
+
+Three details that decide whether a dead torrent is actually caught:
+- **Dead magnets get their own, much shorter timeout** (`meta_timeout_min`, default **2**). A
+  torrent still in `metaDL`/`forcedMetaDL` has no metadata, so no peer has ever answered it —
+  there is no slow download to be patient with. Making these wait the full `stall_timeout_min`
+  is what produces the "0% · fetching metadata · 0 seeds" pileup that parks dead magnets in
+  every grab slot.
+- **`_swarm_seeds()` treats qB's `num_complete: -1` as *unknown*, not as a seed count.** Reading
+  it naively makes an un-scraped swarm look seeded, so `seeds == 0` never fires and a genuinely
+  dead torrent is only caught if its state string happens to match.
+- **`DEAD_DL_STATES` includes `pausedDL`/`stoppedDL`** — nothing in vo-merge can resume a
+  torrent, so a paused donor would otherwise hold its slot forever. When stalled: delete from qB,
 **blocklist that release** (add `dl_id` to `tried`), re-search for another (better-seeded)
 release; give up to `no_release` after `max_sync_retries`. Movies: `drop_stalled`; TV
 season-packs: `_drop_stalled_eps`. A download that **completes but yields no usable video** is
