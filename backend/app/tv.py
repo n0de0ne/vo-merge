@@ -480,7 +480,9 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
-            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint)
+            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint,
+            base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+            base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
             why = ("framerates differ but no reliable drift could be measured"
                    if (m is not None and fps_diff and not drift)
@@ -510,7 +512,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     except OSError:
         pass
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
-                       error=None, progress="", added_langs=",".join(sorted({langs[i] for i in ids})))
+                       sync_drift=drift, error=None, progress="",
+                       added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms -> {os.path.basename(fr)}")
     try:
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])

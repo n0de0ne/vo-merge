@@ -56,6 +56,51 @@ def _train(cuts, dur, sr):
     return np.convolve(x, k / k.sum(), mode="same")
 
 
+def ratio_scan(file_a, file_b, ratios, start=600, dur=2400, max_lag_s=180, bin_ms=20,
+               threads=4, hwaccel="vaapi", device="/dev/dri/renderD128"):
+    """Test candidate RATE RATIOS between two files (PAL speedup & friends).
+
+    A plain cross-correlation can only find a constant shift, so it is blind to a rate
+    difference — worse, it is actively broken by one: at the PAL ratio (4.27%) the cut pattern
+    smears ~20s *within* a single 480s window, the peak flattens, and confidence collapses.
+    That is why a PAL pair reports "no reliable drift could be measured".
+
+    Here the expensive part — one ffmpeg scene-cut pass per file — runs ONCE over a long span.
+    Each candidate ratio `k` then only costs a numpy rescale + FFT, so testing a dozen
+    hypotheses is nearly free.
+
+    `k` maps donor timestamps onto the base timeline: base_t = k * donor_t + offset, which is
+    exactly what `mkvmerge --sync TID:offset,k` applies.
+    Returns [(k, offset_ms, conf), ...] sorted by confidence, best first (empty if too few cuts).
+    """
+    ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device)
+    cb = scene_cuts(file_b, start, dur, threads=threads, hwaccel=hwaccel, device=device)
+    if len(ca) < 12 or len(cb) < 12:      # need a real pattern to match, not a handful of cuts
+        return []
+    sr = 1000 // bin_ms
+    span = dur * max(1.0, max(ratios)) + max_lag_s + 5
+    a = _train(ca, span, sr)
+    na = np.linalg.norm(a)
+    nfft = 1 << int(np.ceil(np.log2(2 * len(a))))
+    fa = np.fft.rfft(a, nfft)
+    ml = int(max_lag_s * sr)
+    out = []
+    for k in ratios:
+        b = _train(cb * k, span, sr)       # rescale the donor's time axis onto the base's
+        nb = np.linalg.norm(b)
+        if nb <= 0:
+            continue
+        cc = np.fft.irfft(fa * np.conj(np.fft.rfft(b, nfft)), nfft)
+        cc = np.concatenate((cc[-ml:], cc[:ml + 1]))
+        lag = (int(np.argmax(cc)) - ml) * 1000.0 / sr        # ms, in window-relative coords
+        conf = float(cc.max() / (na * nb + 1e-9))
+        # back to absolute: base_abs = k*donor_abs + off, with both windows read at `start`
+        off = lag + start * 1000.0 * (1.0 - k)
+        out.append((k, off, conf))
+    out.sort(key=lambda x: -x[2])
+    return out
+
+
 def detect_offset_video_ms(file_a, file_b, start=300, dur=600, max_lag_s=20, bin_ms=20,
                            threads=4, hwaccel="vaapi", device="/dev/dri/renderD128"):
     ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device)

@@ -49,6 +49,9 @@ td .sub { color: var(--muted); font-size: 12px; }
 /* download finished, waiting its turn in the merge queue */
 .pill.ready { background: #123a3a; color: #5fe3d8; }
 .sub.queued { color: #5fe3d8; }
+/* a rate/PAL stretch was applied to the grafted audio */
+.drift { display: inline-block; font-size: 11px; color: #c9a6ff; background: #2a2440;
+  border-radius: 6px; padding: 2px 7px; margin-top: 4px; white-space: nowrap; }
 .pill.review { background: #3a2a4a; color: #c9a6ff; }
 /* AI-review status (secondary pill, orthogonal to pipeline status) */
 .pill.ai_pending { background: #16324a; color: #6fb6ff; }

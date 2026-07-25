@@ -101,6 +101,33 @@ holding a grab slot — the merger could sit idle with completed downloads waiti
   hwaccel failure (rc≠0 / 0 cuts) — never on a merely low-action window.
 - Audio cross-correlation (`offdet.py`) is the fallback when video windows don't resolve.
 
+### Rate-ratio detection — the PAL path (`sync.ratio_detect` / `offdet_video.ratio_scan`)
+
+A PAL transfer plays 24/23.976fps content at 25fps, so the FR copy runs **~4.27% short**. Window
+matching can't see a rate difference — worse, it's *destroyed* by one: at 4.27% the cut pattern
+smears ~20s **inside** a single 480s window, so every window's correlation peak flattens, few
+clear the confidence gate, and the survivors' offsets fan out over tens of seconds
+(the observed "deltas 67–333s" — that is a PAL signature, **not** a different cut).
+
+So we don't measure the stretch, we **hypothesis-test** it:
+- `RATE_RATIOS` holds the ratios that physically occur (25/23.976, 23.976/25, 25/24, 24/25,
+  24/23.976, 23.976/24) plus 1.0 as a control; `ratio_candidates()` also derives the exact ratio
+  from the two files' measured fps and from their duration ratio.
+- `ratio_scan()` extracts scene cuts **once per file** (the only expensive part — one ffmpeg pass
+  each) over `sync_ratio_span` seconds, then per ratio just rescales the donor's time axis and
+  FFT-correlates. A dozen hypotheses cost ~nothing on top of the two decodes.
+- `k` maps donor→base (`base_t = k*donor_t + offset`), i.e. **k = donor_fps / base_fps**, which is
+  exactly what `mkvmerge --sync TID:offset,k` applies. It's persisted in `sync_drift`.
+- **Two guards against inventing a stretch**: the winner must clear `sync_ratio_min_conf` (0.35)
+  *and* beat the no-stretch hypothesis by `sync_ratio_margin` (1.3×). On synthetic PAL data the
+  true ratio scores 0.97 vs 0.04 for 1:1, and the adjacent 25/24 ratio only 0.08 — the
+  discrimination is sharp.
+- Runs as a **fast path** when fps are known to differ (skips five doomed window scans) and as a
+  **fallback** when windows disagree or don't resolve — so it still fires when `probe()` returns
+  no fps (`fps_close` fails open on `None`).
+- `verify_hint` now quick-verifies a *ratio* hint too, so a PAL season pack doesn't redo the full
+  scan for every episode.
+
 ## Stalled-download handling
 
 `_is_stalled(t, cfg)`: incomplete + active > `stall_timeout_min` (default **5**) + `dlspeed==0` +
@@ -147,7 +174,8 @@ New DB columns: `ai_status`, `ai_verdict`, `ai_at` on both `movies` and `episode
 
 Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
-`score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads),
+`score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads,
+`sync_ratio_test`/`sync_ratio_span`/`sync_ratio_min_conf`/`sync_ratio_margin` for the PAL path),
 `stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
 `promote_interval_min`, `max_inflight_downloads` (download slots) /`max_parallel_merges`
 (concurrent merges, applied live via `MERGE_GATE`), `enabled` (master switch),

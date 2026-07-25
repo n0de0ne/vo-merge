@@ -269,6 +269,14 @@ function QueuedLine({ pos }: { pos?: number | null }) {
   return <div className="sub queued">⏳ {queueLabel(pos)}</div>;
 }
 
+// a rate stretch was applied (PAL 25fps vs 23.976 etc) — worth showing, it's not a plain offset
+function DriftBadge({ d }: { d?: number | null }) {
+  if (!d || Math.abs(d - 1) < 1e-6) return null;
+  const pct = (d - 1) * 100;
+  return <span className="drift" title={`audio time-stretched ${pct.toFixed(2)}% to match the video's rate`}>
+    ⏩ rate ×{d.toFixed(4)} ({pct > 0 ? "+" : ""}{pct.toFixed(2)}%)</span>;
+}
+
 // ---------------- Interactive release search modal ----------------
 function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
   { title: string; load: () => Promise<Candidate[]>; onGrab: (c: Candidate) => Promise<any>;
@@ -369,6 +377,7 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
         {m.status === "ready" && <QueuedLine />}
         {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
         {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
+        <DriftBadge d={m.sync_drift} />
         {m.error && <div className="sub bad">{m.error}</div>}
       </div>
     </div>
@@ -916,7 +925,8 @@ function Review() {
                           <Pill s={m.status} /></div>
                       </div></td>
                       <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
-                        {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}</td>
+                        {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}
+                        <DriftBadge d={m.sync_drift} /></td>
                       <td>{aiCell(m.ai_status, m.ai_verdict)}</td>
                       <td><div className="row">
                         <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
@@ -939,7 +949,8 @@ function Review() {
                         <div className="sub">episode</div><Pill s={e.status} /></div>
                     </div></td>
                     <td>{e.error ? <span className="bad">{e.error}</span> : <span className="muted">—</span>}
-                      {e.sync_delta != null && <div className="sub">Δ {e.sync_delta.toFixed(2)}s</div>}</td>
+                      {e.sync_delta != null && <div className="sub">Δ {e.sync_delta.toFixed(2)}s</div>}
+                      <DriftBadge d={e.sync_drift} /></td>
                     <td>{aiCell(e.ai_status, e.ai_verdict)}</td>
                     <td><div className="row">
                       <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Search…</button>

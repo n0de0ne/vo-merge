@@ -64,6 +64,12 @@ DEFAULTS = {
     "sync_window_start": 300,              # seconds into the film to start the analysis window
     "sync_window_dur": 480,                # analysis window length (s)
     "sync_windows": 4,                     # number of windows; need >=2 to agree (consensus)
+    "sync_ratio_test": True,               # test known transfer rate ratios (PAL 25fps vs 23.976
+                                           # etc). Fixes the "framerates differ but no reliable
+                                           # drift could be measured" dead-end.
+    "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
+    "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
+    "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
@@ -208,7 +214,9 @@ def init_db():
                                    "added_langs": "TEXT", "poster": "TEXT", "progress": "TEXT",
                                    "merged_at": "REAL",
                                    # AI-review round-trip: status the host dispatcher reports back
-                                   "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL"})
+                                   "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
+                                   # rate-stretch ratio applied at merge (PAL etc); 1.0 = none
+                                   "sync_drift": "REAL"})
 
 
 def _ensure_cols(c, table, cols):
@@ -237,7 +245,8 @@ def init_tv():
                                      "poster": "TEXT", "progress": "TEXT", "added_langs": "TEXT",
                                      "series_type": "TEXT DEFAULT 'standard'", "merged_at": "REAL",
                                      # AI-review round-trip (see movies table)
-                                     "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL"})
+                                     "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
+                                     "sync_drift": "REAL"})
 
 
 def upsert_episode(e: dict):

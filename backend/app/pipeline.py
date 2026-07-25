@@ -799,7 +799,9 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}",
-            on_progress=lambda msg: core.set_status(tmdb_id, "merging", progress=msg))
+            on_progress=lambda msg: core.set_status(tmdb_id, "merging", progress=msg),
+            base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+            base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
             # m is None  -> inconsistent/low-confidence sync.
             # fps_diff & no drift -> framerates differ but only a constant offset was found
@@ -840,6 +842,7 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
     core.set_status(tmdb_id, "merged", merged_file=out, progress="",
+                    sync_offset_ms=offset, sync_drift=drift,
                     added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
              f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")

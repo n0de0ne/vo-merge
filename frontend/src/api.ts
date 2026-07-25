@@ -5,7 +5,7 @@ export interface Movie {
   candidate_seeders: number | null; dl_hash: string | null; en_file: string | null;
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
   error: string | null; updated: number; poster?: string | null; progress?: string | null;
-  ai_status?: string | null; ai_verdict?: string | null;
+  ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
@@ -16,7 +16,7 @@ export interface Episode {
   candidate_seeders: number | null; quality: string | null; poster: string | null;
   sync_delta: number | null; error: string | null; progress?: string | null;
   dl_hash?: string | null; series_type?: string | null;
-  ai_status?: string | null; ai_verdict?: string | null;
+  ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {
