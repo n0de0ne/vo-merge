@@ -898,6 +898,9 @@ function Review() {
   const aiOf = (r: Row) => r.kind === "movie" ? r.m.ai_status : r.e.ai_status;
   rows.sort((a, b) => (aiUnfixed(aiOf(b)) ? 1 : 0) - (aiUnfixed(aiOf(a)) ? 1 : 0));
   const needHuman = rows.filter(r => aiUnfixed(aiOf(r))).length;
+  // 'review' means a human must decide — bulk retry only covers the two failure states
+  const retryable = rows.filter(r =>
+    ["error", "sync_fail"].includes(r.kind === "movie" ? r.m.status : r.e.status)).length;
 
   const aiCell = (status?: string | null, verdict?: string | null, k?: string) =>
     status ? <><AiPill s={status} />{verdict && <div className="sub" title={verdict}>{verdict}</div>}</>
@@ -909,7 +912,12 @@ function Review() {
         <b>Needs review</b>
         <span className="muted">{rows.length} item{rows.length === 1 ? "" : "s"}
           {needHuman > 0 && <> · <span className="bad">{needHuman} the AI couldn’t fix</span></>}</span>
-        <div className="spacer" /><LiveDot />
+        <div className="spacer" />
+        {retryable > 0 &&
+          <button className="btn sec" disabled={busy}
+            title="Blocklist each failed release, drop its donor, and re-search — films and episodes"
+            onClick={() => act(api.retryAllErrors)}>↻ Retry {retryable} failed</button>}
+        <LiveDot />
       </div>
       {rows.length === 0
         ? <div className="muted">Nothing needs review 🎉</div>

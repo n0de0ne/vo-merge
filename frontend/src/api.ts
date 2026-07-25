@@ -99,6 +99,8 @@ export const api = {
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
+  retryAllErrors: () =>
+    j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),
   epRetry: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>

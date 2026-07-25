@@ -693,6 +693,40 @@ def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
         core.log(f"merge {tmdb_id}: {reason} -> trying another release (attempt {attempts}/{cfg.get('max_sync_retries',4)})")
 
 
+def retry_movie(tmdb_id, cfg=None):
+    """Proper operator-initiated retry, the movie mirror of tv.retry_episode: blocklist the
+    release that failed, drop its donor from qB, clear the grab fields and re-queue for a fresh
+    search. A bare flip to 'pending' would re-search and can pick the very same release again.
+    `attempts` is reset because a human/AI asking for a retry means "try again" — a sync_fail
+    record has already spent its budget and would otherwise fail straight back to sync_fail."""
+    import json as _json
+    cfg = cfg or core.load_config()
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        return False
+    tried = _json.loads(mv.get("tried") or "[]")
+    if mv.get("dl_id") and mv["dl_id"] not in tried:
+        tried.append(mv["dl_id"])
+    if mv.get("dl_hash"):
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            qb.delete([mv["dl_hash"]], delete_files=True)
+            core.log(f"retry {tmdb_id}: dropped failed donor {str(mv['dl_hash'])[:12]}")
+        except Exception as ex:
+            core.log(f"retry {tmdb_id}: donor drop failed: {ex}")
+    core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
+                    dl_hash=None, dl_id=None, en_file=None, progress="")
+    return True
+
+
+def retry_errors(cfg=None, states=("error", "sync_fail")):
+    """Bulk retry every failed movie. Returns how many were re-queued."""
+    cfg = cfg or core.load_config()
+    n = sum(1 for st in states for m in core.get_movies(st) if retry_movie(m["tmdb_id"], cfg))
+    core.log(f"retry-all films: re-queued {n} failed title(s)")
+    return n
+
+
 # ---------------------------------------------------------------- PROBE (local bins)
 def _ffprobe(path, args):
     try:

@@ -290,3 +290,25 @@ These are Unraid **User Scripts** under `/boot/config/plugins/user.scripts/scrip
   when a release adds audio, blocklist-but-keep-seeding the rest).
 
 The host-level CLAUDE.md (`/mnt/user/CLAUDE.md`) documents the Unraid server itself.
+
+## Retrying failures
+
+`POST /api/retry_errors` re-queues **every** failed record — movies and episodes, `error` and
+`sync_fail` — and the Review tab's "↻ Retry N failed" button calls it. Per-record:
+`pipeline.retry_movie` / `tv.retry_episode`, which **blocklist the release that failed** (append
+`dl_id` to `tried`), **drop its donor from qB**, clear the grab fields and reset `attempts`
+before going back to `pending`. Two reasons that matters:
+- a bare flip to `pending` (what `/movie/{id}/retry` used to do) re-searches and can pick the
+  very same broken release, so "retry" looped;
+- `attempts` gates `reject_and_retry` → `sync_fail`, so without the reset a `sync_fail` record
+  would fail straight back to `sync_fail` on its first hiccup. An operator asking for a retry
+  means "try again", so the budget is refreshed while `tried` (the blocklist) is kept.
+
+`review` is deliberately excluded — it means a human must decide, not that something failed.
+
+## CI
+
+`.github/workflows/docker-publish.yml` builds and pushes to GHCR on `main`, on `v*` tags, and on
+`claude/**` branches, so a feature branch can be pulled onto Unraid before it merges. Only `main`
+publishes `:latest`; a branch build is tagged with its sanitised branch name
+(`ghcr.io/alanstrok/vo-merge:claude-<branch>`).

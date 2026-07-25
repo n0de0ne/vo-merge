@@ -193,7 +193,17 @@ def set_sync(tmdb_id: int, body: SyncIn):
 
 @api.post("/movie/{tmdb_id}/retry")
 def retry(tmdb_id: int):
-    core.set_status(tmdb_id, "pending", error=None); return {"ok": True}
+    pipeline.retry_movie(tmdb_id); return {"ok": True}
+
+
+@api.post("/retry_errors")
+def retry_all_errors():
+    """Retry every failed record — movies and episodes, error and sync_fail. Each one blocklists
+    the release that failed and drops its donor first, so a bulk retry re-searches instead of
+    re-grabbing the same broken release."""
+    from . import tv
+    cfg = core.load_config()
+    return {"ok": True, "movies": pipeline.retry_errors(cfg), "episodes": tv.retry_errors(cfg)}
 
 
 @api.post("/movie/{tmdb_id}/ignore")

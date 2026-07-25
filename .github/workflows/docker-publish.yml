@@ -2,7 +2,10 @@ name: build and publish image
 
 on:
   push:
-    branches: [main]
+    # feature branches build too, so a branch can be pulled onto Unraid before it merges.
+    # Only main publishes :latest (see is_default_branch below) — a branch build is tagged
+    # with its own sanitised name, e.g. claude-ui-reliability-error-handling-48molg.
+    branches: [main, "claude/**"]
     tags: ["v*"]
   workflow_dispatch:
 

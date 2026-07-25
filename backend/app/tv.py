@@ -424,19 +424,18 @@ def retry_episode(ep_id, cfg=None):
                 core.log(f"retry {ep_id}: dropped failed donor {str(h)[:12]}")
             except Exception as ex:
                 core.log(f"retry {ep_id}: donor drop failed: {ex}")
-    core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried),
+    # attempts is reset because an operator asking for a retry means "try again": a sync_fail
+    # record has already spent its budget and would otherwise fail straight back to sync_fail.
+    core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
                        dl_hash=None, dl_id=None, en_file=None, progress="")
     return True
 
 
-def retry_errors(cfg=None):
-    """Retry every errored episode (bulk). Returns how many were re-queued."""
+def retry_errors(cfg=None, states=("error", "sync_fail")):
+    """Retry every failed episode (bulk). Returns how many were re-queued."""
     cfg = cfg or core.load_config()
-    n = 0
-    for e in core.get_episodes("error"):
-        if retry_episode(e["id"], cfg):
-            n += 1
-    core.log(f"tv retry-all: re-queued {n} errored episodes")
+    n = sum(1 for st in states for e in core.get_episodes(st) if retry_episode(e["id"], cfg))
+    core.log(f"tv retry-all: re-queued {n} failed episode(s)")
     return n
 
 
