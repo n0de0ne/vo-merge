@@ -45,7 +45,7 @@ export interface Dash {
   movies: Record<string, number>; episodes: Record<string, number>;
   active: DashActive[]; attention: DashAttention[]; recent: DashRecent[];
   merged_24h: number; merged_7d: number;
-  inflight: number | null; inflight_cap: number;
+  inflight: number | null; inflight_cap: number; merge_cap: number;
   disk: { path: string; total: number; free: number } | null;
   next_runs: Record<string, number>; now: number;
 }
@@ -69,6 +69,8 @@ export const api = {
   test: (which: string) =>
     j<{ ok: boolean; error?: string }>(`/api/test/${which}`, { method: "POST" }),
   scan: () => j<{ found: number }>("/api/scan", { method: "POST" }),
+  searchAll: () => j<{ ok: boolean; started: boolean; pending?: number; slots?: number | null; note?: string }>(
+    "/api/search_all", { method: "POST" }),
   search: (id: number) => j<Movie>(`/api/movie/${id}/search`, { method: "POST" }),
   merge: (id: number) => j<Movie>(`/api/movie/${id}/merge`, { method: "POST" }),
   sync: (id: number, offset_ms: number) =>

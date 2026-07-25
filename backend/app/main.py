@@ -111,6 +111,40 @@ def do_finish():
     return {"ok": True, "started": True}
 
 
+@api.post("/search_all")
+def search_all():
+    """Run the search stage NOW over every pending record, instead of waiting for the search
+    timer. Honours the in-flight download cap, so it grabs at most the number of free slots —
+    the rest of the backlog stays pending for the next run."""
+    import threading
+    from . import tv
+
+    if not pipeline.SEARCH_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a search run is already in progress"}
+
+    pending = len(core.get_movies("pending")) + len(core.get_episodes("pending"))
+    try:
+        slots = pipeline.grab_budget(core.load_config())
+    except Exception:
+        slots = None
+
+    def _run():
+        try:
+            cfg = core.load_config()
+            if cfg.get("scope_films", True):
+                pipeline.stage_search(cfg)
+            if cfg.get("scope_series"):
+                tv.stage_search(cfg)
+        except Exception as e:
+            core.log(f"manual search error: {e}")
+        finally:
+            pipeline.SEARCH_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    core.log(f"manual search: {pending} pending, {slots if slots is not None else '?'} free slot(s)")
+    return {"ok": True, "started": True, "pending": pending, "slots": slots}
+
+
 @api.post("/movie/{tmdb_id}/search")
 def do_search(tmdb_id: int):
     pipeline.search_movie(tmdb_id); return core.get_movie(tmdb_id)
@@ -458,6 +492,7 @@ def dashboard():
             "active": active, "attention": attention, "recent": recent,
             "merged_24h": merged_24h, "merged_7d": merged_7d,
             "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
+            "merge_cap": pipeline.MERGE_GATE.limit(cfg),
             "disk": disk, "next_runs": next_runs, "now": now}
 
 

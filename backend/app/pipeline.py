@@ -4,16 +4,52 @@
 Search & merge logic is ported verbatim from the validated dry-run scripts.
 """
 import json, os, re, subprocess, shutil, time, hashlib, threading
+from contextlib import contextmanager
 import requests
 from . import core, sync
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
-# Only ONE merge (sync-detect + mux) runs at a time across the whole app, no matter how it's
-# triggered (scheduler, resume, or the API), so concurrent merges can't peg the CPU/GPU.
-MERGE_LOCK = threading.Lock()
+class _MergeGate:
+    """Admission control for concurrent merges (sync-detect + mux), covering every trigger:
+    the merge workers, the resume path and the API. The limit is `max_parallel_merges` and is
+    re-read while waiting, so changing it in Settings takes effect without a restart.
+    Merging is CPU/iGPU heavy — the default of 1 keeps the old serialized behaviour."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._active = 0
+
+    @staticmethod
+    def limit(cfg=None):
+        try:
+            return max(1, int((cfg or core.load_config()).get("max_parallel_merges", 1)))
+        except Exception:
+            return 1
+
+    def active(self):
+        with self._cv:
+            return self._active
+
+    @contextmanager
+    def slot(self, cfg=None):
+        with self._cv:
+            while self._active >= self.limit(cfg):
+                self._cv.wait(timeout=5)        # re-check a possibly-changed limit
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._active -= 1
+                self._cv.notify()
+
+
+MERGE_GATE = _MergeGate()
 # Only ONE finish cycle runs at a time — concurrent triggers (scheduler + API) would each keep
 # their own per-pack offset cache and duplicate work. Callers acquire non-blocking and skip.
 FINISH_LOCK = threading.Lock()
+# Same for a search sweep: hammering the indexers twice over concurrently gets you rate-limited.
+SEARCH_LOCK = threading.Lock()
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
 EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
@@ -692,8 +728,8 @@ def _place_multi(en, mv, cfg, tmdb_id):
 
 
 def merge_movie(tmdb_id, cfg=None):
-    """Serialize merges (one at a time) so concurrent triggers can't peg CPU/GPU."""
-    with MERGE_LOCK:
+    """Cap concurrent merges at `max_parallel_merges` so they can't peg CPU/GPU."""
+    with MERGE_GATE.slot(cfg):
         return _merge_movie_impl(tmdb_id, cfg)
 
 
@@ -1020,16 +1056,20 @@ def merge_next(cfg=None):
     return False
 
 
-def merge_worker():
-    """Background thread: drains the merge queue one item at a time, forever."""
-    core.log("merge worker started")
+def merge_worker(index=0):
+    """Background thread: drains the merge queue, forever. `index` is this worker's slot in the
+    pool — if `max_parallel_merges` is lowered, workers above the new limit retire themselves."""
+    core.log(f"merge worker #{index} started")
     while True:
         try:
             cfg = core.load_config()
+            if index >= MERGE_GATE.limit(cfg):
+                core.log(f"merge worker #{index} retired (max_parallel_merges lowered)")
+                return
             if cfg.get("enabled") and merge_next(cfg):
                 continue                       # straight on to the next queued item
         except Exception as e:
-            core.log(f"merge worker error: {e}")
+            core.log(f"merge worker #{index} error: {e}")
         MERGE_WAKE.wait(timeout=10)
         MERGE_WAKE.clear()
 

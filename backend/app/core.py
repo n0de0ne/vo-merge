@@ -77,6 +77,9 @@ DEFAULTS = {
     "dl_max_age_min": 720,                 # absolute cap: a download active this long (even if slowly
                                            # trickling) is dropped + blocklisted -> grab another release
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
+    "max_parallel_merges": 1,              # how many merges may run at once. Merging is CPU/iGPU
+                                           # heavy (sync detection + remux) — 1 is safest; raise it
+                                           # only if the box has headroom. Applied live.
     "max_inflight_downloads": 5,           # flow control: never have more than this many downloads
                                            # in qB at once (a season pack counts as one). vo-merge
                                            # won't grab another until a merge finishes + donor is

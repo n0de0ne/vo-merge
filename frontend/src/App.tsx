@@ -421,6 +421,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const backlog = both("pending", "searching", "no_release");
   const downloading = d.active.filter(a => a.status === "downloading");
   const merging = d.active.filter(a => a.status === "merging");
+  const queued = d.active.filter(a => a.status === "ready");
   const totalSpeed = Object.values(dls).reduce((a, x) => a + (x.dlspeed || 0), 0);
   const diskPct = d.disk ? Math.round((1 - d.disk.free / d.disk.total) * 100) : null;
   const dlOf = (a: { dl_hash?: string | null }) => dls[(a.dl_hash || "").toLowerCase()];
@@ -437,8 +438,9 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
         <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
           sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
           tone={d.inflight == null ? "warn" : undefined} />
-        <Tile label="Merging" value={merging.length}
-          sub={merging.length ? merging[0].title : "idle"} />
+        <Tile label="Merging" value={<>{merging.length}<span className="t-cap"> / {d.merge_cap}</span></>}
+          sub={merging.length ? merging[0].title
+            : queued.length ? `${queued.length} queued` : "idle"} />
         <Tile label="Attention" value={attention} tone={attention ? "bad" : undefined}
           onClick={() => goto("review")}
           sub={<>{both("review")} review · {both("sync_fail")} sync · {both("error")} error</>} />
@@ -537,6 +539,7 @@ function Films() {
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
+  const [searchMsg, setSearchMsg] = useState("");
 
   async function refresh() {
     setStatus(await api.status());
@@ -557,6 +560,17 @@ function Films() {
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
+  async function searchAll() {
+    setBusy(true); setSearchMsg("starting…");
+    try {
+      const r = await api.searchAll();
+      setSearchMsg(r.started
+        ? `searching ${r.pending ?? 0} pending · ${r.slots ?? "?"} free slot(s)`
+        : (r.note || "already running"));
+    } catch (e: any) { setSearchMsg("failed: " + (e.message || "")); }
+    finally { setBusy(false); refresh(); }
+  }
+
   return (
     <>
       <div className="panel">
@@ -565,6 +579,10 @@ function Films() {
             ? <span className="ok">enabled</span> : <span className="muted">disabled</span>}
             {status && <span className="muted"> · grab: {status.grab_mode}</span>}</div>
           <div className="spacer" />
+          {searchMsg && <span className="muted">{searchMsg}</span>}
+          <button className="btn sec" disabled={busy} onClick={searchAll}
+            title="Search every pending title now instead of waiting for the timer (grabs up to the free download slots)">
+            🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
@@ -647,6 +665,7 @@ function Series({ anime }: { anime: boolean }) {
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
   const [relEp, setRelEp] = useState<Episode | null>(null);
+  const [searchMsg, setSearchMsg] = useState("");
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
   const dlOf = (e: Episode) => dls[(e.dl_hash || "").toLowerCase()];
 
@@ -684,6 +703,17 @@ function Series({ anime }: { anime: boolean }) {
   usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+
+  async function searchAll() {
+    setBusy(true); setSearchMsg("starting…");
+    try {
+      const r = await api.searchAll();
+      setSearchMsg(r.started
+        ? `searching ${r.pending ?? 0} pending · ${r.slots ?? "?"} free slot(s)`
+        : (r.note || "already running"));
+    } catch (e: any) { setSearchMsg("failed: " + (e.message || "")); }
+    finally { setBusy(false); refresh(); }
+  }
 
   // seasons + episodes detail, shared by the list rows and the grid cards
   const renderSeasons = (sh: typeof shows[number]) => sh.seasons.map(([season, seps]) => (
@@ -766,6 +796,10 @@ function Series({ anime }: { anime: boolean }) {
         <div className="row">
           <div><b>{anime ? "🎌 Anime pipeline" : "📺 TV Shows pipeline"}</b> <span className="muted">episode VO merges</span></div>
           <div className="spacer" />
+          {searchMsg && <span className="muted">{searchMsg}</span>}
+          <button className="btn sec" disabled={busy} onClick={searchAll}
+            title="Search every pending episode now instead of waiting for the timer">
+            🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
@@ -1029,6 +1063,29 @@ function Settings() {
           onChange={e => set("series_pilot", e.target.value)} /><span className="muted">comma-sep; empty = all tagged</span>
         <label>qB TV category</label>{Text("qb_tv_category")}<span />
         <label>Season-pack threshold</label>{Text("tv_pack_threshold", "number")}<span className="muted">≥ N gap eps → grab a pack</span>
+      </div>
+
+      <div className="section-title">Queues &amp; limits</div>
+      <div className="form-grid">
+        <label>Download slots</label>{Text("max_inflight_downloads", "number")}
+        <span className="muted">how many downloads run at once (a season pack counts as one)</span>
+        <label>Simultaneous merges</label>{Text("max_parallel_merges", "number")}
+        <span className="muted">merges share the CPU/iGPU — 1 is safest, raise only with headroom</span>
+        <label>Searches per run</label>{Text("max_search_per_run", "number")}
+        <span className="muted">cap on new searches/grabs per cycle</span>
+        <label>Queue check (min)</label>{Text("promote_interval_min", "number")}
+        <span className="muted">how often finished downloads join the merge queue</span>
+        <label>Stall timeout (min)</label>{Text("stall_timeout_min", "number")}
+        <span className="muted">idle+seedless this long → drop &amp; try another release</span>
+        <label>Max download age (min)</label>{Text("dl_max_age_min", "number")}
+        <span className="muted">absolute cap; even a slow trickle is dropped past this</span>
+        <label>Stall check (min)</label>{Text("stall_check_interval_min", "number")}<span />
+        <label>Max release retries</label>{Text("max_sync_retries", "number")}
+        <span className="muted">different releases tried before giving up</span>
+        <label>AI reply timeout (min)</label>{Text("ai_stale_min", "number")}
+        <span className="muted">no AI verdict in this long → flag for manual review</span>
+        <label>AI escalation</label>{Check("ai_tickets")}
+        <span className="muted">auto-send failures to the on-call AI</span>
       </div>
 
       <div className="section-title">Master</div>

@@ -10,7 +10,7 @@ from collections import defaultdict
 from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_LOCK, FR_DUB,
+                       mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
                        EN_OK, EN_AUDIO, RES, SRC, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
@@ -403,10 +403,10 @@ def stage_search(cfg=None):
 
 # ------------------------------------------------------------------ FINISH (map + merge)
 def _merge_episode(ep, en_file, cfg, hint=None):
-    """Serialize merges (shared lock with movies) so concurrent merges can't peg CPU/GPU.
+    """Share the movie merge gate (max_parallel_merges) so merges can't peg CPU/GPU.
     `hint` = (offset, drift) from a pack-mate, to skip full sync detection when it matches.
     Returns (offset, drift) on a detected merge, else None."""
-    with MERGE_LOCK:
+    with MERGE_GATE.slot(cfg):
         return _merge_episode_impl(ep, en_file, cfg, hint)
 
 

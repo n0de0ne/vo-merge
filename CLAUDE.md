@@ -149,8 +149,10 @@ Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads),
 `stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
-`promote_interval_min`, `enabled` (master switch), `ai_tickets`/`ai_stale_min` (AI-review
-escalation, see below).
+`promote_interval_min`, `max_inflight_downloads` (download slots) /`max_parallel_merges`
+(concurrent merges, applied live via `MERGE_GATE`), `enabled` (master switch),
+`ai_tickets`/`ai_stale_min` (AI-review escalation, see below).
+Most of these are editable in the UI under **Settings → Queues & limits**.
 Secrets are masked in the GET /api/settings response.
 
 ### Paths / mounts (all three must line up)
