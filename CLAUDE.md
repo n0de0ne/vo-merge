@@ -47,10 +47,30 @@ merged / review / sync_fail / error / ignored.
    prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers both the
    auto-picker and the UI's interactive search.
 3. **grab** — `qb_grab()` adds to qB (see VPN gotcha) and records the real infohash.
-4. **finish** (`stage_finish`) — poll qB; on complete, set `en_file` and `merge_movie`;
-   reconcile vanished torrents; **drop stalled torrents** (see below).
-5. **merge** (`merge_movie`) — see merge rules below.
-6. **finish_movie** — replace library file in place, trigger Radarr rescan + Plex scan.
+4. **promote** (`promote_completed`, own 1-min timer) — any download at 100% leaves
+   `downloading` immediately: resolve `en_file` and move it to **`ready`** = the merge queue.
+5. **finish** (`stage_finish`) — reconcile vanished torrents, **drop stalled torrents** (below),
+   re-queue interrupted merges. Calls `promote_completed`; **never merges inline.**
+6. **merge** (`merge_worker` → `merge_movie` / `merge_ready_episode`) — see merge rules below.
+7. **finish_movie** — replace library file in place, trigger Radarr rescan + Plex scan.
+
+### Merge queue & worker (why `ready` matters)
+
+Merging used to run **inline inside the qB-poll loop**, so a finished download stayed
+`downloading` until every earlier item had merged (hours for a 30–50 ep season pack) while
+holding a grab slot — the merger could sit idle with completed downloads waiting. Now:
+
+- `ready` is a **real queue** (FIFO by `updated`), not a marker set one line before a merge.
+- A single daemon thread (`pipeline.merge_worker`, started in `scheduler.start()`) drains it
+  one item at a time, claiming each atomically via `core.claim_movie`/`claim_episode`
+  (`UPDATE … WHERE status='ready'` + `rowcount`) so nothing can ever be merged twice.
+  `MERGE_WAKE` (an `Event`) makes a promotion start the merge immediately.
+- A failed merge marks only that record `error` — it can no longer abort the whole cycle.
+- **The in-flight cap counts `downloading` only** (`ACTIVE_STATES`), so a slot frees at 100%
+  and new grabs continue while the queue drains. `KEEP_DONOR_STATES` still covers
+  `ready`/`merging` so the orphan sweep never deletes a donor out from under the worker.
+- Stale `merging` records (>15 min, not in `_merging_now()`) go back to `ready` rather than
+  being re-merged inline. SQLite runs in **WAL** — the worker writes concurrently.
 
 ## Merge rules (important, non-obvious)
 
@@ -91,7 +111,14 @@ a release that can't finish in that long isn't worth the slot. When stalled: del
 release; give up to `no_release` after `max_sync_retries`. Movies: `drop_stalled`; TV
 season-packs: `_drop_stalled_eps`. A download that **completes but yields no usable video** is
 NOT left stuck in `downloading`: movies call `reject_and_retry`, TV calls `_drop_stalled_eps`
-(both blocklist the release and re-search), unless the path just isn't visible yet (mount race).
+(both blocklist the release and re-search).
+
+Completed-download dead-ends all now terminate instead of looping forever in `downloading`:
+- **path never becomes visible** (mount race) — retried `NOT_VISIBLE_MAX` (10) promote passes,
+  then `error`.
+- **TV: files parsed but none map to a gap episode** — nearly always a numbering mismatch
+  (absolute vs season, e.g. a "Complete Collection S01–S04" pack). Sets the episodes `error`
+  with the parsed keys in the message, so it surfaces in Review/AI instead of squatting a slot.
 
 ## AI-assisted review (round-trip)
 
@@ -121,8 +148,9 @@ New DB columns: `ai_status`, `ai_verdict`, `ai_at` on both `movies` and `episode
 Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads),
-`stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`, `enabled`
-(master switch), `ai_tickets`/`ai_stale_min` (AI-review escalation, see below).
+`stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
+`promote_interval_min`, `enabled` (master switch), `ai_tickets`/`ai_stale_min` (AI-review
+escalation, see below).
 Secrets are masked in the GET /api/settings response.
 
 ### Paths / mounts (all three must line up)

@@ -72,6 +72,8 @@ DEFAULTS = {
     "stall_timeout_min": 5,                # an incomplete download not moving (no seeds/0 speed) for
                                            # this long is dropped + blocklisted -> grab another release
     "stall_check_interval_min": 3,         # how often the stall sweep runs (independent of merges)
+    "promote_interval_min": 1,             # how often completed downloads are moved onto the
+                                           # merge queue (cheap qB poll; keeps the UI honest)
     "dl_max_age_min": 720,                 # absolute cap: a download active this long (even if slowly
                                            # trickling) is dropped + blocklisted -> grab another release
     "max_search_per_run": 25,              # cap new searches/grabs per cycle (ramp, don't flood)
@@ -160,6 +162,8 @@ def db():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
+    # the merge worker writes concurrently with the scheduler + API threads
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
         conn.commit()
@@ -169,6 +173,12 @@ def db():
 
 def init_db():
     with db() as c:
+        # WAL: a background merge worker writes while the scheduler/API read — without it
+        # concurrent access raises "database is locked" and aborts a whole stage.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
         c.execute("""CREATE TABLE IF NOT EXISTS movies (
             tmdb_id INTEGER PRIMARY KEY,
             imdb_id TEXT, radarr_id INTEGER,
@@ -301,6 +311,30 @@ def set_status(tmdb_id, status, **fields):
     with db() as c:
         c.execute(f"UPDATE movies SET {keys} WHERE tmdb_id=?",
                   tuple(fields.values()) + (tmdb_id,))
+
+
+def claim_movie(tmdb_id, from_status, to_status, **fields):
+    """Atomically move a movie from one status to another. Returns True only if THIS caller
+    won the transition — the merge worker uses it to claim a queued item so a concurrent
+    claimer (or a re-entrant sweep) can never merge the same file twice."""
+    fields["status"] = to_status
+    fields["updated"] = time.time()
+    keys = ",".join(f"{k}=?" for k in fields)
+    with db() as c:
+        cur = c.execute(f"UPDATE movies SET {keys} WHERE tmdb_id=? AND status=?",
+                        tuple(fields.values()) + (tmdb_id, from_status))
+        return cur.rowcount == 1
+
+
+def claim_episode(ep_id, from_status, to_status, **fields):
+    """Episode mirror of claim_movie."""
+    fields["status"] = to_status
+    fields["updated"] = time.time()
+    keys = ",".join(f"{k}=?" for k in fields)
+    with db() as c:
+        cur = c.execute(f"UPDATE episodes SET {keys} WHERE id=? AND status=?",
+                        tuple(fields.values()) + (ep_id, from_status))
+        return cur.rowcount == 1
 
 
 def get_movies(status=None):

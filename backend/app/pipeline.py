@@ -164,12 +164,14 @@ def _free_donor(qb, h, cfg, tag=""):
         core.log(f"donor {tag}: delete failed ({str(h)[:12]}): {e}")
 
 
-# donor-ownership states: ACTIVE records are consuming their donor (counts toward the
-# in-flight cap); review/sync_fail keep the donor for manual resync but must NOT hold a
-# grab slot — counting raw qB hashes caused two dead-donor cap deadlocks (2026-07-12,
-# 2026-07-15: merged/review/sync_fail owners saturated the cap for days).
-ACTIVE_STATES = ("downloading", "ready", "merging")
-KEEP_DONOR_STATES = ACTIVE_STATES + ("review", "sync_fail")
+# The in-flight cap limits DOWNLOADS, not merges. A torrent that reached 100% has stopped
+# using bandwidth and a slot: it frees its slot immediately (status leaves 'downloading' for
+# 'ready') so new releases keep flowing while the merge queue drains. Counting ready/merging
+# here is what let two finished packs squat the cap with the merger idle.
+ACTIVE_STATES = ("downloading",)
+# ...but the donor FILES must survive until the merge consumes them, so the orphan sweep keeps
+# its hands off ready/merging (and review/sync_fail, kept for manual resync).
+KEEP_DONOR_STATES = ("downloading", "ready", "merging", "review", "sync_fail")
 
 
 def _dl_hashes(states):
@@ -964,6 +966,135 @@ def stage_search(cfg=None):
             break
 
 
+# ---------------------------------------------------------------- MERGE QUEUE + WORKER
+# Merging used to run INLINE inside the qB-poll loop, so a completed download stayed in
+# 'downloading' until every earlier item had finished merging (hours for a season pack) and
+# it held a grab slot the whole time. Now the poll only promotes completed downloads to
+# 'ready' (the queue) and a single background worker drains it.
+MERGE_WAKE = threading.Event()          # set by a promotion -> worker starts immediately
+_MERGING_NOW = set()                    # keys actively being merged BY THE WORKER right now
+_MERGING_NOW_LOCK = threading.Lock()
+
+
+def _merging_now():
+    with _MERGING_NOW_LOCK:
+        return set(_MERGING_NOW)
+
+
+def merge_queue(cfg=None):
+    """Everything waiting to merge, oldest first (FIFO — the old LIFO ordering meant the
+    longest-waiting item was served last). Returns [(kind, id, updated), ...]."""
+    items = [("movie", m["tmdb_id"], m.get("updated") or 0) for m in core.get_movies("ready")]
+    items += [("episode", e["id"], e.get("updated") or 0) for e in core.get_episodes("ready")]
+    items.sort(key=lambda x: x[2])
+    return items
+
+
+def merge_next(cfg=None):
+    """Claim and merge ONE queued item. Returns True if something was merged."""
+    from . import tv as _tv
+    cfg = cfg or core.load_config()
+    for kind, rid, _ts in merge_queue(cfg):
+        key = f"{'m' if kind == 'movie' else 'e'}{rid}"
+        claim = core.claim_movie if kind == "movie" else core.claim_episode
+        # atomic ready -> merging: if we lose the race, another claimer has it
+        if not claim(rid, "ready", "merging", progress="starting…"):
+            continue
+        with _MERGING_NOW_LOCK:
+            _MERGING_NOW.add(key)
+        try:
+            if kind == "movie":
+                merge_movie(rid, cfg)
+            else:
+                _tv.merge_ready_episode(rid, cfg)
+        except Exception as e:
+            # never let one bad item kill the worker (the old inline merge aborted the
+            # whole finish cycle, stranding every record behind it)
+            setter = core.set_status if kind == "movie" else core.set_ep_status
+            setter(rid, "error", error=f"merge: {e}", progress="")
+            core.log(f"merge {key} FAILED: {e}")
+        finally:
+            with _MERGING_NOW_LOCK:
+                _MERGING_NOW.discard(key)
+        return True
+    return False
+
+
+def merge_worker():
+    """Background thread: drains the merge queue one item at a time, forever."""
+    core.log("merge worker started")
+    while True:
+        try:
+            cfg = core.load_config()
+            if cfg.get("enabled") and merge_next(cfg):
+                continue                       # straight on to the next queued item
+        except Exception as e:
+            core.log(f"merge worker error: {e}")
+        MERGE_WAKE.wait(timeout=10)
+        MERGE_WAKE.clear()
+
+
+def _resolve_donor_video(mv, t, cfg):
+    """Locate the downloaded video for a completed movie donor. Returns (video_path, local_root)."""
+    save = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
+    local = save if (save and os.path.exists(save)) \
+        else os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
+    if not os.path.exists(local):
+        return None, local
+    return (_find_video(local) if os.path.isdir(local) else local), local
+
+
+_NOT_VISIBLE = {}          # tmdb_id -> consecutive sweeps its completed path wasn't visible
+NOT_VISIBLE_MAX = 10       # ~10 min at the 1-min promote cadence, then stop waiting forever
+
+
+def promote_completed(cfg=None):
+    """Fast sweep: every download that reached 100% leaves 'downloading' NOW and joins the
+    merge queue. Cheap (one qB poll, no ffmpeg) so it runs every minute — the UI never shows
+    a finished torrent as 'downloading', and the freed slot lets a new release start."""
+    cfg = cfg or core.load_config()
+    if not (cfg.get("enabled") and cfg.get("scope_films", True)):
+        return 0
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        torrents = qb.torrents(cfg["qb_category"])
+    except Exception as e:
+        core.log(f"promote: qB error {e}"); return 0
+    by_hash = {t["hash"]: t for t in torrents}
+    queued = 0
+    for mv in core.get_movies("downloading"):
+        tmdb = str(mv["tmdb_id"])
+        t = by_hash.get(mv.get("dl_hash"))
+        if not t:
+            t = next((x for x in torrents
+                      if _owns(x.get("save_path", "") + x.get("content_path", ""), tmdb)), None)
+        if not t or (t.get("progress", 0) or 0) < 1.0:
+            continue
+        vid, local = _resolve_donor_video(mv, t, cfg)
+        if vid:
+            _NOT_VISIBLE.pop(mv["tmdb_id"], None)
+            if core.claim_movie(mv["tmdb_id"], "downloading", "ready",
+                                en_file=vid, progress="queued for merge"):
+                queued += 1
+                core.log(f"queued {mv['tmdb_id']}: download complete -> merge queue")
+        elif os.path.exists(local):
+            # complete but no usable video (archive-only / wrong layout) -> try another release
+            core.log(f"promote {mv['tmdb_id']}: complete but no video in {local} -> re-searching")
+            reject_and_retry(mv["tmdb_id"], "download complete but no video file", cfg)
+        else:
+            # path not visible (mount race) — retry, but don't wait forever holding a slot
+            miss = _NOT_VISIBLE.get(mv["tmdb_id"], 0) + 1
+            _NOT_VISIBLE[mv["tmdb_id"]] = miss
+            if miss >= NOT_VISIBLE_MAX:
+                _NOT_VISIBLE.pop(mv["tmdb_id"], None)
+                core.set_status(mv["tmdb_id"], "error", progress="",
+                                error=f"download complete but {local} never became visible")
+                core.log(f"promote {mv['tmdb_id']}: path never appeared -> error")
+    if queued:
+        MERGE_WAKE.set()                       # wake the worker immediately
+    return queued
+
+
 def _owns(paths, tmdb):
     """Does the concatenated qB path string belong to this movie? Savepath is exactly
     `{qb_download_dir}/{tmdb_id}`, so match a whole `/{tmdb}` segment — a bare substring test
@@ -973,7 +1104,9 @@ def _owns(paths, tmdb):
 
 
 def stage_finish(cfg=None):
-    """Poll qB for completed audio-merge downloads, resolve the EN file, merge."""
+    """Reconcile movie downloads against qB and queue completed ones for merging. This NEVER
+    merges inline — the background worker does that — so the cycle stays fast and one big
+    season pack can't stall every other completed download behind it."""
     cfg = cfg or core.load_config()
     if not cfg["enabled"]:
         return
@@ -997,37 +1130,24 @@ def stage_finish(cfg=None):
                 core.set_status(mv["tmdb_id"], "pending", dl_hash=None, dl_id=None, en_file=None, error=None)
                 core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued")
             continue
-        if t.get("progress", 0) < 1.0:
-            if _is_stalled(t, cfg):
-                drop_stalled(mv, t, cfg)
-            continue
-        # locate the donor: prefer qB's reported path (works for both the legacy /downloads
-        # layout and the new .Téléchargements one), fall back to <downloads_mount>/<tmdb>.
-        save = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
-        local = save if (save and os.path.exists(save)) else os.path.join(cfg["downloads_mount"], str(mv["tmdb_id"]))
-        exists = os.path.exists(local)
-        vid = (_find_video(local) if os.path.isdir(local) else local) if exists else None
-        if not vid:
-            if not exists:
-                # download path not visible yet (mount race / path lag) — leave it, retry next cycle
-                core.log(f"stage_finish {mv['tmdb_id']}: complete but path {local} not visible yet -> waiting")
-                continue
-            # complete but genuinely no usable video (wrong layout / archive-only) -> don't sit here
-            # forever holding a slot: blocklist this release and grab another (sync_fail after retries).
-            core.log(f"stage_finish {mv['tmdb_id']}: complete but no video in {local} -> blocklisting, re-searching")
-            reject_and_retry(mv["tmdb_id"], "download complete but no video file", cfg)
-            continue
-        core.set_status(mv["tmdb_id"], "ready", en_file=vid)
-        merge_movie(mv["tmdb_id"], cfg)
-    # resume merges interrupted by a restart/crash: stuck at 'merging' but not updated recently
-    # (an active merge bumps `updated` every window via the progress field).
+        if (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
+            drop_stalled(mv, t, cfg)
+    # completed downloads -> merge queue (also runs on its own fast timer)
+    promote_completed(cfg)
+    # re-queue merges interrupted by a restart/crash: stuck at 'merging' but not updated
+    # recently (an active merge bumps `updated` every window via the progress field). Skip
+    # anything the worker is merging RIGHT NOW — a long remux writes no progress.
+    live = _merging_now()
     for mv in core.get_movies("merging"):
+        if f"m{mv['tmdb_id']}" in live:
+            continue
         if time.time() - (mv.get("updated") or 0) < 900:     # <15min -> probably still running
             continue
         en, fr = mv.get("en_file"), mv.get("french_path")
         if en and fr and os.path.exists(en) and os.path.exists(fr):
-            core.log(f"resume {mv['tmdb_id']}: stale merge -> re-merging")
-            merge_movie(mv["tmdb_id"], cfg)
+            core.set_status(mv["tmdb_id"], "ready", progress="re-queued after interruption")
+            core.log(f"resume {mv['tmdb_id']}: stale merge -> back on the merge queue")
+            MERGE_WAKE.set()
         else:
             core.set_status(mv["tmdb_id"], "pending", progress="",
                             error="merge interrupted and source file missing")

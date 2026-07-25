@@ -250,8 +250,23 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
 const STATES = ["pending","searching","no_release","grabbed","downloading",
   "ready","merging","merged","review","sync_fail","error","ignored"];
 
+// `ready` means "download finished, waiting its turn to merge" — say that, don't say "ready"
+const STATE_LABEL: Record<string, string> = { ready: "queued" };
+
 function Pill({ s }: { s: string }) {
-  return <span className={`pill ${s}`}>{s.replace("_", " ")}</span>;
+  return <span className={`pill ${s}`}>{STATE_LABEL[s] ?? s.replace("_", " ")}</span>;
+}
+
+// ordinal for the merge-queue position: 1 -> "next up", 2 -> "2nd in line", …
+const queueLabel = (pos?: number | null) => {
+  if (!pos) return "queued for merge";
+  if (pos === 1) return "next up to merge";
+  const s = ["th", "st", "nd", "rd"][(pos % 100 - 20) % 10] || ["th", "st", "nd", "rd"][pos % 100] || "th";
+  return `queued for merge · ${pos}${s} in line`;
+};
+
+function QueuedLine({ pos }: { pos?: number | null }) {
+  return <div className="sub queued">⏳ {queueLabel(pos)}</div>;
 }
 
 // ---------------- Interactive release search modal ----------------
@@ -351,6 +366,7 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
           <MovieActions m={m} busy={busy} act={act} onRelease={onRelease} onTune={onTune} />
         </div>
         {m.status === "downloading" && <DownloadBar dl={dl} />}
+        {m.status === "ready" && <QueuedLine />}
         {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
         {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
         {m.error && <div className="sub bad">{m.error}</div>}
@@ -447,6 +463,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                   {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
                 {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
                 {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
+                {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
                 {a.status === "merging" && a.progress &&
                   <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
               </div>
@@ -592,6 +609,7 @@ function Films() {
                     <td style={{ minWidth: 150 }}><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
                       <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
                       {m.status === "downloading" && <DownloadBar dl={dlOf(m)} />}
+                      {m.status === "ready" && <QueuedLine />}
                       {m.status === "merging" && m.progress &&
                       <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}</td>
                     <td>{m.candidate_title
@@ -681,6 +699,7 @@ function Series({ anime }: { anime: boolean }) {
             <td style={{ minWidth: 140 }}><Pill s={e.status} />
               {e.ai_status && <AiPill s={e.ai_status} />}
               {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
+              {e.status === "ready" && <QueuedLine />}
               {e.status === "merging" && e.progress &&
               <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
               {e.error && <div className="sub bad">{e.error}</div>}

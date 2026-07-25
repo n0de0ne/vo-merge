@@ -1,8 +1,26 @@
-"""APScheduler: runs the two pipeline stages on configurable intervals."""
+"""APScheduler: runs the pipeline stages on configurable intervals, plus the merge worker."""
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from . import core, pipeline, tv
 
 _sched = BackgroundScheduler(daemon=True)
+_merge_thread = None
+
+
+def _promote_job():
+    """Fast + cheap: move every download that hit 100% out of 'downloading' and onto the merge
+    queue. Runs on its own short timer (and never behind FINISH_LOCK) so a finished torrent is
+    reflected in the UI within a minute and its grab slot is freed immediately."""
+    try:
+        cfg = core.load_config()
+        if not cfg.get("enabled"):
+            return
+        if cfg.get("scope_films", True):
+            pipeline.promote_completed(cfg)
+        if cfg.get("scope_series"):
+            tv.promote_completed(cfg)
+    except Exception as e:
+        core.log(f"promote_job error: {e}")
 
 
 def _search_job():
@@ -62,6 +80,7 @@ def _stall_job():
 
 
 def start():
+    global _merge_thread
     cfg = core.load_config()
     _sched.add_job(_search_job, "interval", minutes=cfg["search_interval_min"],
                    id="search", replace_existing=True)
@@ -69,7 +88,14 @@ def start():
                    id="finish", replace_existing=True)
     _sched.add_job(_stall_job, "interval", minutes=cfg.get("stall_check_interval_min", 3),
                    id="stall", replace_existing=True)
+    _sched.add_job(_promote_job, "interval", minutes=cfg.get("promote_interval_min", 1),
+                   id="promote", replace_existing=True)
     _sched.start()
+    # single background merger: drains the 'ready' queue one item at a time, forever
+    if _merge_thread is None or not _merge_thread.is_alive():
+        _merge_thread = threading.Thread(target=pipeline.merge_worker, name="merge-worker",
+                                         daemon=True)
+        _merge_thread.start()
     core.log("scheduler started")
 
 
@@ -78,3 +104,4 @@ def reschedule():
     _sched.reschedule_job("search", trigger="interval", minutes=cfg["search_interval_min"])
     _sched.reschedule_job("finish", trigger="interval", minutes=cfg["finish_interval_min"])
     _sched.reschedule_job("stall", trigger="interval", minutes=cfg.get("stall_check_interval_min", 3))
+    _sched.reschedule_job("promote", trigger="interval", minutes=cfg.get("promote_interval_min", 1))

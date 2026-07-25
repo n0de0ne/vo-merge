@@ -11,10 +11,11 @@ from . import core
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_LOCK, FR_DUB,
-                       EN_OK, EN_AUDIO, RES, SRC)
+                       EN_OK, EN_AUDIO, RES, SRC, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
+_TV_NOT_VISIBLE = {}      # dl_hash -> consecutive sweeps its completed path wasn't visible
 
 
 def _parse_se(relpath):
@@ -565,42 +566,83 @@ def sweep_stalled(cfg=None):
             _drop_stalled_eps(eps, t, cfg)
 
 
-def stage_finish(cfg=None):
+_PACK_HINT = {}      # dl_hash -> (offset, drift) learned from the first episode of a pack
+
+
+def _pack_done(h):
+    """Has every episode served by this donor reached a terminal state?"""
+    with core.db() as c:
+        sts = [r["status"] for r in
+               c.execute("SELECT status FROM episodes WHERE dl_hash=?", (h,))]
+    return bool(sts) and all(s in ("merged", "ignored") for s in sts)
+
+
+def free_donor_if_done(h, cfg, qb=None):
+    """A season pack feeds many episodes: free the donor only once EVERY episode it serves has
+    reached a terminal state. Called after each episode merge (the worker merges them one at a
+    time, so this is what actually releases pack disk now)."""
+    if not h or not _pack_done(h):
+        return
+    try:
+        if qb is None:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        _free_donor(qb, h, cfg, tag=f"tv pack {str(h)[:12]}")
+    except Exception as e:
+        core.log(f"tv donor free {str(h)[:12]} failed: {e}")
+
+
+def merge_ready_episode(ep_id, cfg=None):
+    """Merge one queued episode. Reuses the pack's learned A/V offset so the 2nd..Nth episode
+    of a season pack skips full sync detection (the hint used to live in a local variable of
+    the inline finish loop; it's now cached per donor hash so the worker keeps the speedup)."""
+    cfg = cfg or core.load_config()
+    ep = core.get_episode(ep_id)
+    if not ep:
+        return
+    en = ep.get("en_file")
+    if not en or not os.path.exists(en):
+        core.set_ep_status(ep_id, "error", progress="", error="merge: donor file missing")
+        return
+    h = ep.get("dl_hash")
+    res = _merge_episode(ep, en, cfg, hint=_PACK_HINT.get(h))
+    if res and res[0] is not None and h:
+        _PACK_HINT[h] = res
+    free_donor_if_done(h, cfg)
+
+
+def promote_completed(cfg=None):
+    """Fast sweep: map completed pack/episode downloads onto episodes and queue them for
+    merging. No ffmpeg here — just a qB poll and a directory walk."""
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
-        return
-    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+        return 0
     try:
-        qb.login()
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
         torrents = {t["hash"]: t for t in qb.torrents(cfg["qb_tv_category"])}
     except Exception as e:
-        core.log(f"tv finish: qB error {e}"); return
-    downloading = core.get_episodes("downloading")
-    # group episodes by their torrent hash; map each completed torrent's files to episodes
+        core.log(f"tv promote: qB error {e}"); return 0
     by_hash = defaultdict(list)
-    for e in downloading:
+    for e in core.get_episodes("downloading"):
         by_hash[e.get("dl_hash")].append(e)
-    # merge anime packs first (priority on the Anime library)
-    def _order(item):
-        h, eps = item
-        return 0 if any((e.get("series_type") or "") == "anime" for e in eps) else 1
-    for h, eps in sorted(by_hash.items(), key=_order):
+    queued = 0
+    for h, eps in by_hash.items():
         t = torrents.get(h)
-        if not t:
-            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
-            for e in eps:
-                core.set_ep_status(e["id"], "pending", dl_hash=None, dl_id=None,
-                                   en_file=None, error=None, progress="")
-            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) -> re-queued")
+        if not t or (t.get("progress", 0) or 0) < 1.0:
             continue
-        if t.get("progress", 0) < 1.0:
-            if _is_stalled(t, cfg):
-                _drop_stalled_eps(eps, t, cfg)
-            continue
-        save = (t.get("content_path") or t.get("save_path") or "")
-        local = _qb_to_local(save, cfg)         # qB's /data path -> our /media view
-        # index EVERY downloaded video file by (season,episode) — parse handles anime layouts
+        local = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
         root = local if os.path.isdir(local) else os.path.dirname(local)
+        if not os.path.isdir(root):
+            miss = _TV_NOT_VISIBLE.get(h, 0) + 1
+            _TV_NOT_VISIBLE[h] = miss
+            if miss >= NOT_VISIBLE_MAX:
+                _TV_NOT_VISIBLE.pop(h, None)
+                for e in eps:
+                    core.set_ep_status(e["id"], "error", progress="",
+                                       error=f"download complete but {root} never became visible")
+                core.log(f"tv promote: {str(h)[:12]} path never appeared -> error")
+            continue
+        _TV_NOT_VISIBLE.pop(h, None)
+        # index EVERY downloaded video file by (season,episode) — parse handles anime layouts
         files = {}
         for r, _, fs in os.walk(root):
             for f in fs:
@@ -615,40 +657,81 @@ def stage_finish(cfg=None):
         sid = eps[0]["series_id"]
         gap = {(x["season"], x["episode"]): x for x in core.get_episodes()
                if x["series_id"] == sid and x["status"] not in ("merged", "ignored")}
-        merged_any = False
-        pack_hint = None                            # offset learned from this pack's first episode
+        claimed = 0
         for (s, ep), vid in sorted(files.items()):
             tgt = gap.get((s, ep))
-            if not tgt:
-                continue
-            core.set_ep_status(tgt["id"], "ready", en_file=vid, dl_hash=t["hash"], dl_id=eps[0].get("dl_id"))
-            res = _merge_episode(core.get_episode(tgt["id"]), vid, cfg, hint=pack_hint)
-            if res and res[0] is not None:          # reuse this pack's offset for the next episode
-                pack_hint = res
-            merged_any = True
-        if not merged_any:
-            if os.path.isdir(root) and not files:
-                # complete, dir present, but ZERO parseable video -> dead release: don't hold the
-                # slot forever; blocklist it for these episodes and re-search a better release.
-                core.log(f"tv finish: {t['name'][:50]} complete but no video files -> blocklisting, re-searching")
-                _drop_stalled_eps(eps, t, cfg)
-                continue
-            core.log(f"tv finish: {t['name'][:50]} complete but no files mapped to episodes "
-                     f"(parsed {sorted(files.keys())[:6]})")
-        # a season pack feeds many episodes: only free the donor once EVERY episode it serves
-        # has reached a terminal state (merged/ignored). Otherwise keep it for the rest.
-        served = [e for e in core.get_episodes() if e.get("dl_hash") == h]
-        if served and all(e["status"] in ("merged", "ignored") for e in served):
-            _free_donor(qb, h, cfg, tag=f"tv {t['name'][:40]}")
-    # resume episode merges interrupted by a restart/crash (stuck 'merging', not updated recently)
+            if not tgt or tgt["status"] in ("ready", "merging"):
+                continue                       # already queued or being merged — don't disturb
+            # conditional on the status we just read: if the worker claimed it in between,
+            # this fails and we leave the live merge alone (never re-queue a merging episode)
+            if core.claim_episode(tgt["id"], tgt["status"], "ready", en_file=vid,
+                                  dl_hash=t["hash"], dl_id=eps[0].get("dl_id"),
+                                  progress="queued for merge"):
+                claimed += 1
+        if claimed:
+            queued += claimed
+            core.log(f"tv queued: {t['name'][:50]} -> {claimed} episode(s) on the merge queue")
+        elif not files:
+            # complete, dir present, but ZERO parseable video -> dead release
+            core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")
+            _drop_stalled_eps(eps, t, cfg)
+        else:
+            # Files parsed but none matched a gap episode — almost always a numbering mismatch
+            # (absolute vs season, e.g. a "Complete Collection S01-S04" pack). This used to log
+            # forever while the pack squatted a slot; surface it for review/AI instead.
+            for e in eps:
+                core.set_ep_status(e["id"], "error", progress="",
+                                   error=f"download complete but no episode files matched "
+                                         f"(parsed {sorted(files.keys())[:6]})")
+            core.log(f"tv promote: {t['name'][:50]} complete but no files mapped to episodes "
+                     f"(parsed {sorted(files.keys())[:6]}) -> error")
+    if queued:
+        MERGE_WAKE.set()
+    return queued
+
+
+def stage_finish(cfg=None):
+    """Reconcile episode downloads against qB and queue completed ones. Never merges inline —
+    the background worker drains the queue."""
+    cfg = cfg or core.load_config()
+    if not (cfg["enabled"] and cfg["scope_series"]):
+        return
+    qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    try:
+        qb.login()
+        torrents = {t["hash"]: t for t in qb.torrents(cfg["qb_tv_category"])}
+    except Exception as e:
+        core.log(f"tv finish: qB error {e}"); return
+    by_hash = defaultdict(list)
+    for e in core.get_episodes("downloading"):
+        by_hash[e.get("dl_hash")].append(e)
+    for h, eps in by_hash.items():
+        t = torrents.get(h)
+        if not t:
+            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
+            for e in eps:
+                core.set_ep_status(e["id"], "pending", dl_hash=None, dl_id=None,
+                                   en_file=None, error=None, progress="")
+            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) -> re-queued")
+            continue
+        if (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
+            _drop_stalled_eps(eps, t, cfg)
+    promote_completed(cfg)
+    # sweep: free any donor still in qB whose episodes have all finished (covers a pack whose
+    # last episode merged after the previous cycle looked at it)
+    for h in list(torrents):
+        free_donor_if_done(h, cfg, qb)
+    # re-queue episode merges interrupted by a restart/crash (skip live worker merges)
     import time as _t
+    live = _merging_now()
     for e in core.get_episodes("merging"):
-        if _t.time() - (e.get("updated") or 0) < 900:
+        if f"e{e['id']}" in live or _t.time() - (e.get("updated") or 0) < 900:
             continue
         en, fr = e.get("en_file"), e.get("french_path")
         if en and fr and os.path.exists(en) and os.path.exists(fr):
-            core.log(f"resume {e['id']}: stale merge -> re-merging")
-            _merge_episode(core.get_episode(e["id"]), en, cfg)
+            core.set_ep_status(e["id"], "ready", progress="re-queued after interruption")
+            core.log(f"resume {e['id']}: stale merge -> back on the merge queue")
+            MERGE_WAKE.set()
         else:
             core.set_ep_status(e["id"], "pending", progress="",
                                error="merge interrupted and source file missing")

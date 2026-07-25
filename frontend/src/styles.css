@@ -45,7 +45,10 @@ td .sub { color: var(--muted); font-size: 12px; }
 .pill.sync_fail { background: #4a3318; color: #ffc06b; }
 .pill.downloading, .pill.merging { background: #15324f; color: #6fb6ff; }
 .pill.no_release, .pill.ignored { background: #2a313b; color: #9aa6b4; }
-.pill.pending, .pill.searching, .pill.grabbed, .pill.ready { background: #3a3622; color: #e6d27a; }
+.pill.pending, .pill.searching, .pill.grabbed { background: #3a3622; color: #e6d27a; }
+/* download finished, waiting its turn in the merge queue */
+.pill.ready { background: #123a3a; color: #5fe3d8; }
+.sub.queued { color: #5fe3d8; }
 .pill.review { background: #3a2a4a; color: #c9a6ff; }
 /* AI-review status (secondary pill, orthogonal to pipeline status) */
 .pill.ai_pending { background: #16324a; color: #6fb6ff; }

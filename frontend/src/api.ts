@@ -30,6 +30,7 @@ export interface Candidate {
 export interface DashActive {
   kind: string; key: string; title: string; sub?: string | null; status: string;
   progress?: string | null; dl_hash?: string | null; poster?: string | null; count: number;
+  queue_pos?: number | null;   // place in the merge queue while status is 'ready'
 }
 export interface DashAttention {
   kind: string; key: string; title: string; status: string; error?: string | null;

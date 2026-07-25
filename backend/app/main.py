@@ -355,7 +355,7 @@ def dashboard():
     now = time.time()
     ACTIVE = ("grabbed", "downloading", "ready", "merging")
     ATTN = ("review", "sync_fail", "error")
-    order = {s: i for i, s in enumerate(("merging", "downloading", "ready", "grabbed"))}
+    order = {s: i for i, s in enumerate(("merging", "ready", "downloading", "grabbed"))}
     qa, qn = ",".join("?" * len(ACTIVE)), ",".join("?" * len(ATTN))
     with core.db() as c:
         mcounts = {r["status"]: r["n"] for r in c.execute(
@@ -363,9 +363,15 @@ def dashboard():
         ecounts = {r["status"]: r["n"] for r in c.execute(
             "SELECT status, COUNT(*) n FROM episodes GROUP BY status")}
 
+        # merge-queue position (1 = next up) so a finished download can say where it stands
+        qpos = {}
+        for i, (kind, rid, _ts) in enumerate(pipeline.merge_queue(cfg), start=1):
+            qpos[f"{'m' if kind == 'movie' else 'e'}{rid}"] = i
+
         active = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
                    "sub": r["candidate_title"], "status": r["status"], "progress": r["progress"],
-                   "dl_hash": r["dl_hash"], "poster": r["poster"], "count": 1}
+                   "dl_hash": r["dl_hash"], "poster": r["poster"], "count": 1,
+                   "queue_pos": qpos.get(f"m{r['tmdb_id']}")}
                   for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qa})", ACTIVE)]
         # episodes: fold season-pack siblings (same torrent + status) into one row
         packs = {}
@@ -373,17 +379,21 @@ def dashboard():
                            "ORDER BY series_title, season, episode", ACTIVE):
             e = dict(r)
             k = (e["series_title"], e["season"], e["status"], e["dl_hash"] or e["id"])
-            g = packs.setdefault(k, {"e": e, "eps": [], "progress": None})
+            g = packs.setdefault(k, {"e": e, "eps": [], "ids": [], "progress": None})
             g["eps"].append(e["episode"])
+            g["ids"].append(e["id"])
             g["progress"] = g["progress"] or e.get("progress")
         for g in packs.values():
             e, eps = g["e"], sorted(g["eps"])
             rng = f"E{eps[0]:02d}" + (f"–E{eps[-1]:02d}" if len(eps) > 1 else "")
+            # a folded pack row reports the best (soonest) position among its episodes
+            pos = [p for p in (qpos.get(f"e{i}") for i in g["ids"]) if p]
             active.append({"kind": "episode", "key": f"e{e['id']}",
                            "title": f"{e['series_title']} S{e['season']:02d} {rng}",
                            "sub": e["candidate_title"], "status": e["status"],
                            "progress": g["progress"], "dl_hash": e["dl_hash"],
-                           "poster": e["poster"], "count": len(eps)})
+                           "poster": e["poster"], "count": len(eps),
+                           "queue_pos": min(pos) if pos else None})
         active.sort(key=lambda x: (order.get(x["status"], 9), x["title"]))
 
         attention = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
