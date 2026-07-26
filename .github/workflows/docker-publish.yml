@@ -31,7 +31,14 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/vo-merge
+          # Pinned to a literal owner ON PURPOSE. This used to be
+          # ghcr.io/${{ github.repository_owner }}/vo-merge, which silently followed an account
+          # rename: builds moved to the new path while the Unraid template kept pulling the old
+          # one. GHCR does NOT redirect a renamed owner the way git repos do, so the old path
+          # just starts answering "manifest unknown" and the server quietly runs a stale image.
+          # If the account is ever renamed again, change this line and the Unraid template
+          # together.
+          images: ghcr.io/n0de0ne/vo-merge
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}

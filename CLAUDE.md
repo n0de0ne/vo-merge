@@ -424,4 +424,12 @@ before going back to `pending`. Two reasons that matters:
 `.github/workflows/docker-publish.yml` builds and pushes to GHCR on `main`, on `v*` tags, and on
 `claude/**` branches, so a feature branch can be pulled onto Unraid before it merges. Only `main`
 publishes `:latest`; a branch build is tagged with its sanitised branch name
-(`ghcr.io/alanstrok/vo-merge:claude-<branch>`).
+(`ghcr.io/n0de0ne/vo-merge:claude-<branch>`).
+
+**The image name is pinned to a literal owner on purpose.** It used to be
+`ghcr.io/${{ github.repository_owner }}/vo-merge`, which silently followed the `alanstrok` →
+`n0de0ne` account rename: new builds went to the new path while the Unraid template kept pulling
+the old one. **GHCR does not redirect a renamed owner the way git repos do** — the old path
+answers `manifest unknown`, Unraid reports `TOTAL DATA PULLED: 0 B`, and the server keeps running
+a stale image with no obvious error. If the account is renamed again, change the workflow and the
+Unraid template together.
