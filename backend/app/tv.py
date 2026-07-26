@@ -164,7 +164,8 @@ def scan(cfg=None):
     for s in son.series():
         if tagid is not None and not by_files and tagid not in s.get("tags", []):
             continue
-        if (s.get("originalLanguage") or {}).get("name") == "French":
+        if cfg.get("exclude_french_origin", True) and \
+           (s.get("originalLanguage") or {}).get("name") == "French":
             continue
         if pilot and s["title"] not in pilot:
             continue

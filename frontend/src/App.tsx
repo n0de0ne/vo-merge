@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash } from "./api";
+import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -289,6 +289,39 @@ function Tracks({ a, s, na, ns }:
       {na && <span className="needs">+ {na} audio</span>}
       {ns && <span className="needs">+ {ns} subs</span>}
     </div>
+  );
+}
+
+// Re-read every library file with mkvmerge and re-decide the gaps. Covers films, series and
+// anime in one pass regardless of the enabled scopes, and takes minutes on a big library — so
+// it reports live progress rather than looking hung.
+function RescanButton() {
+  const [st, setSt] = useState<RescanState | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000, [st?.running]);
+
+  async function go() {
+    setBusy(true);
+    try { await api.rescan(true); await api.rescanState().then(setSt); }
+    finally { setBusy(false); }
+  }
+  const done = st && !st.running && st.finished > 0;
+  return (
+    <>
+      <button className="btn sec" disabled={busy || !!st?.running} onClick={go}
+        title="Re-read EVERY library file with mkvmerge — films, series and anime — and re-decide
+               what each one is missing. Takes a few minutes the first time.">
+        {st?.running ? "Re-reading…" : "Re-read files"}
+      </button>
+      {st?.running &&
+        <span className="muted">probing {st.phase === "films" ? "films" : "series & anime"}
+          {st.films != null && <> · {st.films} film gap(s)</>}</span>}
+      {done && !st.error &&
+        <span className="muted">last re-read: {st.films ?? "?"} film · {st.episodes ?? "?"} episode
+          gap(s) · {st.probes.cached} file(s) cached
+          {st.probes.unreadable > 0 && <span className="bad"> · {st.probes.unreadable} unreadable</span>}</span>}
+      {st?.error && <span className="bad">rescan failed: {st.error}</span>}
+    </>
   );
 }
 
@@ -609,9 +642,7 @@ function Films() {
             title="Search every pending title now instead of waiting for the timer (grabs up to the free download slots)">
             🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
-          <button className="btn sec" disabled={busy} onClick={() => act(() => api.rescan(true))}
-            title="Re-read EVERY library file with mkvmerge and re-decide the gaps from scratch (takes a few minutes)">
-            Re-read files</button>
+          <RescanButton />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {STATES.map(s => (
@@ -833,6 +864,7 @@ function Series({ anime }: { anime: boolean }) {
             title="Search every pending episode now instead of waiting for the timer">
             🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
+          <RescanButton />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {TV_STATES.map(s => (

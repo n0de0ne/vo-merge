@@ -124,6 +124,11 @@ the gap decision itself.
 - **Probe cache** (`probes` table, keyed by path, invalidated by size+mtime) — the first pass over
   a big library costs one `mkvmerge` per file; after that only changed files are re-read. A merge
   calls `core.forget_probe()` on the files it rewrote. `POST /api/rescan?forget=true` clears it.
+- **`POST /api/rescan` covers EVERY library** — films, series and anime — and deliberately ignores
+  `scope_films`/`scope_series` and `series_pilot`. Those gate what the pipeline *acts* on; a
+  rescan only reads files and records what's missing, so limiting it to the enabled slice would
+  silently skip most of the library. Records for a disabled scope sit as inventory until it's
+  turned on. It runs in a thread (minutes on a first pass) and `GET /api/rescan` reports progress.
 - `scan` **only inserts records that have a gap** (a whole library of fine files would flood the
   pipeline), and a tracked record whose gap has since been filled is closed out as `merged`
   instead of being re-searched — which self-heals the DB from the stale-tag era.

@@ -25,6 +25,11 @@ export interface Episode {
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
+export interface RescanState {
+  running: boolean; phase: string; started: number; finished: number;
+  films: number | null; episodes: number | null; error: string | null;
+  probes: { cached: number; unreadable: number };
+}
 export interface DL {
   progress: number; dlspeed: number; eta: number; state: string;
   seeds: number; size: number; downloaded: number;
@@ -104,7 +109,8 @@ export const api = {
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
   rescan: (forget = false) =>
-    j<{ ok: boolean; started: boolean }>(`/api/rescan?forget=${forget}`, { method: "POST" }),
+    j<{ ok: boolean; started: boolean; note?: string }>(`/api/rescan?forget=${forget}`, { method: "POST" }),
+  rescanState: () => j<RescanState>("/api/rescan"),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),

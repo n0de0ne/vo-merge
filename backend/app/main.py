@@ -90,33 +90,55 @@ def do_scan():
 
 @api.post("/rescan")
 def do_rescan(forget: bool = False):
-    """Re-decide every gap from the FILES (films + series), in the background — a full library
-    probe takes minutes on the first pass. `forget=true` drops the probe cache first, so every
-    file is re-read even if its size and mtime are unchanged (use after fixing tags by hand)."""
+    """Re-decide every gap from the FILES, across EVERY library — films, series and anime — in
+    the background, because a full probe takes minutes on the first pass.
+
+    Deliberately ignores `scope_films`/`scope_series` and `series_pilot`. Those exist to control
+    what the pipeline *acts* on; a rescan only reads files and records what's missing, and an
+    operator asking to re-read the library means the whole library, not the slice currently
+    enabled. Records for a disabled scope simply sit as inventory until it's turned on.
+
+    `forget=true` drops the probe cache first, so every file is re-read even when its size and
+    mtime are unchanged (use after fixing track tags by hand)."""
     import threading
     from . import tv
 
     if not pipeline.SCAN_LOCK.acquire(blocking=False):
-        return {"ok": True, "started": False, "note": "a scan is already running"}
+        return {"ok": True, "started": False, "note": "a scan is already running",
+                "state": pipeline.SCAN_STATE}
     if forget:
         with core.db() as c:
             c.execute("DELETE FROM probes")
         core.log("rescan: probe cache cleared — every file will be re-read")
 
     def _run():
+        st = pipeline.SCAN_STATE
+        st.update(running=True, started=time.time(), finished=0, phase="films",
+                  films=None, episodes=None, error=None)
         try:
-            cfg = core.load_config()
-            if cfg.get("scope_films", True):
-                pipeline.scan(cfg)
-            if cfg.get("scope_series"):
-                tv.scan(cfg)
+            # every library, whatever the scopes say; pilot cleared so it's not 3 series
+            cfg = dict(core.load_config(), series_pilot=[])
+            st["films"] = pipeline.scan(cfg)
+            st["phase"] = "series"
+            st["episodes"] = tv.scan(cfg)
+            st["phase"] = "done"
+            core.log(f"rescan: {st['films']} film gap(s), {st['episodes']} episode gap(s)")
         except Exception as e:
+            st["error"] = str(e)
+            st["phase"] = "error"
             core.log(f"rescan error: {e}")
         finally:
+            st.update(running=False, finished=time.time())
             pipeline.SCAN_LOCK.release()
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "started": True, "probes": core.probe_stats()}
+
+
+@api.get("/rescan")
+def rescan_state():
+    """Progress of a running (or the last) rescan — it takes minutes, so the UI can say so."""
+    return {**pipeline.SCAN_STATE, "probes": core.probe_stats()}
 
 
 @api.post("/finish")
