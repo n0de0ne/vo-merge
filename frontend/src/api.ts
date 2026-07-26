@@ -8,7 +8,7 @@ export interface Movie {
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
   // read off the FILE by mkvmerge, not from Radarr/Sonarr metadata
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
-  added_subs?: string | null;
+  need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
@@ -22,7 +22,7 @@ export interface Episode {
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
   aired?: string | null;   // "S04E15" when releases number this episode differently
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
-  added_subs?: string | null;
+  need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {

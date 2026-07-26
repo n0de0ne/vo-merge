@@ -209,6 +209,23 @@ def wanted_subs(donor_info, base_info, want, limit=2):
     return out
 
 
+def wanted_audio(donor_info, base_info, want, extra=()):
+    """Donor audio tracks worth adding: a target language the base lacks. One track per language
+    (the best-channel variant), so a 3-dub release doesn't triple the file size. `extra` carries
+    the original-language VO codes, which stay eligible as the fallback when a title's original
+    language isn't in the profile and no English exists."""
+    if not donor_info:
+        return []
+    have, _ = langs(base_info)
+    ok = {norm_lang(x) for x in want} | {norm_lang(x) for x in extra}
+    out, taken = [], set(have)
+    for a in sorted(donor_info["auds"], key=lambda t: -(t.get("ch") or 0)):
+        if a["lang"] == "und" or a["lang"] in taken or a["lang"] not in ok:
+            continue
+        out.append(a); taken.add(a["lang"])
+    return sorted(out, key=lambda t: t["id"])
+
+
 # ------------------------------------------------------------------ audit (cached)
 def audit(path, refresh=False):
     """(audio langs, subtitle langs, error) for a library file, read from the container and
@@ -235,30 +252,56 @@ def _split(v):
     return {x for x in (v or "").split(",") if x}
 
 
-def gap_kind(auds, subs, orig_codes, cfg):
-    """What this file is missing: "audio", "subs", "audio+subs", or "" when nothing.
+_PROFILES = {"movie":  {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
+             "series": {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
+             "anime":  {"audio": ["fre", "eng", "jpn"], "subs": ["fre", "eng"]}}
 
-    `gap_target` decides what "not missing" means, and the two answers differ sharply for anime:
-    - **"eng"** (default) — the target is ENGLISH. A French anime rip that also carries its
-      Japanese VO is still missing English, so it's a gap. This is what the app is for, and it
-      matches the original `_no_eng()` behaviour.
-    - **"eng_or_vo"** — English *or* the title's original language counts as filled, i.e. the
-      rule the host mirror script uses to decide a file is watchable. Much more conservative:
-      every FRE+JPN anime and every foreign film already carrying its VO is left alone.
 
-    Subtitles are missing when none of `sub_langs` is present. A subs-only shortfall counts as a
-    gap only if `subs_only_gap` is on; otherwise subs ride along with an audio graft and a file
-    that merely lacks subtitles doesn't trigger a whole download on its own."""
-    has_audio = ("eng" in auds) or (
-        cfg.get("gap_target", "eng") == "eng_or_vo" and bool(orig_codes & auds))
-    need = []
-    if not has_audio:
-        need.append("audio")
+def profile(kind, cfg):
+    """The target language set for a kind of title ("movie" | "series" | "anime")."""
+    p = (cfg.get("lang_profiles") or {}).get(kind) or _PROFILES.get(kind) or _PROFILES["movie"]
+    return ([norm_lang(x) for x in (p.get("audio") or [])],
+            [norm_lang(x) for x in (p.get("subs") or [])])
+
+
+def kind_of(path, original_lang, cfg, series_type=None):
+    """Which profile applies. Sonarr's own `seriesType` is authoritative when we have it;
+    otherwise the library folder (`anime_dirs`) and then a Japanese original language, which is
+    what an anime film looks like to Radarr — it has no anime flag of its own."""
+    if (series_type or "").lower() == "anime":
+        return "anime"
+    mount = (cfg.get("media_mount") or "/media").rstrip("/")
+    top = ""
+    if path and path.startswith(mount + "/"):
+        top = path[len(mount) + 1:].split(os.sep, 1)[0]
+    if top and top in set(cfg.get("anime_dirs") or ["Anime"]):
+        return "anime"
+    if norm_lang(original_lang) == "jpn":
+        return "anime"
+    return "series" if series_type else "movie"
+
+
+def gap_langs(auds, subs, kind, cfg):
+    """(missing audio codes, missing subtitle codes) against the kind's target profile.
+
+    `und` is not a language, so it never satisfies a target — see the module docstring. A
+    subtitle shortfall on its own is only reported when `subs_only_gap` is on; otherwise subs
+    ride along with an audio graft and a file that merely lacks subtitles doesn't trigger a
+    whole download by itself."""
+    want_a, want_s = profile(kind, cfg)
+    miss_a = [c for c in want_a if c not in auds]
+    miss_s = []
     if cfg.get("want_subs", True):
-        want = {norm_lang(x) for x in (cfg.get("sub_langs") or ["eng"])}
-        if want and not (want & subs) and (need or cfg.get("subs_only_gap", False)):
-            need.append("subs")
-    return "+".join(need)
+        miss_s = [c for c in want_s if c not in subs]
+        if miss_s and not miss_a and not cfg.get("subs_only_gap", False):
+            miss_s = []
+    return miss_a, miss_s
+
+
+def gap_kind(auds, subs, kind, cfg):
+    """Coarse label for `gap_langs`: "audio", "subs", "audio+subs", or "" when nothing."""
+    a, s = gap_langs(auds, subs, kind, cfg)
+    return "+".join([x for x in (("audio" if a else ""), ("subs" if s else "")) if x])
 
 
 # ------------------------------------------------------------------ path mapping

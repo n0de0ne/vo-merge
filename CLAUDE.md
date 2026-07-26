@@ -100,16 +100,25 @@ the gap decision itself.
   the file reads as a gap. That errs toward adding a real English track; the opposite error
   leaves a French-only file forever. **`VOSTFR`/`VOST`/`SUBFRENCH` in a filename suppress the
   French hint** — they describe the *subtitles*, so the audio is the original language.
-- **`gap_target` decides what counts as filled**, and the two answers differ sharply for anime:
-  - **`eng`** (default) — the target is ENGLISH. A French anime rip that also carries its Japanese
-    VO is still missing English, so it IS a gap. This is what the app is for, and it's what the
-    original `_no_eng()` did. It also means every foreign-language film without an English track
-    becomes a gap, so expect a large backlog on a big library (the in-flight cap throttles it).
-  - **`eng_or_vo`** — English *or* the original language counts as filled, i.e. the host mirror
-    script's "is this watchable" rule. Much more conservative: leaves every FRE+JPN anime and
-    every foreign film already carrying its VO alone.
-  The VO **merge** fallback is unaffected either way — when no English release exists, the
-  original-language track is still what gets grafted.
+- **`lang_profiles` is the target end state per kind of title**, and the gap is simply
+  *target minus present* — for both audio and subtitles:
+
+  | kind | audio | subs |
+  |---|---|---|
+  | `movie` | fre, eng | fre, eng |
+  | `series` | fre, eng | fre, eng |
+  | `anime` | fre, eng, **jpn** | fre, eng |
+
+  So a FR anime that already carries its Japanese VO is still missing English → a gap (the
+  earlier "English *or* the original language counts as filled" rule silently skipped exactly
+  those, which is the case the app exists for). The missing codes are stored per record in
+  `need_audio`/`need_subs`, shown in the UI, and are what the merge grafts.
+- **`media.kind_of`** picks the profile: Sonarr's own `seriesType == "anime"` wins, then a
+  top-level library folder in `anime_dirs`, then a Japanese original language — which is what an
+  anime *film* looks like to Radarr, since Radarr has no anime flag.
+- **`media.wanted_audio` takes only target languages the base lacks, one track per language**, so
+  a 3-dub donor doesn't triple the file size and a Spanish track nobody asked for isn't grafted.
+  The original-language VO stays eligible as the fallback when no English exists.
 - **A probe failure is not "no English."** Unreadable files are skipped and counted in the scan
   log, never guessed at.
 - **Probe cache** (`probes` table, keyed by path, invalidated by size+mtime) — the first pass over
@@ -126,7 +135,7 @@ the gap decision itself.
 Most French library files have no English subtitles, and the donor downloaded for its audio
 usually ships them — so taking them costs one extra mkvmerge argument, not another download.
 
-- `want_subs` (default on) + `sub_langs` (default `["eng"]`) + `max_sub_tracks` (default 2).
+- `want_subs` (default on) + the profile's `subs` list + `max_sub_tracks` (default 2 per language).
 - `_donor_opts()` builds the donor's track selection for both merge paths. Options precede the
   donor filename so they apply to it; the base keeps its own video, audio, subs and chapters.
 - **Subtitles get the same `--sync` as the audio** — they're timed to the donor's video, so an
@@ -302,8 +311,7 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
-Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `gap_target` (**eng**|eng_or_vo), `want_subs`/`sub_langs`/
-`max_sub_tracks`/`subs_only_gap`, `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
+Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `lang_profiles`, `anime_dirs`, `want_subs`/`max_sub_tracks`/`subs_only_gap`, `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads,
 `sync_ratio_test`/`sync_ratio_span`/`sync_ratio_min_conf`/`sync_ratio_margin` for the PAL path),

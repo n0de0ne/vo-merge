@@ -334,7 +334,9 @@ def _scan_files(cfg):
             # the only honest option; the count is logged so a systemic problem is visible.
             unreadable += 1
             continue
-        need = media.gap_kind(auds, subs, _orig_codes(lang), cfg)
+        kind = media.kind_of(fr_path, lang, cfg)
+        miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
+        need = "+".join([x for x in (("audio" if miss_a else ""), ("subs" if miss_s else "")) if x])
         alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
         existing = core.get_movie(m["tmdbId"])
         if not need:
@@ -342,11 +344,12 @@ def _scan_files(cfg):
             # if we already track it, the gap is filled — record that instead of re-searching.
             if existing and existing["status"] in ("pending", "no_release", "searching"):
                 core.set_status(m["tmdbId"], "merged", added_langs="", progress="", error=None,
-                                audio_langs=alangs, sub_langs=slangs, needs="")
+                                audio_langs=alangs, sub_langs=slangs, needs="",
+                                need_audio="", need_subs="")
                 filled += 1
             elif existing:
-                core.set_status(m["tmdbId"], existing["status"],
-                                audio_langs=alangs, sub_langs=slangs, needs="")
+                core.set_status(m["tmdbId"], existing["status"], audio_langs=alangs,
+                                sub_langs=slangs, needs="", need_audio="", need_subs="")
             continue
         poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
                        if i.get("coverType") == "poster"), None)
@@ -359,7 +362,8 @@ def _scan_files(cfg):
             "poster": poster,
         })
         core.set_status(m["tmdbId"], (existing or {}).get("status") or "pending",
-                        audio_langs=alangs, sub_langs=slangs, needs=need)
+                        audio_langs=alangs, sub_langs=slangs, needs=need,
+                        need_audio=",".join(miss_a), need_subs=",".join(miss_s))
         gaps += 1
     mount = cfg["media_mount"]
     core.log(f"scan(files): {gaps} gap(s) of {seen} movie(s) probed"
@@ -889,13 +893,14 @@ def merge_movie(tmdb_id, cfg=None):
         return _merge_movie_impl(tmdb_id, cfg)
 
 
-def _pick_subs(donor_info, base_info, cfg):
-    """Donor subtitle tracks to graft alongside the audio. English subs are missing from most
-    French library files, and the donor we already downloaded for its audio usually carries
-    them — so taking them costs one extra mkvmerge argument rather than another download."""
+def _pick_subs(donor_info, base_info, cfg, kind="movie"):
+    """Donor subtitle tracks to graft alongside the audio, per the kind's target profile.
+    English subs are missing from most French library files, and the donor we already downloaded
+    for its audio usually carries them — so taking them costs one extra mkvmerge argument rather
+    than another download."""
     if not cfg.get("want_subs", True):
         return []
-    want = [media.norm_lang(x) for x in (cfg.get("sub_langs") or ["eng"])]
+    _, want = media.profile(kind, cfg)
     return media.wanted_subs(donor_info, base_info, want, cfg.get("max_sub_tracks", 2))
 
 
@@ -968,15 +973,19 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     else:
         base, bi, donor, di, who = en, ei, fr, fi, "EN"
     have = {a["lang"] for a in bi["auds"]}
-    ids, langs, daidx = [], {}, {}
-    for ix, a in enumerate(di["auds"]):
-        if a["lang"] == "und" or a["lang"] in have:
-            continue
-        ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
+    # Take only the profile's target languages the base lacks (plus the VO fallback), one track
+    # per language — grabbing every new language would bloat the file with dubs nobody asked for.
+    kind = media.kind_of(fr, mv.get("original_lang"), cfg)
+    want_a, _ = media.profile(kind, cfg)
+    picked = media.wanted_audio(di, bi, want_a, extra=orig_codes)
+    ids = [a["id"] for a in picked]
+    langs = {a["id"]: a["lang"] for a in picked}
+    daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
+    have |= {a["lang"] for a in picked}
     if not ("eng" in have or (orig_codes & have)):
         core.set_status(tmdb_id, "error",
                         error="merge: no English or original-language (VO) audio to add"); return
-    subs = _pick_subs(di, bi, cfg)
+    subs = _pick_subs(di, bi, cfg, kind)
     if not ids and not subs:
         # base already has the wanted audio (English/VO) and needs no subtitles -> gap already
         # filled (stale vo-gap tag or a prior merge). Mark done, don't error on "nothing to add".

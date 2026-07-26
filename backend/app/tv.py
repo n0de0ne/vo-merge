@@ -12,7 +12,7 @@ from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
                        EN_OK, EN_AUDIO, RES, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _orig_codes, _pick_subs, _donor_opts)
+                       _pick_subs, _donor_opts)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -174,7 +174,8 @@ def scan(cfg=None):
             continue
         poster = next((i.get("remoteUrl") or i.get("url") for i in s.get("images", [])
                        if i.get("coverType") == "poster"), None)
-        orig = _orig_codes((s.get("originalLanguage") or {}).get("name"))
+        orig_name = (s.get("originalLanguage") or {}).get("name")
+        stype = s.get("seriesType", "standard")
         for f in files:
             mi = f.get("mediaInfo") or {}
             path = f.get("path") or ""
@@ -199,17 +200,21 @@ def scan(cfg=None):
                 if err:
                     unreadable += 1        # can't read it -> we know nothing; don't guess
                     continue
-                need = media.gap_kind(auds, subs, orig, cfg)
+                kind = media.kind_of(local, orig_name, cfg, series_type=stype)
+                miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
+                need = "+".join([x for x in (("audio" if miss_a else ""),
+                                             ("subs" if miss_s else "")) if x])
                 alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
                 cur = core.get_episode(ep_id)
                 if not need:
                     if cur and cur["status"] in ("pending", "no_release", "searching"):
                         core.set_ep_status(ep_id, "merged", added_langs="", progress="", error=None,
-                                           audio_langs=alangs, sub_langs=slangs, needs="")
+                                           audio_langs=alangs, sub_langs=slangs, needs="",
+                                           need_audio="", need_subs="")
                         filled += 1
                     elif cur:
                         core.set_ep_status(ep_id, cur["status"], audio_langs=alangs,
-                                           sub_langs=slangs, needs="")
+                                           sub_langs=slangs, needs="", need_audio="", need_subs="")
                     continue
             core.upsert_episode({
                 "id": ep_id, "series_id": s["id"],
@@ -221,7 +226,8 @@ def scan(cfg=None):
             if alangs is not None:
                 cur = core.get_episode(ep_id)
                 core.set_ep_status(ep_id, (cur or {}).get("status") or "pending",
-                                   audio_langs=alangs, sub_langs=slangs, needs=need)
+                                   audio_langs=alangs, sub_langs=slangs, needs=need,
+                                   need_audio=",".join(miss_a), need_subs=",".join(miss_s))
             n += 1
     if by_files:
         core.log(f"tv scan(files): {n} gap(s) of {seen} episode(s) probed"
@@ -635,14 +641,17 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     eq, fq = _video_quality(en_file, ei["dur"]), _video_quality(fr, fi["dur"])
     base, bi, donor, di = (fr, fi, en_file, ei) if fq >= eq else (en_file, ei, fr, fi)
     have = {a["lang"] for a in bi["auds"]}
-    ids, langs, daidx = [], {}, {}
-    for ix, a in enumerate(di["auds"]):
-        if a["lang"] == "und" or a["lang"] in have:
-            continue
-        ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
+    # only the profile's target languages the base lacks (anime keeps its JPN VO), one per lang
+    kind = media.kind_of(fr, None, cfg, series_type=ep.get("series_type") or "standard")
+    want_a, _ = media.profile(kind, cfg)
+    picked = media.wanted_audio(di, bi, want_a)
+    ids = [a["id"] for a in picked]
+    langs = {a["id"]: a["lang"] for a in picked}
+    daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
+    have |= {a["lang"] for a in picked}
     if "eng" not in have:
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
-    subs = _pick_subs(di, bi, cfg)
+    subs = _pick_subs(di, bi, cfg, kind)
     if not ids and not subs:
         # episode file already has English -> already filled (stale tag / prior merge), mark done
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")

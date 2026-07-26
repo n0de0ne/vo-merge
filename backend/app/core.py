@@ -62,15 +62,17 @@ DEFAULTS = {
     "scan_mode": "files",
     "scan_all_movies": True,               # files mode: consider EVERY Radarr movie, not just
                                            # the tagged ones (the tag is what we're replacing)
-    # What counts as "already fine":
-    #   "eng"       -> the target is English. A French anime that also carries its Japanese VO
-    #                  is STILL a gap (this is the point of the app).
-    #   "eng_or_vo" -> English or the original language counts as filled — the host mirror
-    #                  script's "is it watchable" rule. Far fewer downloads; leaves every
-    #                  FRE+JPN anime and every foreign film with its VO alone.
-    "gap_target": "eng",
-    "want_subs": True,                     # also graft the donor's subtitles for `sub_langs`
-    "sub_langs": ["eng"],                  # subtitle languages worth adding
+    # The END STATE each kind of title should reach. A file is a gap when it is missing any of
+    # these; the missing codes are recorded per record (need_audio / need_subs) and are what the
+    # merge grafts off the donor. Anime keeps its Japanese VO on top of FR+EN.
+    "lang_profiles": {
+        "movie":  {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
+        "series": {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
+        "anime":  {"audio": ["fre", "eng", "jpn"], "subs": ["fre", "eng"]},
+    },
+    "anime_dirs": ["Anime"],               # top-level library folders that mean "anime"; a
+                                           # Japanese-original title also gets the anime profile
+    "want_subs": True,                     # graft the donor's subtitles, not just its audio
     "max_sub_tracks": 2,                   # per language, keep at most this many (packs ship 6+)
     "subs_only_gap": False,                # a file that has English AUDIO but no English SUBS:
                                            # off (default) = subs ride along with an audio graft
@@ -243,6 +245,8 @@ def init_db():
                                    # what the FILE actually holds (from mkvmerge, not metadata)
                                    "audio_langs": "TEXT", "sub_langs": "TEXT",
                                    "needs": "TEXT",          # audio | subs | audio+subs
+                                   # which target languages are still missing (comma lists)
+                                   "need_audio": "TEXT", "need_subs": "TEXT",
                                    "added_subs": "TEXT"})
 
 
@@ -276,7 +280,8 @@ def init_tv():
                                      "sync_drift": "REAL",
                                      # what the FILE actually holds (see movies table)
                                      "audio_langs": "TEXT", "sub_langs": "TEXT",
-                                     "needs": "TEXT", "added_subs": "TEXT"})
+                                     "needs": "TEXT", "added_subs": "TEXT",
+                                     "need_audio": "TEXT", "need_subs": "TEXT"})
 
 
 def init_probe_cache():

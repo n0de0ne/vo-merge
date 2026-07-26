@@ -279,14 +279,15 @@ function DriftBadge({ d }: { d?: number | null }) {
 
 // What the library file actually contains, read off the file itself (not from Radarr/Sonarr
 // metadata), plus what it's still missing. `needs` is "", "audio", "subs" or "audio+subs".
-function Tracks({ a, s, needs }: { a?: string | null; s?: string | null; needs?: string | null }) {
-  if (!a && !s && !needs) return null;
-  const miss = (needs || "").split("+").filter(Boolean);
+function Tracks({ a, s, na, ns }:
+  { a?: string | null; s?: string | null; na?: string | null; ns?: string | null }) {
+  if (!a && !s && !na && !ns) return null;
   return (
     <div className="sub tracks" title="languages read from the file itself">
       🔊 {a || <span className="muted">none tagged</span>}
       {s ? <> · 💬 {s}</> : <> · <span className="muted">no subs</span></>}
-      {miss.map(k => <span key={k} className="needs">needs {k}</span>)}
+      {na && <span className="needs">+ {na} audio</span>}
+      {ns && <span className="needs">+ {ns} subs</span>}
     </div>
   );
 }
@@ -390,7 +391,7 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
         {m.status === "downloading" && <DownloadBar dl={dl} />}
         {m.status === "ready" && <QueuedLine />}
         {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
-        <Tracks a={m.audio_langs} s={m.sub_langs} needs={m.needs} />
+        <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
         {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
         <DriftBadge d={m.sync_drift} />
         {m.error && <div className="sub bad">{m.error}</div>}
@@ -661,7 +662,7 @@ function Films() {
                       ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
                       : <span className="muted">—</span>}</td>
                     <td className="muted">{m.quality || "—"}
-                      <Tracks a={m.audio_langs} s={m.sub_langs} needs={m.needs} /></td>
+                      <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} /></td>
                     <td><MovieActions m={m} busy={busy} act={act} onRelease={setRelease} onTune={setTune} /></td>
                   </tr>
                 ))}
@@ -762,7 +763,7 @@ function Series({ anime }: { anime: boolean }) {
               {e.status === "ready" && <QueuedLine />}
               {e.status === "merging" && e.progress &&
               <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
-              <Tracks a={e.audio_langs} s={e.sub_langs} needs={e.needs} />
+              <Tracks a={e.audio_langs} s={e.sub_langs} na={e.need_audio} ns={e.need_subs} />
               {e.error && <div className="sub bad">{e.error}</div>}
               {e.ai_verdict && <div className="sub" title={e.ai_verdict}>🤖 {e.ai_verdict}</div>}</td>
             <td>{e.candidate_title
@@ -1033,7 +1034,7 @@ function Settings() {
     for (const key of ["en_indexer_ids", "multi_indexer_ids"])
       if (key in data && typeof data[key] === "string")
         data[key] = data[key].split(",").map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !isNaN(n));
-    for (const key of ["series_pilot", "sub_langs"])
+    for (const key of ["series_pilot", "anime_dirs"])
       if (key in data && typeof data[key] === "string")
         data[key] = data[key].split(",").map((x: string) => x.trim()).filter(Boolean);
     await api.saveSettings(data); setSaved(true); setChanged({});
@@ -1044,6 +1045,18 @@ function Settings() {
     const r = await api.test(which);
     setTests({ ...tests, [which]: r.ok ? "ok" : (r.error || "failed") });
   }
+
+  // lang_profiles is nested ({movie:{audio:[],subs:[]}, …}); edit it as comma-separated text
+  // and keep the whole object in `changed` so save() sends it in one piece.
+  const prof = (kind: string, which: "audio" | "subs") => {
+    const v = (val("lang_profiles") || {})[kind]?.[which];
+    return Array.isArray(v) ? v.join(", ") : (v ?? "");
+  };
+  const setProf = (kind: string, which: "audio" | "subs", text: string) => {
+    const all = JSON.parse(JSON.stringify(val("lang_profiles") || {}));
+    all[kind] = { ...(all[kind] || {}), [which]: text.split(",").map(x => x.trim()).filter(Boolean) };
+    set("lang_profiles", all);
+  };
 
   const Text = (k: string, type = "text") =>
     <input type={type} value={val(k) ?? ""} onChange={e => set(k, type === "number" ? Number(e.target.value) : e.target.value)} />;
@@ -1119,25 +1132,38 @@ function Settings() {
           stale tag or an un-analysed file can't hide a gap</span>
         <label>Scan all films</label>{Check("scan_all_movies")}
         <span className="muted">files mode: consider every Radarr film, not just vo-gap tagged ones</span>
-        <label>Counts as filled</label>
-        <select value={val("gap_target") ?? "eng"} onChange={e => set("gap_target", e.target.value)}>
-          <option value="eng">English audio only</option>
-          <option value="eng_or_vo">English or original language</option>
-        </select>
-        <span className="muted">"English only": a FR anime that already has its Japanese track is
-          still a gap — it gets hunted for an English dub. "English or original": that file counts
-          as fine and is left alone (far fewer downloads)</span>
         <label>Add subtitles</label>{Check("want_subs")}
         <span className="muted">take the donor's subtitles while grafting its audio</span>
-        <label>Subtitle languages</label>
-        <input type="text" value={Array.isArray(val("sub_langs")) ? val("sub_langs").join(", ") : (val("sub_langs") ?? "")}
-          onChange={e => set("sub_langs", e.target.value)} />
-        <span className="muted">comma-sep 3-letter codes, e.g. eng</span>
         <label>Max sub tracks</label>{Text("max_sub_tracks", "number")}
         <span className="muted">per language (packs ship 6+: full, forced, SDH, signs…)</span>
         <label>Chase subs alone</label>{Check("subs_only_gap")}
-        <span className="muted">download a release for a file that already has English audio but
-          no English subs — off by default, this adds a lot of downloads</span>
+        <span className="muted">download a release for a file that already has every target
+          audio language but is missing a target subtitle — off by default, this adds a lot of
+          downloads</span>
+      </div>
+
+      <div className="section-title">Language targets</div>
+      <div className="muted" style={{ margin: "-4px 0 10px" }}>
+        The end state each kind of title should reach. A file missing any of these is a gap, and
+        the missing languages are what gets grafted off the donor. Comma-separated 3-letter codes.
+      </div>
+      <div className="form-grid">
+        {(["movie", "series", "anime"] as const).flatMap(kind => [
+          <label key={`${kind}-a`}>{kind === "movie" ? "Films" : kind === "series" ? "TV shows" : "Anime"} — audio</label>,
+          <input key={`${kind}-ai`} type="text" value={prof(kind, "audio")}
+            onChange={e => setProf(kind, "audio", e.target.value)} />,
+          <span key={`${kind}-as`} className="muted">
+            {kind === "anime" ? "keeps the Japanese VO alongside FR+EN" : "e.g. fre, eng"}</span>,
+          <label key={`${kind}-s`}>&nbsp;&nbsp;&nbsp;&nbsp;— subtitles</label>,
+          <input key={`${kind}-si`} type="text" value={prof(kind, "subs")}
+            onChange={e => setProf(kind, "subs", e.target.value)} />,
+          <span key={`${kind}-ss`} className="muted" />,
+        ])}
+        <label>Anime folders</label>
+        <input type="text" value={Array.isArray(val("anime_dirs")) ? val("anime_dirs").join(", ") : (val("anime_dirs") ?? "")}
+          onChange={e => set("anime_dirs", e.target.value)} />
+        <span className="muted">top-level library folders that mean anime; Sonarr's own anime
+          flag and a Japanese original language also select that profile</span>
       </div>
 
       <div className="section-title">Queues &amp; limits</div>
