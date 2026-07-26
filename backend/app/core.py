@@ -116,6 +116,9 @@ DEFAULTS = {
                                            # won't grab another until a merge finishes + donor is
                                            # freed, dropping the count below the cap.
     "enabled": False,                      # master switch; off until configured
+    "webhook_token": "",                   # optional shared secret for /api/hook/*. Empty =
+                                           # no check (matches the rest of this LAN-only API).
+                                           # Set it and Radarr/Sonarr must send ?token=… .
     "paused": False,                       # temporary brake: no NEW searches, grabs or merges.
                                            # Work already in flight finishes (killing mkvmerge
                                            # mid-write would leave a corrupt file), so the load

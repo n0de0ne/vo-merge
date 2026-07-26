@@ -1093,6 +1093,10 @@ function Settings() {
     set("lang_profiles", all);
   };
 
+  // the *arrs must reach this app by IP, so show the URL the browser is already using
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://<vo-merge>";
+  const tok = val("webhook_token") ? `?token=${encodeURIComponent(val("webhook_token"))}` : "";
+
   const Text = (k: string, type = "text") =>
     <input type={type} value={val(k) ?? ""} onChange={e => set(k, type === "number" ? Number(e.target.value) : e.target.value)} />;
   const Secret = (k: string) =>
@@ -1175,6 +1179,22 @@ function Settings() {
         <span className="muted">download a release for a file that already has every target
           audio language but is missing a target subtitle — off by default, this adds a lot of
           downloads</span>
+      </div>
+
+      <div className="section-title">Instant pickup (webhooks)</div>
+      <div className="muted" style={{ margin: "-4px 0 10px" }}>
+        Without these, a newly imported file waits up to one search interval
+        ({val("search_interval_min") ?? 60} min) for the sweep. Add a <b>Connect → Webhook</b> in
+        Radarr and Sonarr, method POST, triggered <b>On Import</b> and <b>On Upgrade</b>, pointing at:
+        <div className="hookurl">{origin}/api/hook/radarr{tok}</div>
+        <div className="hookurl">{origin}/api/hook/sonarr{tok}</div>
+        Their <b>Test</b> button works. Only the changed file is probed, so a hook costs one
+        mkvmerge call rather than a library sweep.
+      </div>
+      <div className="form-grid">
+        <label>Webhook token</label>{Text("webhook_token")}
+        <span className="muted">optional; when set, the URLs above must carry
+          <code>?token=…</code>. Leave empty for no check (LAN-only, like the rest of the API)</span>
       </div>
 
       <div className="section-title">Language targets</div>

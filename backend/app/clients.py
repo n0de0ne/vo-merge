@@ -33,6 +33,10 @@ class Radarr:
     def movies(self):
         return self._req("GET", "/api/v3/movie")
 
+    def movie(self, movie_id):
+        """One movie by Radarr id — what a webhook needs, instead of pulling the whole library."""
+        return self._req("GET", f"/api/v3/movie/{movie_id}")
+
     def tags(self):
         return self._req("GET", "/api/v3/tag")
 
@@ -56,6 +60,10 @@ class Sonarr:
 
     def series(self):
         return self._req("GET", "/api/v3/series")
+
+    def series_one(self, series_id):
+        """One series by Sonarr id — what a webhook needs, instead of pulling the whole library."""
+        return self._req("GET", f"/api/v3/series/{series_id}")
 
     def tags(self):
         return self._req("GET", "/api/v3/tag")

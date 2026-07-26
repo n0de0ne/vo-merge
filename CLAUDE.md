@@ -157,6 +157,31 @@ usually ships them — so taking them costs one extra mkvmerge argument, not ano
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
 
+## Instant pickup — *arr webhooks
+
+The scheduled `_search_job` (every `search_interval_min`, default 60) already re-scans and picks
+up newly imported media, and the probe cache makes that sweep nearly free. But it is a *sweep*,
+so a new file waits up to an hour, and the scheduled scan honours `scope_series` + `series_pilot`.
+
+`POST /api/hook/radarr` and `POST /api/hook/sonarr` turn an import into a scanned, queued record
+in seconds. Point Radarr/Sonarr **Connect → Webhook** (POST, *On Import* + *On Upgrade*) at them.
+
+- **Nothing in the payload is required.** *arr payload shapes differ by version, so the hook reads
+  only `eventType` and the id, then fetches the authoritative record (`Radarr.movie(id)` /
+  `Sonarr.series_one(id)`) and judges the FILE exactly like a scan does.
+- Films reuse `pipeline.ingest_movie` — the same function the sweep calls per movie — so an import
+  and a sweep can never disagree. TV runs `tv.scan(only_series=…)`, one targeted pass whose probe
+  cache means only the file that actually changed costs an `mkvmerge`.
+- `refresh=True` bypasses the probe cache: an import just rewrote the file and a fast disk can
+  land the new one inside the cache's 1-second mtime tolerance.
+- **`series_pilot` does not gate a single-series hook** — you asked about *this* import.
+- `Test` returns OK (so the *arr Test button works), `Grab`/`Health`/etc. are ignored, and the
+  delete events call `core.forget_probe()` so a removed file never answers from a stale probe.
+- The hook answers immediately and ingests on a worker thread — a probe plus a Prowlarr search is
+  far slower than an *arr webhook timeout. The follow-up search honours the same brakes as
+  everything else (`hold_reason`, `SEARCH_LOCK`, the in-flight cap).
+- `webhook_token` (empty = no check) adds `?token=…` if you ever expose the endpoint.
+
 ## Pause & holds
 
 `paused` (header button, `POST /api/pause`) is a brake, not a kill switch: no NEW searches,

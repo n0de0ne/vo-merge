@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from . import core, scheduler, pipeline
+from . import core, scheduler, pipeline, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
 app = FastAPI(title="VO Merger")
@@ -175,6 +175,111 @@ def do_finish():
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "started": True}
+
+
+# ---------------------------------------------------------------- *arr webhooks
+# Radarr/Sonarr "Connect -> Webhook" on Import/Upgrade. Turns a new file into a scanned,
+# queued record in seconds instead of waiting up to search_interval_min for the sweep.
+# The payload shape varies by *arr version, so nothing here is required: we read what we
+# need, fetch the authoritative record from the *arr by id, and judge the FILE as always.
+IMPORT_EVENTS = {"download", "movieimported", "episodefileimport", "upgrade", "rename"}
+DELETE_EVENTS = {"moviefiledelete", "episodefiledelete", "moviedelete", "seriesdelete"}
+
+
+def _hook_auth(token):
+    want = (core.load_config().get("webhook_token") or "").strip()
+    if want and (token or "") != want:
+        raise HTTPException(401, "bad webhook token")
+
+
+def _hook_after(fn, what):
+    """Run the ingest off the request thread and return at once: Radarr/Sonarr time their
+    webhooks out, and a probe plus a Prowlarr search is far too slow to answer inline."""
+    import threading
+
+    def _run():
+        try:
+            fn()
+        except Exception as e:
+            core.log(f"hook {what}: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@api.post("/hook/radarr")
+def hook_radarr(body: dict, token: str | None = None):
+    """Radarr Connect -> Webhook. Point it at http://<vo-merge>/api/hook/radarr."""
+    _hook_auth(token)
+    ev = str(body.get("eventType") or "").lower()
+    mid = (body.get("movie") or {}).get("id")
+    if ev == "test":
+        core.log("hook radarr: test OK")
+        return {"ok": True, "test": True}
+    if ev in DELETE_EVENTS:
+        path = (body.get("movieFile") or {}).get("path")
+        local = media.to_media(path, core.load_config()) if path else None
+        if local:
+            core.forget_probe(local)          # gone/replaced: never answer from a stale probe
+        return {"ok": True, "event": ev, "forgot": bool(local)}
+    if ev not in IMPORT_EVENTS or not mid:
+        return {"ok": True, "ignored": ev or "no eventType"}
+
+    def _run():
+        cfg = core.load_config()
+        m = Radarr(cfg["radarr_url"], cfg["radarr_key"]).movie(mid)
+        r = pipeline.ingest_movie(m, cfg, refresh=True)
+        core.log(f"hook radarr: {ev} {m.get('title')!r} -> {r}")
+        if r == "gap":
+            _kick_search(cfg, lambda c: pipeline.stage_search(c))
+    _hook_after(_run, f"radarr {ev} {mid}")
+    return {"ok": True, "event": ev, "movie": mid, "queued": True}
+
+
+@api.post("/hook/sonarr")
+def hook_sonarr(body: dict, token: str | None = None):
+    """Sonarr Connect -> Webhook. Point it at http://<vo-merge>/api/hook/sonarr."""
+    from . import tv
+    _hook_auth(token)
+    ev = str(body.get("eventType") or "").lower()
+    sid = (body.get("series") or {}).get("id")
+    if ev == "test":
+        core.log("hook sonarr: test OK")
+        return {"ok": True, "test": True}
+    if ev in DELETE_EVENTS:
+        path = (body.get("episodeFile") or {}).get("path")
+        local = media.to_media(path, core.load_config()) if path else None
+        if local:
+            core.forget_probe(local)
+        return {"ok": True, "event": ev, "forgot": bool(local)}
+    if ev not in IMPORT_EVENTS or not sid:
+        return {"ok": True, "ignored": ev or "no eventType"}
+
+    def _run():
+        cfg = core.load_config()
+        # one targeted pass over just this series: the probe cache means only the file that
+        # actually changed costs an mkvmerge call
+        n = tv.scan(cfg, only_series=sid, refresh=True)
+        core.log(f"hook sonarr: {ev} series {sid} -> {n} gap(s)")
+        if n:
+            _kick_search(cfg, lambda c: tv.stage_search(c))
+    _hook_after(_run, f"sonarr {ev} {sid}")
+    return {"ok": True, "event": ev, "series": sid, "queued": True}
+
+
+def _kick_search(cfg, run):
+    """Search for the record we just ingested instead of waiting for the timer. Honours the
+    same brakes as everything else — paused, a running scan, and the in-flight download cap
+    (stage_search enforces that itself)."""
+    if not cfg.get("enabled"):
+        return
+    why = pipeline.hold_reason(cfg)
+    if why:
+        core.log(f"hook: not searching yet ({why})"); return
+    if not pipeline.SEARCH_LOCK.acquire(blocking=False):
+        return                                   # a search run is already covering the backlog
+    try:
+        run(cfg)
+    finally:
+        pipeline.SEARCH_LOCK.release()
 
 
 class PauseIn(BaseModel):

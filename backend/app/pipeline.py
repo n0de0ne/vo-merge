@@ -334,61 +334,75 @@ def _scan_files(cfg):
     gaps = filled = unmapped = unreadable = 0
     seen = 0
     for m in rad.movies():
-        if not (m.get("movieFile") or {}).get("id") and not (m.get("movieFile") or {}).get("path"):
-            continue                                     # not downloaded yet — nothing to fix
         if tagid is not None and tagid not in m.get("tags", []):
             continue
-        lang = (m.get("originalLanguage") or {}).get("name", "?")
-        if cfg["exclude_french_origin"] and lang == "French":
-            continue
-        seen += 1
-        fr_path = _radarr_file_path(m, cfg)
-        if not fr_path:
-            unmapped += 1
-            continue
-        auds, subs, err = media.audit(fr_path)
-        if err:
-            # unreadable != "has no English" — probing failed, so we know nothing. Skipping is
-            # the only honest option; the count is logged so a systemic problem is visible.
-            unreadable += 1
-            continue
-        kind = media.kind_of(fr_path, lang, cfg)
-        miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
-        need = "+".join([x for x in (("audio" if miss_a else ""), ("subs" if miss_s else "")) if x])
-        alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
-        existing = core.get_movie(m["tmdbId"])
-        if not need:
-            # No gap. Never insert these (a whole library of them would flood the pipeline);
-            # if we already track it, the gap is filled — record that instead of re-searching.
-            if existing and existing["status"] in ("pending", "no_release", "searching"):
-                core.set_status(m["tmdbId"], "merged", added_langs="", progress="", error=None,
-                                audio_langs=alangs, sub_langs=slangs, needs="",
-                                need_audio="", need_subs="")
-                filled += 1
-            elif existing:
-                core.set_status(m["tmdbId"], existing["status"], audio_langs=alangs,
-                                sub_langs=slangs, needs="", need_audio="", need_subs="")
-            continue
-        poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
-                       if i.get("coverType") == "poster"), None)
-        mf = m.get("movieFile") or {}
-        core.upsert_movie({
-            "tmdb_id": m["tmdbId"], "imdb_id": m.get("imdbId"), "radarr_id": m["id"],
-            "title": m.get("title"), "original_title": m.get("originalTitle") or m.get("title"),
-            "year": m.get("year"), "original_lang": lang, "french_path": fr_path,
-            "quality": (((mf.get("quality") or {}).get("quality") or {}).get("name")),
-            "poster": poster,
-        })
-        core.set_status(m["tmdbId"], (existing or {}).get("status") or "pending",
-                        audio_langs=alangs, sub_langs=slangs, needs=need,
-                        need_audio=",".join(miss_a), need_subs=",".join(miss_s))
-        gaps += 1
+        r = ingest_movie(m, cfg)
+        seen += r != "no file"
+        gaps += r == "gap"
+        filled += r == "filled"
+        unmapped += r == "unmapped"
+        unreadable += r == "unreadable"
     mount = cfg["media_mount"]
     core.log(f"scan(files): {gaps} gap(s) of {seen} movie(s) probed"
              f"{f', {filled} already filled' if filled else ''}"
              f"{f', {unmapped} path not found under {mount}' if unmapped else ''}"
              f"{f', {unreadable} unreadable' if unreadable else ''}")
     return gaps
+
+
+def ingest_movie(m, cfg, refresh=False):
+    """Decide one Radarr movie's gap from its FILE and record it. Shared by the library scan and
+    the Radarr webhook, so an import is judged by exactly the same rules as a sweep.
+
+    Returns a short outcome: "gap" | "filled" | "ok" | "no file" | "unmapped" | "unreadable".
+    `refresh=True` bypasses the probe cache — an import or upgrade just rewrote the file, and on
+    a fast disk the new one can land within the cache's 1-second mtime tolerance."""
+    mf = m.get("movieFile") or {}
+    if not (mf.get("id") or mf.get("path")):
+        return "no file"                                 # not downloaded yet — nothing to fix
+    lang = (m.get("originalLanguage") or {}).get("name", "?")
+    if cfg["exclude_french_origin"] and lang == "French":
+        return "ok"
+    fr_path = _radarr_file_path(m, cfg)
+    if not fr_path:
+        return "unmapped"
+    if refresh:
+        core.forget_probe(fr_path)
+    auds, subs, err = media.audit(fr_path)
+    if err:
+        # unreadable != "has no English" — probing failed, so we know nothing. Skipping is
+        # the only honest option; the count is logged so a systemic problem is visible.
+        return "unreadable"
+    kind = media.kind_of(fr_path, lang, cfg)
+    miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
+    need = "+".join([x for x in (("audio" if miss_a else ""), ("subs" if miss_s else "")) if x])
+    alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
+    existing = core.get_movie(m["tmdbId"])
+    if not need:
+        # No gap. Never insert these (a whole library of them would flood the pipeline);
+        # if we already track it, the gap is filled — record that instead of re-searching.
+        if existing and existing["status"] in ("pending", "no_release", "searching"):
+            core.set_status(m["tmdbId"], "merged", added_langs="", progress="", error=None,
+                            audio_langs=alangs, sub_langs=slangs, needs="",
+                            need_audio="", need_subs="")
+            return "filled"
+        if existing:
+            core.set_status(m["tmdbId"], existing["status"], audio_langs=alangs,
+                            sub_langs=slangs, needs="", need_audio="", need_subs="")
+        return "ok"
+    poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
+                   if i.get("coverType") == "poster"), None)
+    core.upsert_movie({
+        "tmdb_id": m["tmdbId"], "imdb_id": m.get("imdbId"), "radarr_id": m["id"],
+        "title": m.get("title"), "original_title": m.get("originalTitle") or m.get("title"),
+        "year": m.get("year"), "original_lang": lang, "french_path": fr_path,
+        "quality": (((mf.get("quality") or {}).get("quality") or {}).get("name")),
+        "poster": poster,
+    })
+    core.set_status(m["tmdbId"], (existing or {}).get("status") or "pending",
+                    audio_langs=alangs, sub_langs=slangs, needs=need,
+                    need_audio=",".join(miss_a), need_subs=",".join(miss_s))
+    return "gap"
 
 
 def _scan_tagged(cfg):

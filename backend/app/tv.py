@@ -151,9 +151,11 @@ def series_kind(s, cfg):
                          series_type=s.get("seriesType") or "standard")
 
 
-def scan(cfg=None, kinds=None):
+def scan(cfg=None, kinds=None, only_series=None, refresh=False):
     """Find episodes whose library file is missing English. `kinds` limits the pass to one kind
-    of library — ("anime",) or ("series",) — so the UI can re-read one tab at a time.
+    of library — ("anime",) or ("series",) — so the UI can re-read one tab at a time, and
+    `only_series` limits it to a single Sonarr series id, which is what the webhook uses to turn
+    an import into one cheap targeted pass. `refresh=True` bypasses the probe cache.
 
     In `scan_mode="files"` (default) the gap comes from probing the FILE, not from Sonarr's
     `mediaInfo.audioLanguages`. That field is a snapshot of whatever Sonarr parsed at import: it
@@ -170,7 +172,9 @@ def scan(cfg=None, kinds=None):
         core.log("tv scan: vo-gap tag not found"); return 0
     pilot = set(cfg.get("series_pilot") or [])
     n = seen = filled = unmapped = unreadable = 0
-    for s in son.series():
+    for s in son.series() if only_series is None else [son.series_one(only_series)]:
+        if not s:
+            continue
         if kinds and series_kind(s, cfg) not in kinds:
             continue
         if tagid is not None and not by_files and tagid not in s.get("tags", []):
@@ -178,7 +182,7 @@ def scan(cfg=None, kinds=None):
         if cfg.get("exclude_french_origin", True) and \
            (s.get("originalLanguage") or {}).get("name") == "French":
             continue
-        if pilot and s["title"] not in pilot:
+        if pilot and only_series is None and s["title"] not in pilot:
             continue
         try:
             files = son.episode_files(s["id"])
@@ -208,6 +212,8 @@ def scan(cfg=None, kinds=None):
                 if not local:
                     unmapped += 1
                     continue
+                if refresh:
+                    core.forget_probe(local)
                 auds, subs, err = media.audit(local)
                 if err:
                     unreadable += 1        # can't read it -> we know nothing; don't guess
@@ -243,7 +249,8 @@ def scan(cfg=None, kinds=None):
                                    need_audio=",".join(miss_a), need_subs=",".join(miss_s),
                                    orig_lang=orig_name)
             n += 1
-    what = "/".join(kinds) if kinds else "series+anime"
+    what = "/".join(kinds) if kinds else ("series+anime" if only_series is None
+                                          else f"series {only_series}")
     if by_files:
         core.log(f"tv scan(files, {what}): {n} gap(s) of {seen} episode(s) probed"
                  f"{f', {filled} already filled' if filled else ''}"
