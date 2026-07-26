@@ -6,6 +6,9 @@ export interface Movie {
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
   error: string | null; updated: number; poster?: string | null; progress?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  // read off the FILE by mkvmerge, not from Radarr/Sonarr metadata
+  audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
+  added_subs?: string | null;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
@@ -18,6 +21,8 @@ export interface Episode {
   dl_hash?: string | null; series_type?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
   aired?: string | null;   // "S04E15" when releases number this episode differently
+  audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
+  added_subs?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface DL {
@@ -98,6 +103,8 @@ export const api = {
   tvEpisodes: (status?: string) =>
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
+  rescan: (forget = false) =>
+    j<{ ok: boolean; started: boolean }>(`/api/rescan?forget=${forget}`, { method: "POST" }),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),

@@ -55,6 +55,20 @@ DEFAULTS = {
     "qb_tv_download_dir": "/data/.Téléchargements/completed/audio-merge-tv",
     "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
     "exclude_french_origin": True,
+    # ---- how the gap is decided ------------------------------------------------------------
+    # "files": probe every library file with mkvmerge and believe the container (accurate, and
+    #          the only thing that can't go stale). "tag": the old behaviour — trust Radarr's
+    #          vo-gap tag / Sonarr's mediaInfo, both of which are import-time snapshots.
+    "scan_mode": "files",
+    "scan_all_movies": True,               # files mode: consider EVERY Radarr movie, not just
+                                           # the tagged ones (the tag is what we're replacing)
+    "want_subs": True,                     # also graft the donor's subtitles for `sub_langs`
+    "sub_langs": ["eng"],                  # subtitle languages worth adding
+    "max_sub_tracks": 2,                   # per language, keep at most this many (packs ship 6+)
+    "subs_only_gap": False,                # a file that has English AUDIO but no English SUBS:
+                                           # off (default) = subs ride along with an audio graft
+                                           # only, so nothing is downloaded purely for subtitles.
+                                           # On = chase those too (many more downloads).
     "sync_tolerance_s": 2.0,
     "max_sync_retries": 4,                 # try this many different releases before giving up
     "sync_review": True,                   # low-confidence/inconclusive sync -> 'review' (human) instead of auto-reject
@@ -218,7 +232,11 @@ def init_db():
                                    # AI-review round-trip: status the host dispatcher reports back
                                    "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                    # rate-stretch ratio applied at merge (PAL etc); 1.0 = none
-                                   "sync_drift": "REAL"})
+                                   "sync_drift": "REAL",
+                                   # what the FILE actually holds (from mkvmerge, not metadata)
+                                   "audio_langs": "TEXT", "sub_langs": "TEXT",
+                                   "needs": "TEXT",          # audio | subs | audio+subs
+                                   "added_subs": "TEXT"})
 
 
 def _ensure_cols(c, table, cols):
@@ -248,7 +266,68 @@ def init_tv():
                                      "series_type": "TEXT DEFAULT 'standard'", "merged_at": "REAL",
                                      # AI-review round-trip (see movies table)
                                      "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
-                                     "sync_drift": "REAL"})
+                                     "sync_drift": "REAL",
+                                     # what the FILE actually holds (see movies table)
+                                     "audio_langs": "TEXT", "sub_langs": "TEXT",
+                                     "needs": "TEXT", "added_subs": "TEXT"})
+
+
+def init_probe_cache():
+    """Cache of what each library file actually contains, keyed by path and invalidated by
+    (size, mtime). A scan of a few thousand files would otherwise be a few thousand mkvmerge
+    calls every cycle; with this, only files that changed on disk are re-read."""
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS probes (
+            path TEXT PRIMARY KEY,
+            size INTEGER, mtime REAL, probed REAL,
+            dur REAL, fps REAL,
+            auds TEXT,               -- comma-joined canonical audio language codes
+            subs TEXT,               -- comma-joined canonical subtitle language codes
+            ntracks INTEGER,         -- audio track count (0 with auds='' means unreadable)
+            err TEXT )""")
+
+
+def get_probe(path):
+    """Cached probe row for `path`, but only if the file on disk still matches it."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    with db() as c:
+        r = c.execute("SELECT * FROM probes WHERE path=?", (path,)).fetchone()
+    if not r:
+        return None
+    if int(r["size"] or -1) != st.st_size or abs((r["mtime"] or 0) - st.st_mtime) > 1:
+        return None
+    return dict(r)
+
+
+def put_probe(path, dur=None, fps=None, auds="", subs="", ntracks=0, err=None):
+    try:
+        st = os.stat(path)
+        size, mtime = st.st_size, st.st_mtime
+    except OSError:
+        size, mtime = None, None
+    with db() as c:
+        c.execute("""INSERT INTO probes (path,size,mtime,probed,dur,fps,auds,subs,ntracks,err)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,
+                       probed=excluded.probed,dur=excluded.dur,fps=excluded.fps,
+                       auds=excluded.auds,subs=excluded.subs,ntracks=excluded.ntracks,
+                       err=excluded.err""",
+                  (path, size, mtime, time.time(), dur, fps, auds, subs, ntracks, err))
+
+
+def forget_probe(path):
+    """Drop a cached probe (after a merge rewrites the file in place)."""
+    with db() as c:
+        c.execute("DELETE FROM probes WHERE path=?", (path,))
+
+
+def probe_stats():
+    with db() as c:
+        r = c.execute("SELECT COUNT(*) n, SUM(err IS NOT NULL) bad FROM probes").fetchone()
+    return {"cached": r["n"] or 0, "unreadable": r["bad"] or 0}
 
 
 def upsert_episode(e: dict):

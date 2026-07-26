@@ -40,11 +40,24 @@ def _promote_job():
 def _search_job():
     try:
         cfg = core.load_config()
+        # In "files" mode a scan probes the library, so it must not overlap a manual /rescan —
+        # two full passes would double the mkvmerge load for no benefit. Skipping is safe: the
+        # run in progress is producing fresher results than this one would.
+        scanning = pipeline.SCAN_LOCK.acquire(blocking=False)
+        try:
+            if scanning:
+                if cfg.get("scope_films", True):
+                    pipeline.scan(cfg)
+                if cfg.get("scope_series"):
+                    tv.scan(cfg)
+            else:
+                core.log("search job: a rescan is already running -> searching without re-scanning")
+        finally:
+            if scanning:
+                pipeline.SCAN_LOCK.release()
         if cfg.get("scope_films", True):
-            pipeline.scan(cfg)
             pipeline.stage_search(cfg)
         if cfg.get("scope_series"):
-            tv.scan(cfg)
             tv.stage_search(cfg)
     except Exception as e:
         core.log(f"search_job error: {e}")

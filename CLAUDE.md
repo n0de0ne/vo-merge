@@ -27,6 +27,8 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
   `set_status`/`set_ep_status` (**dynamic-column UPDATE — pass any column as kwarg**),
   `_ensure_cols` migrations, `log`/`tail_log`, `STATES`.
 - `clients.py` — thin HTTP clients: `Prowlarr`, `Radarr`, `Sonarr`, `QBittorrent`, `Plex`.
+- `media.py` — **file truth**: `mkvmerge -J` track inventory, ISO-639 normalisation, `und`
+  resolution, the gap decision, subtitle ranking, and *arr-path → `/media` mapping.
 - `pipeline.py` — movie pipeline: `scan` (Radarr gap) → `candidates`/`search_movie`/`score_release`
   → `grab`/`qb_grab` → `merge_movie` → `finish_movie`. Also shared helpers used by TV.
 - `tv.py` — episode pipeline (mirrors pipeline.py); imports shared helpers from it.
@@ -41,8 +43,8 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
 `STATES`: pending → searching → no_release / grabbed → downloading → ready → merging →
 merged / review / sync_fail / error / ignored.
 
-1. **scan** — pull Radarr movies tagged `vo-gap` (missing English); skip French-origin if
-   `exclude_french_origin`. (The `vo-gap` tag is maintained by an external user script — see below.)
+1. **scan** — decide the gap by **probing the files** (see "Gap detection" below); Radarr/Sonarr
+   supply only metadata. Skip French-origin if `exclude_french_origin`.
 2. **search/score** — Prowlarr search; `score_release` rejects French-dub-only, **strongly
    prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers both the
    auto-picker and the UI's interactive search.
@@ -71,6 +73,64 @@ holding a grab slot — the merger could sit idle with completed downloads waiti
   `ready`/`merging` so the orphan sweep never deletes a donor out from under the worker.
 - Stale `merging` records (>15 min, not in `_merging_now()`) go back to `ready` rather than
   being re-merged inline. SQLite runs in **WAL** — the worker writes concurrently.
+
+## Gap detection — read the files, not the metadata (`media.py`)
+
+`scan_mode` (default **`files`**) decides where "this file is missing English" comes from.
+It used to come from metadata *other tools* wrote down, and both sources are import-time
+snapshots that fail **silently**:
+
+- Sonarr's `mediaInfo.audioLanguages` is **empty for anything it never analysed**, and the old
+  `_no_eng("")` returned False — i.e. "already has English". Those episodes were never fixable.
+- Radarr's `vo-gap` tag is maintained by an external host script, so vo-merge inherited its lag.
+- Neither notices a file replaced or remuxed outside the *arrs.
+- A track tagged `und` (very common on FR rips) has no language at all — unreadable from metadata.
+
+On identical test files the two modes disagree in **both** directions: legacy flags an episode
+that already has English (wasted download) *and* skips one that has none (gap missed forever).
+
+So `files` mode reads the container with `mkvmerge -J`. The *arrs are still the source for what
+isn't on disk — title, year, tmdb/tvdb id, original language, anime numbering — but never for
+the gap decision itself.
+
+- **`media.norm_lang`** collapses 639-2/B (`fre`), 639-2/T (`fra`), 639-1 (`fr`) and plain names
+  onto one canonical code, so a set comparison can't be defeated by spelling.
+- **`und` tracks** fall back to the track NAME, then the FILE name, for an explicit marker
+  (`VFF`, `TRUEFRENCH`, `English`). Still nothing → stays `und`, which `langs()` **excludes**, so
+  the file reads as a gap. That errs toward adding a real English track; the opposite error
+  leaves a French-only file forever. **`VOSTFR`/`VOST`/`SUBFRENCH` in a filename suppress the
+  French hint** — they describe the *subtitles*, so the audio is the original language.
+- **The gap is "no English AND no original-language track"** — the same rule the host mirror
+  script uses, so a Norwegian film that already carries its VO isn't downloaded again.
+- **A probe failure is not "no English."** Unreadable files are skipped and counted in the scan
+  log, never guessed at.
+- **Probe cache** (`probes` table, keyed by path, invalidated by size+mtime) — the first pass over
+  a big library costs one `mkvmerge` per file; after that only changed files are re-read. A merge
+  calls `core.forget_probe()` on the files it rewrote. `POST /api/rescan?forget=true` clears it.
+- `scan` **only inserts records that have a gap** (a whole library of fine files would flood the
+  pipeline), and a tracked record whose gap has since been filled is closed out as `merged`
+  instead of being re-searched — which self-heals the DB from the stale-tag era.
+- `media.to_media()` maps an *arr path to `/media` and **verifies it exists**, so a mis-mapped
+  path is reported in the scan log rather than silently becoming a wrong `french_path`.
+
+## Subtitles
+
+Most French library files have no English subtitles, and the donor downloaded for its audio
+usually ships them — so taking them costs one extra mkvmerge argument, not another download.
+
+- `want_subs` (default on) + `sub_langs` (default `["eng"]`) + `max_sub_tracks` (default 2).
+- `_donor_opts()` builds the donor's track selection for both merge paths. Options precede the
+  donor filename so they apply to it; the base keeps its own video, audio, subs and chapters.
+- **Subtitles get the same `--sync` as the audio** — they're timed to the donor's video, so an
+  offset *and* a PAL rate stretch apply identically (verified: a cue at 1000 ms lands at 1293 ms
+  under `+250 ms, ×1.0427083`).
+- `media.sub_rank()` picks *which* track when a pack ships six: full translation > forced/signs >
+  SDH, and text beats image (PGS/VobSub). Grafted subs are **never default-flagged** — a default
+  subtitle starts burned-in for every viewer.
+- `subs_only_gap` (default **off**): a file with English audio but no English subs is not worth a
+  whole download on its own. Turn it on to chase those too.
+- A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
+  only closes the record when there's neither.
 
 ## Merge rules (important, non-obvious)
 
@@ -234,7 +294,8 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
-Keys you'll touch most: `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
+Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `want_subs`/`sub_langs`/
+`max_sub_tracks`/`subs_only_gap`, `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads,
 `sync_ratio_test`/`sync_ratio_span`/`sync_ratio_min_conf`/`sync_ratio_margin` for the PAL path),

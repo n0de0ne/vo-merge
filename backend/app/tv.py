@@ -7,11 +7,12 @@ Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scop
 """
 import os, re, subprocess, shutil, time
 from collections import defaultdict
-from . import core
+from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
-                       EN_OK, EN_AUDIO, RES, SRC, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX)
+                       EN_OK, EN_AUDIO, RES, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
+                       _orig_codes, _pick_subs, _donor_opts)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -143,15 +144,25 @@ def _alt_keys(series_id, s, e, cfg=None):
 
 # ------------------------------------------------------------------ SCAN
 def scan(cfg=None):
+    """Find episodes whose library file is missing English.
+
+    In `scan_mode="files"` (default) the gap comes from probing the FILE, not from Sonarr's
+    `mediaInfo.audioLanguages`. That field is a snapshot of whatever Sonarr parsed at import: it
+    is empty for anything never analysed — and the old `_no_eng("")` answered False, i.e. "has
+    English" — and it goes stale the moment a file is replaced outside Sonarr. Sonarr is still
+    the source for everything we can't read off disk (series title, tvdb id, anime numbering)."""
     cfg = cfg or core.load_config()
+    by_files = cfg.get("scan_mode", "files") == "files"
     son = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
     tagid = next((t["id"] for t in son.tags() if t["label"] == cfg["sonarr_vo_gap_tag"]), None)
-    if tagid is None:
+    # In files mode the tag is advisory only: it's the thing we're replacing, so a missing tag
+    # isn't fatal any more.
+    if tagid is None and not by_files:
         core.log("tv scan: vo-gap tag not found"); return 0
     pilot = set(cfg.get("series_pilot") or [])
-    n = 0
+    n = seen = filled = unmapped = unreadable = 0
     for s in son.series():
-        if tagid not in s.get("tags", []):
+        if tagid is not None and not by_files and tagid not in s.get("tags", []):
             continue
         if (s.get("originalLanguage") or {}).get("name") == "French":
             continue
@@ -163,24 +174,63 @@ def scan(cfg=None):
             continue
         poster = next((i.get("remoteUrl") or i.get("url") for i in s.get("images", [])
                        if i.get("coverType") == "poster"), None)
+        orig = _orig_codes((s.get("originalLanguage") or {}).get("name"))
         for f in files:
             mi = f.get("mediaInfo") or {}
-            if not _no_eng(mi.get("audioLanguages")):
-                continue
             path = f.get("path") or ""
             m = SXXEXX.search(os.path.basename(path))
             if not m:
                 continue
             season, ep = int(m.group(1)), int(m.group(2))
+            ep_id = f"{s['id']}:{season}:{ep}"
+            quality = mi.get("resolution") or (f.get("quality", {}).get("quality", {}) or {}).get("name")
+            if not by_files:
+                if not _no_eng(mi.get("audioLanguages")):
+                    continue
+                need, alangs, slangs = "audio", None, None
+                local = _media(path, cfg)
+            else:
+                seen += 1
+                local = media.to_media(path, cfg)
+                if not local:
+                    unmapped += 1
+                    continue
+                auds, subs, err = media.audit(local)
+                if err:
+                    unreadable += 1        # can't read it -> we know nothing; don't guess
+                    continue
+                need = media.gap_kind(auds, subs, orig, cfg)
+                alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
+                cur = core.get_episode(ep_id)
+                if not need:
+                    if cur and cur["status"] in ("pending", "no_release", "searching"):
+                        core.set_ep_status(ep_id, "merged", added_langs="", progress="", error=None,
+                                           audio_langs=alangs, sub_langs=slangs, needs="")
+                        filled += 1
+                    elif cur:
+                        core.set_ep_status(ep_id, cur["status"], audio_langs=alangs,
+                                           sub_langs=slangs, needs="")
+                    continue
             core.upsert_episode({
-                "id": f"{s['id']}:{season}:{ep}", "series_id": s["id"],
+                "id": ep_id, "series_id": s["id"],
                 "series_title": s["title"], "tvdb_id": s.get("tvdbId"),
-                "season": season, "episode": ep, "french_path": _media(path, cfg),
-                "quality": mi.get("resolution") or (f.get("quality", {}).get("quality", {}) or {}).get("name"),
+                "season": season, "episode": ep, "french_path": local,
+                "quality": quality,
                 "poster": poster, "series_type": s.get("seriesType", "standard"),
             })
+            if alangs is not None:
+                cur = core.get_episode(ep_id)
+                core.set_ep_status(ep_id, (cur or {}).get("status") or "pending",
+                                   audio_langs=alangs, sub_langs=slangs, needs=need)
             n += 1
-    core.log(f"tv scan: {n} episodes missing English (pilot={sorted(pilot) or 'all'})")
+    if by_files:
+        core.log(f"tv scan(files): {n} gap(s) of {seen} episode(s) probed"
+                 f"{f', {filled} already filled' if filled else ''}"
+                 f"{f', {unmapped} path not found' if unmapped else ''}"
+                 f"{f', {unreadable} unreadable' if unreadable else ''}"
+                 f" (pilot={sorted(pilot) or 'all'})")
+    else:
+        core.log(f"tv scan(tag): {n} episodes missing English (pilot={sorted(pilot) or 'all'})")
     return n
 
 
@@ -592,7 +642,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         ids.append(a["id"]); langs[a["id"]] = a["lang"]; daidx[a["id"]] = ix; have.add(a["lang"])
     if "eng" not in have:
         core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
-    if not ids:
+    subs = _pick_subs(di, bi, cfg)
+    if not ids and not subs:
         # episode file already has English -> already filled (stale tag / prior merge), mark done
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"tv merge {ep['id']}: already has English -> done")
@@ -606,7 +657,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     if not offset and cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
-            base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
+            base, donor, 0, (daidx[ids[0]] if ids else 0),
+            min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
             on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint,
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
@@ -618,18 +670,13 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
-    core.set_ep_status(ep["id"], "merging", progress="muxing audio…")
+    what = "audio" if ids else ""
+    what = (what + "+subs") if (what and subs) else (what or "subs")
+    core.set_ep_status(ep["id"], "merging", progress=f"muxing {what}…")
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
-    cmd = ["mkvmerge", "-o", out, base, "--no-video", "--no-subtitles", "--no-chapters",
-           "--no-buttons", "--no-track-tags", "--audio-tracks", ",".join(str(i) for i in ids)]
-    for i in ids:
-        cmd += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
-        if offset or drift:
-            arg = f"{i}:{offset}" + (f",{round(drift * 1000000)}/1000000" if drift else "")
-            cmd += ["--sync", arg]
-    cmd += [donor]
+    cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):
         core.set_ep_status(ep["id"], "error", error=f"mkvmerge rc={r.returncode}"); return
@@ -638,10 +685,14 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         os.rmdir(outdir)
     except OSError:
         pass
+    core.forget_probe(fr)           # the file changed; its cached languages are now stale
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
                        sync_drift=drift, error=None, progress="",
+                       added_subs=",".join(sorted({x["lang"] for x in subs})),
                        added_langs=",".join(sorted({langs[i] for i in ids})))
-    core.log(f"tv merge {ep['id']}: OK +{offset}ms -> {os.path.basename(fr)}")
+    core.log(f"tv merge {ep['id']}: OK +{offset}ms"
+             f"{' +subs ' + ','.join(sorted({x['lang'] for x in subs})) if subs else ''}"
+             f" -> {os.path.basename(fr)}")
     try:
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
     except Exception:

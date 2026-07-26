@@ -6,7 +6,7 @@ Search & merge logic is ported verbatim from the validated dry-run scripts.
 import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
-from . import core, sync
+from . import core, sync, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 class _MergeGate:
@@ -50,6 +50,7 @@ MERGE_GATE = _MergeGate()
 FINISH_LOCK = threading.Lock()
 # Same for a search sweep: hammering the indexers twice over concurrently gets you rate-limited.
 SEARCH_LOCK = threading.Lock()
+SCAN_LOCK = threading.Lock()   # a library probe takes minutes; never run two at once
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
 EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
@@ -280,7 +281,96 @@ def _clients(cfg):
 
 # ---------------------------------------------------------------- SCAN
 def scan(cfg=None):
+    """Find movies whose library file is missing English. Two modes (`scan_mode`):
+
+    "files" (default) — ask Radarr only for METADATA (title/year/tmdb/original language, all of
+      which we need to search) and take the gap decision from the FILE, by probing the container
+      with mkvmerge. Radarr's `vo-gap` tag and Sonarr's mediaInfo are import-time snapshots that
+      go stale and are empty for anything never analysed; the container cannot be stale.
+    "tag" — the old behaviour, kept for comparison and as a fallback."""
     cfg = cfg or core.load_config()
+    return _scan_files(cfg) if cfg.get("scan_mode", "files") == "files" else _scan_tagged(cfg)
+
+
+def _radarr_file_path(m, cfg):
+    """Container path of a Radarr movie's file. Prefers the absolute path Radarr reports; falls
+    back to folder+relativePath. `media.to_media` verifies the result exists, so a path we
+    can't map is reported instead of silently becoming a wrong french_path."""
+    mf = m.get("movieFile") or {}
+    for p in (mf.get("path"),
+              (os.path.join(m["path"], mf["relativePath"])
+               if m.get("path") and mf.get("relativePath") else None)):
+        got = media.to_media(p, cfg)
+        if got:
+            return got
+    return None
+
+
+def _scan_files(cfg):
+    rad = Radarr(cfg["radarr_url"], cfg["radarr_key"])
+    tagid = None
+    if not cfg.get("scan_all_movies", True):
+        tagid = next((t["id"] for t in rad.tags() if t["label"] == cfg["vo_gap_tag"]), None)
+        if tagid is None:
+            core.log(f"scan: tag '{cfg['vo_gap_tag']}' not found in Radarr"); return 0
+    gaps = filled = unmapped = unreadable = 0
+    seen = 0
+    for m in rad.movies():
+        if not (m.get("movieFile") or {}).get("id") and not (m.get("movieFile") or {}).get("path"):
+            continue                                     # not downloaded yet — nothing to fix
+        if tagid is not None and tagid not in m.get("tags", []):
+            continue
+        lang = (m.get("originalLanguage") or {}).get("name", "?")
+        if cfg["exclude_french_origin"] and lang == "French":
+            continue
+        seen += 1
+        fr_path = _radarr_file_path(m, cfg)
+        if not fr_path:
+            unmapped += 1
+            continue
+        auds, subs, err = media.audit(fr_path)
+        if err:
+            # unreadable != "has no English" — probing failed, so we know nothing. Skipping is
+            # the only honest option; the count is logged so a systemic problem is visible.
+            unreadable += 1
+            continue
+        need = media.gap_kind(auds, subs, _orig_codes(lang), cfg)
+        alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
+        existing = core.get_movie(m["tmdbId"])
+        if not need:
+            # No gap. Never insert these (a whole library of them would flood the pipeline);
+            # if we already track it, the gap is filled — record that instead of re-searching.
+            if existing and existing["status"] in ("pending", "no_release", "searching"):
+                core.set_status(m["tmdbId"], "merged", added_langs="", progress="", error=None,
+                                audio_langs=alangs, sub_langs=slangs, needs="")
+                filled += 1
+            elif existing:
+                core.set_status(m["tmdbId"], existing["status"],
+                                audio_langs=alangs, sub_langs=slangs, needs="")
+            continue
+        poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
+                       if i.get("coverType") == "poster"), None)
+        mf = m.get("movieFile") or {}
+        core.upsert_movie({
+            "tmdb_id": m["tmdbId"], "imdb_id": m.get("imdbId"), "radarr_id": m["id"],
+            "title": m.get("title"), "original_title": m.get("originalTitle") or m.get("title"),
+            "year": m.get("year"), "original_lang": lang, "french_path": fr_path,
+            "quality": (((mf.get("quality") or {}).get("quality") or {}).get("name")),
+            "poster": poster,
+        })
+        core.set_status(m["tmdbId"], (existing or {}).get("status") or "pending",
+                        audio_langs=alangs, sub_langs=slangs, needs=need)
+        gaps += 1
+    mount = cfg["media_mount"]
+    core.log(f"scan(files): {gaps} gap(s) of {seen} movie(s) probed"
+             f"{f', {filled} already filled' if filled else ''}"
+             f"{f', {unmapped} path not found under {mount}' if unmapped else ''}"
+             f"{f', {unreadable} unreadable' if unreadable else ''}")
+    return gaps
+
+
+def _scan_tagged(cfg):
+    """Legacy mode: believe Radarr's vo-gap tag (maintained by the host mirror script)."""
     rad = Radarr(cfg["radarr_url"], cfg["radarr_key"])
     tagid = next((t["id"] for t in rad.tags() if t["label"] == cfg["vo_gap_tag"]), None)
     if tagid is None:
@@ -292,14 +382,8 @@ def scan(cfg=None):
         lang = (m.get("originalLanguage") or {}).get("name", "?")
         if cfg["exclude_french_origin"] and lang == "French":
             continue
+        fr_path = _radarr_file_path(m, cfg)
         mf = m.get("movieFile") or {}
-        rel = mf.get("relativePath")
-        # container path to the FR file under /media (Radarr path -> our media mount)
-        fr_path = None
-        if rel and m.get("path"):
-            # m['path'] is Radarr's movie folder; map its leaf into our media mount
-            fr_path = os.path.join(cfg["media_mount"], "Films",
-                                   os.path.basename(m["path"].rstrip("/")), rel)
         poster = next((i.get("remoteUrl") or i.get("url") for i in m.get("images", [])
                        if i.get("coverType") == "poster"), None)
         core.upsert_movie({
@@ -310,7 +394,7 @@ def scan(cfg=None):
             "poster": poster,
         })
         n += 1
-    core.log(f"scan: {n} candidate movies (non-French gap)")
+    core.log(f"scan(tag): {n} candidate movies (non-French gap)")
     return n
 
 
@@ -736,35 +820,23 @@ def _ffprobe(path, args):
         return ""
 
 
-def _norm(lang):
-    if not lang: return "und"
-    l = lang.lower()
-    return {"en": "eng", "eng": "eng", "english": "eng",
-            "fr": "fre", "fra": "fre", "fre": "fre", "french": "fre"}.get(l, l[:3])
-
-
 def probe(path):
-    dur = _ffprobe(path, ["-show_entries", "format=duration", "-of", "default=nk=1:nw=1"])
-    fps = _ffprobe(path, ["-select_streams", "v:0", "-show_entries",
-                          "stream=avg_frame_rate", "-of", "default=nk=1:nw=1"])
-    try: dur = float(dur)
-    except Exception: dur = None
-    try:
-        n, d = fps.split("/"); fps = round(float(n) / float(d), 3) if float(d) else None
-    except Exception: fps = None
-    try:
-        j = subprocess.run(["mkvmerge", "-J", path], capture_output=True,
-                           text=True, timeout=120).stdout
-        auds = []
-        for t in json.loads(j).get("tracks", []):
-            if t.get("type") == "audio":
-                p = t.get("properties", {})
-                auds.append({"id": t["id"], "lang": _norm(p.get("language")),
-                             "codec": t.get("codec"), "ch": p.get("audio_channels"),
-                             "name": p.get("track_name") or ""})
-    except Exception:
+    """{dur, fps, auds, subs} for a media file, or None if it can't be read.
+
+    Delegates to `media.probe` so the whole app resolves track languages the same way — one
+    canonical code per language, with `und` tracks falling back to their track/file name.
+    Duration comes from the container when it states one, else from ffprobe (mkv records it;
+    mp4/avi/ts often don't)."""
+    info = media.probe(path)
+    if info is None:
         return None
-    return {"dur": dur, "fps": fps, "auds": auds}
+    if not info.get("dur"):
+        try:
+            info["dur"] = float(_ffprobe(path, ["-show_entries", "format=duration",
+                                                "-of", "default=nk=1:nw=1"]))
+        except Exception:
+            info["dur"] = None
+    return info
 
 
 def _find_video(folder):
@@ -815,6 +887,40 @@ def merge_movie(tmdb_id, cfg=None):
     """Cap concurrent merges at `max_parallel_merges` so they can't peg CPU/GPU."""
     with MERGE_GATE.slot(cfg):
         return _merge_movie_impl(tmdb_id, cfg)
+
+
+def _pick_subs(donor_info, base_info, cfg):
+    """Donor subtitle tracks to graft alongside the audio. English subs are missing from most
+    French library files, and the donor we already downloaded for its audio usually carries
+    them — so taking them costs one extra mkvmerge argument rather than another download."""
+    if not cfg.get("want_subs", True):
+        return []
+    want = [media.norm_lang(x) for x in (cfg.get("sub_langs") or ["eng"])]
+    return media.wanted_subs(donor_info, base_info, want, cfg.get("max_sub_tracks", 2))
+
+
+def _donor_opts(aud_ids, langs, subs, offset, drift):
+    """mkvmerge options selecting what the DONOR contributes. These precede the donor filename,
+    so they apply to it and not to the base (which keeps its video, audio, subs and chapters).
+
+    Both audio and subtitles get the same --sync: the donor's tracks are timed to the donor's
+    video, so a subtitle grafted onto the base drifts exactly as its audio would."""
+    sub_ids = [s["id"] for s in subs]
+    opts = ["--no-video", "--no-chapters", "--no-buttons", "--no-track-tags",
+            "--audio-tracks", ",".join(str(i) for i in aud_ids)]
+    opts += ["--subtitle-tracks", ",".join(str(i) for i in sub_ids)] if sub_ids else ["--no-subtitles"]
+    for i in aud_ids:
+        opts += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
+    for s in subs:
+        # never default-flag a grafted subtitle: it would start burned-in for every viewer
+        opts += ["--language", f"{s['id']}:{s['lang']}", "--default-track", f"{s['id']}:0"]
+        if s.get("forced"):
+            opts += ["--forced-track", f"{s['id']}:1"]
+    if offset or drift:
+        arg = f"{offset}" + (f",{round(drift * 1000000)}/1000000" if drift else "")
+        for i in aud_ids + sub_ids:
+            opts += ["--sync", f"{i}:{arg}"]
+    return opts
 
 
 def _merge_movie_impl(tmdb_id, cfg=None):
@@ -870,9 +976,10 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if not ("eng" in have or (orig_codes & have)):
         core.set_status(tmdb_id, "error",
                         error="merge: no English or original-language (VO) audio to add"); return
-    if not ids:
-        # base already has the wanted audio (English/VO) -> gap already filled (stale vo-gap tag
-        # or a prior merge). Mark done instead of erroring on "nothing to add".
+    subs = _pick_subs(di, bi, cfg)
+    if not ids and not subs:
+        # base already has the wanted audio (English/VO) and needs no subtitles -> gap already
+        # filled (stale vo-gap tag or a prior merge). Mark done, don't error on "nothing to add".
         core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"merge {tmdb_id}: library already has the wanted audio -> done")
         mirror_to_en(fr, cfg)
@@ -887,7 +994,8 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if not offset and cfg.get("auto_sync", True):
         core.set_status(tmdb_id, "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
-            base, donor, 0, daidx[ids[0]], min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}",
+            base, donor, 0, (daidx[ids[0]] if ids else 0),
+            min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}",
             on_progress=lambda msg: core.set_status(tmdb_id, "merging", progress=msg),
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
@@ -909,29 +1017,24 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             offset = int(round(m))
         core.log(f"merge {tmdb_id}: sync {offset:+d}ms"
                  f"{' drift ' + format(drift, '.6f') if drift else ''} ({method} conf {conf:.2f})")
-    core.set_status(tmdb_id, "merging", sync_delta=delta, progress="muxing audio…")
+    what = "audio" if ids else ""
+    if subs:
+        what = (what + "+subs") if what else "subs"
+    core.set_status(tmdb_id, "merging", sync_delta=delta, progress=f"muxing {what}…")
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
-    cmd = ["mkvmerge", "-o", out, base,
-           "--no-video", "--no-subtitles", "--no-chapters", "--no-buttons", "--no-track-tags",
-           "--audio-tracks", ",".join(str(i) for i in ids)]
-    for i in ids:
-        cmd += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
-        if offset or drift:
-            arg = f"{i}:{offset}"
-            if drift:                          # linear drift correction (lossless timestamp stretch)
-                arg += f",{round(drift * 1000000)}/1000000"
-            cmd += ["--sync", arg]
-    cmd += [donor]
+    cmd = ["mkvmerge", "-o", out, base] + \
+          _donor_opts(ids, langs, subs, offset, drift) + [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
     core.set_status(tmdb_id, "merged", merged_file=out, progress="",
                     sync_offset_ms=offset, sync_drift=drift,
+                    added_subs=",".join(sorted({s["lang"] for s in subs})),
                     added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
              f"{_video_quality(base,bi['dur'])[0]}p) added {[langs[i] for i in ids]} -> {out}")
@@ -1059,6 +1162,9 @@ def finish_movie(tmdb_id, cfg=None):
             os.rmdir(mergedir)          # clean up now-empty _merged
         except OSError:
             pass
+        # the library file changed on disk: drop both cached probes so the next scan re-reads
+        # the new track list instead of reporting the pre-merge languages
+        core.forget_probe(donor); core.forget_probe(dest)
         core.set_status(tmdb_id, "merged", merged_file=dest)
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])

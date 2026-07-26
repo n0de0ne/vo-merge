@@ -277,6 +277,20 @@ function DriftBadge({ d }: { d?: number | null }) {
     ⏩ rate ×{d.toFixed(4)} ({pct > 0 ? "+" : ""}{pct.toFixed(2)}%)</span>;
 }
 
+// What the library file actually contains, read off the file itself (not from Radarr/Sonarr
+// metadata), plus what it's still missing. `needs` is "", "audio", "subs" or "audio+subs".
+function Tracks({ a, s, needs }: { a?: string | null; s?: string | null; needs?: string | null }) {
+  if (!a && !s && !needs) return null;
+  const miss = (needs || "").split("+").filter(Boolean);
+  return (
+    <div className="sub tracks" title="languages read from the file itself">
+      🔊 {a || <span className="muted">none tagged</span>}
+      {s ? <> · 💬 {s}</> : <> · <span className="muted">no subs</span></>}
+      {miss.map(k => <span key={k} className="needs">needs {k}</span>)}
+    </div>
+  );
+}
+
 // ---------------- Interactive release search modal ----------------
 function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
   { title: string; load: () => Promise<Candidate[]>; onGrab: (c: Candidate) => Promise<any>;
@@ -376,6 +390,7 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
         {m.status === "downloading" && <DownloadBar dl={dl} />}
         {m.status === "ready" && <QueuedLine />}
         {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
+        <Tracks a={m.audio_langs} s={m.sub_langs} needs={m.needs} />
         {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
         <DriftBadge d={m.sync_drift} />
         {m.error && <div className="sub bad">{m.error}</div>}
@@ -593,6 +608,9 @@ function Films() {
             title="Search every pending title now instead of waiting for the timer (grabs up to the free download slots)">
             🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
+          <button className="btn sec" disabled={busy} onClick={() => act(() => api.rescan(true))}
+            title="Re-read EVERY library file with mkvmerge and re-decide the gaps from scratch (takes a few minutes)">
+            Re-read files</button>
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {STATES.map(s => (
@@ -642,7 +660,8 @@ function Films() {
                     <td>{m.candidate_title
                       ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
                       : <span className="muted">—</span>}</td>
-                    <td className="muted">{m.quality || "—"}</td>
+                    <td className="muted">{m.quality || "—"}
+                      <Tracks a={m.audio_langs} s={m.sub_langs} needs={m.needs} /></td>
                     <td><MovieActions m={m} busy={busy} act={act} onRelease={setRelease} onTune={setTune} /></td>
                   </tr>
                 ))}
@@ -743,6 +762,7 @@ function Series({ anime }: { anime: boolean }) {
               {e.status === "ready" && <QueuedLine />}
               {e.status === "merging" && e.progress &&
               <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
+              <Tracks a={e.audio_langs} s={e.sub_langs} needs={e.needs} />
               {e.error && <div className="sub bad">{e.error}</div>}
               {e.ai_verdict && <div className="sub" title={e.ai_verdict}>🤖 {e.ai_verdict}</div>}</td>
             <td>{e.candidate_title
@@ -1013,8 +1033,9 @@ function Settings() {
     for (const key of ["en_indexer_ids", "multi_indexer_ids"])
       if (key in data && typeof data[key] === "string")
         data[key] = data[key].split(",").map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !isNaN(n));
-    if ("series_pilot" in data && typeof data.series_pilot === "string")
-      data.series_pilot = data.series_pilot.split(",").map((x: string) => x.trim()).filter(Boolean);
+    for (const key of ["series_pilot", "sub_langs"])
+      if (key in data && typeof data[key] === "string")
+        data[key] = data[key].split(",").map((x: string) => x.trim()).filter(Boolean);
     await api.saveSettings(data); setSaved(true); setChanged({});
     api.settings().then(setCfg);
   }
@@ -1085,6 +1106,30 @@ function Settings() {
           onChange={e => set("series_pilot", e.target.value)} /><span className="muted">comma-sep; empty = all tagged</span>
         <label>qB TV category</label>{Text("qb_tv_category")}<span />
         <label>Season-pack threshold</label>{Text("tv_pack_threshold", "number")}<span className="muted">≥ N gap eps → grab a pack</span>
+      </div>
+
+      <div className="section-title">Gap detection &amp; subtitles</div>
+      <div className="form-grid">
+        <label>How gaps are found</label>
+        <select value={val("scan_mode") ?? "files"} onChange={e => set("scan_mode", e.target.value)}>
+          <option value="files">Read the files (accurate)</option>
+          <option value="tag">Trust Radarr/Sonarr metadata (legacy)</option>
+        </select>
+        <span className="muted">"Read the files" probes every library file with mkvmerge, so a
+          stale tag or an un-analysed file can't hide a gap</span>
+        <label>Scan all films</label>{Check("scan_all_movies")}
+        <span className="muted">files mode: consider every Radarr film, not just vo-gap tagged ones</span>
+        <label>Add subtitles</label>{Check("want_subs")}
+        <span className="muted">take the donor's subtitles while grafting its audio</span>
+        <label>Subtitle languages</label>
+        <input type="text" value={Array.isArray(val("sub_langs")) ? val("sub_langs").join(", ") : (val("sub_langs") ?? "")}
+          onChange={e => set("sub_langs", e.target.value)} />
+        <span className="muted">comma-sep 3-letter codes, e.g. eng</span>
+        <label>Max sub tracks</label>{Text("max_sub_tracks", "number")}
+        <span className="muted">per language (packs ship 6+: full, forced, SDH, signs…)</span>
+        <label>Chase subs alone</label>{Check("subs_only_gap")}
+        <span className="muted">download a release for a file that already has English audio but
+          no English subs — off by default, this adds a lot of downloads</span>
       </div>
 
       <div className="section-title">Queues &amp; limits</div>

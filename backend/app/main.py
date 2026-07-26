@@ -16,6 +16,7 @@ PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
 def _startup():
     core.init_db()
     core.init_tv()
+    core.init_probe_cache()
     scheduler.start()
 
 
@@ -85,6 +86,37 @@ def test(which: str):
 @api.post("/scan")
 def do_scan():
     return {"found": pipeline.scan()}
+
+
+@api.post("/rescan")
+def do_rescan(forget: bool = False):
+    """Re-decide every gap from the FILES (films + series), in the background — a full library
+    probe takes minutes on the first pass. `forget=true` drops the probe cache first, so every
+    file is re-read even if its size and mtime are unchanged (use after fixing tags by hand)."""
+    import threading
+    from . import tv
+
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan is already running"}
+    if forget:
+        with core.db() as c:
+            c.execute("DELETE FROM probes")
+        core.log("rescan: probe cache cleared — every file will be re-read")
+
+    def _run():
+        try:
+            cfg = core.load_config()
+            if cfg.get("scope_films", True):
+                pipeline.scan(cfg)
+            if cfg.get("scope_series"):
+                tv.scan(cfg)
+        except Exception as e:
+            core.log(f"rescan error: {e}")
+        finally:
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "probes": core.probe_stats()}
 
 
 @api.post("/finish")
@@ -486,7 +518,10 @@ def _probe_brief(path):
         return {"path": path, "error": "probe failed"}
     return {"path": path, "dur": p.get("dur"), "fps": p.get("fps"),
             "audio": [{"id": a["id"], "lang": a["lang"], "codec": a.get("codec"),
-                       "ch": a.get("ch"), "name": a.get("name")} for a in p.get("auds", [])]}
+                       "ch": a.get("ch"), "name": a.get("name")} for a in p.get("auds", [])],
+            "subs": [{"id": s["id"], "lang": s["lang"], "codec": s.get("codec"),
+                      "name": s.get("name"), "forced": s.get("forced"), "sdh": s.get("sdh")}
+                     for s in p.get("subs", [])]}
 
 
 @api.get("/movie/{tmdb_id}/context")

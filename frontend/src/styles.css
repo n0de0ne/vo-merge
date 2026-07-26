@@ -212,3 +212,11 @@ input.sync { width: 110px; }
 }
 pre.logs.mini { max-height: 220px; font-size: 11.5px; }
 .panel.warnbar { border-color: #6b4a2c; background: #241c12; color: #ffc06b; display: flex; align-items: center; }
+
+/* languages read off the file itself (mkvmerge), plus what's still missing */
+.tracks { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; }
+.tracks .needs {
+  font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 999px;
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border: 1px solid rgba(255, 176, 62, .35);
+}
