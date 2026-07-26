@@ -435,7 +435,15 @@ def _scan_tagged(cfg):
 
 
 # ---------------------------------------------------------------- SEARCH + SCORE
-def score_release(r, otitle, year, imdb, tmdb, want_res, want_src):
+def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=()):
+    """Score a Prowlarr result for this title, or None to reject it.
+
+    `need` = the audio languages this file is still missing (its `need_audio`). It only matters
+    for French-dub-only releases: the library file is normally ALREADY the French dub, so such a
+    release adds nothing and is rejected — that guard is why "French" was never downloadable.
+    When `fre` is genuinely one of the missing languages (an English-only or JP-only file), a
+    French release IS the thing that fills the gap, so let it through. It earns no MULTI bonus,
+    so a MULTI or English release still outranks it whenever one exists."""
     t = r.get("title", ""); tl = t.lower()
     idok = (imdb and r.get("imdbId") == imdb) or (tmdb and r.get("tmdbId") == tmdb)
     titleok = idok or (_toks(otitle) and
@@ -443,8 +451,8 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src):
               any(str(year + d) in t for d in (-1, 0, 1)))
     if not titleok:
         return None
-    if FR_DUB.search(t) and not EN_OK.search(t):
-        return None                      # French-dub-only -> skip
+    if FR_DUB.search(t) and not EN_OK.search(t) and "fre" not in set(need):
+        return None                      # French-dub-only, and French isn't missing -> skip
     sc = min(int(r.get("seeders") or 0), 100)
     if want_res and want_res.lower() in tl: sc += 60
     if want_src and re.search(want_src[:3], tl): sc += 30
@@ -466,6 +474,7 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
         otitle = mv["title"]              # nothing -> query+match on Radarr's English title instead
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
+    need = {x for x in (mv.get("need_audio") or "").split(",") if x}
     try:
         results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
@@ -474,7 +483,8 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
     tried = set(_json.loads(mv.get("tried") or "[]"))
     out = []
     for r in results:
-        sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src)
+        sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src,
+                           need=need)
         if sc is None:
             continue
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
@@ -1014,15 +1024,21 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
     have |= {a["lang"] for a in picked}
-    if not ("eng" in have or (orig_codes & have)):
-        core.set_status(tmdb_id, "error",
-                        error="merge: no English or original-language (VO) audio to add"); return
     subs = _pick_subs(di, bi, cfg, kind)
     if not ids and not subs:
-        # base already has the wanted audio (English/VO) and needs no subtitles -> gap already
-        # filled (stale vo-gap tag or a prior merge). Mark done, don't error on "nothing to add".
+        # The donor contributes nothing. Two very different reasons, so decide from the FILE
+        # rather than assuming: either the library file already meets its language profile —
+        # a stale record or a prior merge, mark it done — or this release simply carried none
+        # of the languages still missing, in which case blocklist it and try another. The old
+        # check demanded English specifically, which rejected a donor that carried exactly the
+        # language the record was short of (French, or a VO).
+        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg)
+        if still_a or still_s:
+            reject_and_retry(tmdb_id, "release carries none of the missing languages "
+                                      f"(still needs {'+'.join(still_a + still_s)})", cfg, delta)
+            return
         core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
-        core.log(f"merge {tmdb_id}: library already has the wanted audio -> done")
+        core.log(f"merge {tmdb_id}: library already meets its language profile -> done")
         en_dir = mirror_to_en(fr, cfg)
         plex_refresh(cfg, [os.path.dirname(fr).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1),
                            en_dir], mv.get("title"), year=mv.get("year"))

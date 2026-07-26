@@ -220,6 +220,18 @@ library copies analysed.
   isn't English and no English exists, graft the **original-language (VO)** track instead
   (e.g. Norwegian for "Kraken"). `_orig_codes(name)` maps Radarr/Sonarr `originalLanguage`
   → ffprobe audio codes (excludes eng/fre, which are handled directly).
+- **French is targetable too, but only when it's actually missing.** A French-dub-only release
+  is normally rejected outright (`score_release`, `tv._search`): the library file already IS the
+  French dub, so such a release adds nothing and would just burn a slot. That guard is why
+  French could never be downloaded. It now consults the record's `need_audio`, so an English-only
+  or JP-only file — where `fre` genuinely is the gap — can grab a French release. It earns no
+  MULTI bonus (250 vs 50), so a MULTI or English release still wins whenever one exists. With no
+  `need_audio` recorded the old conservative behaviour applies.
+- **"Nothing to add" is decided from the file, not from "is English present".** Both merge paths
+  used to demand English and error otherwise, which rejected a donor carrying exactly the
+  language the record was short of. Now, when the donor contributes no track, `media.gap_langs`
+  re-checks the base: still missing something → blocklist that release and try another; profile
+  met → mark it done.
 - **Framerate mismatch → drift, not reject.** Don't reject on differing fps; let
   `sync.detect()` measure a **linear drift** and apply `mkvmerge --sync TID:offset,num/den`.
   Only bail if auto-sync is off, or if fps differ but no reliable drift could be measured.

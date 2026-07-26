@@ -289,10 +289,12 @@ def _abs_match(title, absn):
     return bool(re.search(rf'(?:\s-\s|\bep\.?\s*|\be)0*{int(absn)}\b', title, re.I))
 
 
-def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None):
-    """Return best (score, seeders, title, link) for an English release, or None.
+def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=()):
+    """Return best (score, seeders, title, link) for a usable release, or None.
     `absn` = this episode's absolute number, so an anime release that numbers absolutely
-    ('Title - 51') still matches a search for its aired S04E15."""
+    ('Title - 51') still matches a search for its aired S04E15.
+    `need` = languages still missing; a French-dub-only release is only worth grabbing when
+    French is one of them (see pipeline.score_release)."""
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
         results = pro.search(query, cfg["en_indexer_ids"])
@@ -302,7 +304,8 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
+           and "fre" not in set(need):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -340,6 +343,7 @@ def season_candidates(series_id, season, cfg=None):
     # An absolute-as-S01 anime library files several AIRED seasons under one library season, so
     # accept a pack for any season this group actually spans (and drop the Sxx from the query
     # when it spans more than one — a bare title surfaces the per-season and complete packs).
+    need = {x for e in eps for x in (e.get("need_audio") or "").split(",") if x}
     rseasons = sorted({_release_se(e, cfg)[0] for e in eps}) or [season]
     query = f"{title} S{rseasons[0]:02d}" if len(rseasons) == 1 else title
     import json as _json
@@ -355,7 +359,8 @@ def season_candidates(series_id, season, cfg=None):
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
+           and "fre" not in need:
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -442,6 +447,7 @@ def episode_candidates(ep_id, cfg=None):
     title = e["series_title"]
     season, ep = _release_se(e, cfg)          # search by the numbering releases actually use
     absn = _abs_num(e, cfg)
+    need = {x for x in (e.get("need_audio") or "").split(",") if x}
     import json as _json
     tried = set(_json.loads(e.get("tried") or "[]"))
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
@@ -453,7 +459,8 @@ def episode_candidates(ep_id, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t):
+        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
+           and "fre" not in need:
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -564,7 +571,8 @@ def stage_search(cfg=None):
             break
         if len(eps) >= cfg["tv_pack_threshold"]:
             q = f"{title} S{season:02d}"
-            best = _search(q, cfg, want_pack=True, season=season)
+            best = _search(q, cfg, want_pack=True, season=season,
+                           need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x})
             if best:
                 sc, seed, rtitle, link = best
                 h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
@@ -588,7 +596,8 @@ def stage_search(cfg=None):
                 break
             rs, rn = rel[e["id"]]
             q = f"{title} S{rs:02d}E{rn:02d}"
-            best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg))
+            best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
+                           need={x for x in (e.get("need_audio") or "").split(",") if x})
             if not best or best[0] < cfg["min_seeders"]:
                 core.set_ep_status(e["id"], "no_release",
                                    candidate_title=(best[2] if best else None))
@@ -677,11 +686,18 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
     have |= {a["lang"] for a in picked}
-    if "eng" not in have:
-        core.set_ep_status(ep["id"], "error", error="merge: no English audio to add"); return
     subs = _pick_subs(di, bi, cfg, kind)
     if not ids and not subs:
-        # episode file already has English -> already filled (stale tag / prior merge), mark done
+        # Donor contributes nothing — decide from the FILE, not from "is English present":
+        # still short of a target language means this release was the wrong one, whereas a file
+        # that meets its profile is simply already done. Demanding English specifically used to
+        # reject a donor carrying exactly the language the record needed.
+        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg)
+        if still_a or still_s:
+            core.set_ep_status(ep["id"], "error", progress="",
+                               error="merge: release carries none of the missing languages "
+                                     f"(still needs {'+'.join(still_a + still_s)})")
+            return
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"tv merge {ep['id']}: already has English -> done")
         _plex_ep_refresh(ep, cfg)
