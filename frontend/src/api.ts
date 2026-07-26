@@ -12,6 +12,9 @@ export interface Movie {
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
+  paused?: boolean;
+  hold?: string | null;      // "paused" | "scanning" — why no new work is starting
+  merging_now?: number;      // merges still in flight (a pause lets these finish)
 }
 export interface Episode {
   id: string; series_id: number; series_title: string; season: number; episode: number;
@@ -80,6 +83,9 @@ export const api = {
   test: (which: string) =>
     j<{ ok: boolean; error?: string }>(`/api/test/${which}`, { method: "POST" }),
   scan: () => j<{ found: number }>("/api/scan", { method: "POST" }),
+  pause: (on: boolean) =>
+    j<{ ok: boolean; paused: boolean; in_flight: string[] }>(
+      "/api/pause", { method: "POST", body: JSON.stringify({ on }) }),
   searchAll: () => j<{ ok: boolean; started: boolean; pending?: number; slots?: number | null; note?: string }>(
     "/api/search_all", { method: "POST" }),
   search: (id: number) => j<Movie>(`/api/movie/${id}/search`, { method: "POST" }),

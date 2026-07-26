@@ -220,3 +220,7 @@ pre.logs.mini { max-height: 220px; font-size: 11.5px; }
   padding: 1px 6px; border-radius: 999px;
   color: #ffcf8f; background: rgba(255, 176, 62, .13); border: 1px solid rgba(255, 176, 62, .35);
 }
+
+/* global pause brake in the header */
+header.top { display: flex; align-items: center; gap: 10px; }
+.badge.paused { color: #ffcf8f; background: rgba(255,176,62,.14); border-color: rgba(255,176,62,.4); }

@@ -157,6 +157,34 @@ usually ships them — so taking them costs one extra mkvmerge argument, not ano
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
 
+## Pause & holds
+
+`paused` (header button, `POST /api/pause`) is a brake, not a kill switch: no NEW searches,
+grabs or merges start, but work already in flight finishes — aborting `mkvmerge` mid-write would
+leave a corrupt library file — so load drops as the current merge ends, and the header says how
+many are still going. **Scans keep running while paused**, which is the point: pausing is how you
+let a library re-read finish undisturbed.
+
+`pipeline.hold_reason()` is the single answer every stage and the UI share: `"paused"`, or
+`"scanning"` when `SCAN_LOCK` is held. Searches also hold off during a rescan — grabbing off a
+half-finished scan picks releases for gaps that may not exist and burns slots the scan is about
+to re-price.
+
+## Plex refresh — analyze, and in BOTH libraries
+
+A merge rewrites the library file **in place**, so its path and name never change and a plain
+`scan` will not re-read the streams — only `analyze` does. Two things this got wrong:
+- the `-EN` mirror only ever got a bare `scan_path`, so a graft into a title already in the EN
+  library (e.g. adding subtitles to a file that already had English audio) never showed up there;
+- `_rating_key` returned only the FIRST match, but a mirrored title exists **twice** — once in
+  `Films`/`Series`/`Anime` and once in `Films-EN`/`Series-EN`/`Anime-EN`, as two items with two
+  keys — so whichever Plex listed first was analysed and the other stayed stale.
+
+Now `mirror_to_en()` creates the symlink and *returns* the EN folder, and `plex_refresh(cfg,
+[fr_dir, en_dir], …)` scans both folders and analyses **every** matching ratingKey, on **every**
+configured PMS (`plex_url` + `plex2_url`). Verified: 2 servers x 2 folders scanned, 2 servers x 2
+library copies analysed.
+
 ## Merge rules (important, non-obvious)
 
 - **Keep the better video, graft the other's audio.** `_video_quality` = (height, bitrate).

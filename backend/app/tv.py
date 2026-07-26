@@ -10,9 +10,9 @@ from collections import defaultdict
 from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       mirror_to_en, _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
+                       _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
                        EN_OK, EN_AUDIO, RES, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _pick_subs, _donor_opts)
+                       _pick_subs, _donor_opts, hold_reason)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -531,6 +531,9 @@ def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
         return
+    why = hold_reason(cfg)
+    if why:
+        core.log(f"tv search: holding off ({why})"); return
     budget = grab_budget(cfg)                        # flow control: cap downloads in flight (shared with films)
     if budget <= 0:
         core.log(f"tv search: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
@@ -606,12 +609,15 @@ def _merge_episode(ep, en_file, cfg, hint=None):
 
 
 def _plex_ep_refresh(ep, cfg):
-    """Refresh + analyze this episode on every PMS (master + replica) so the grafted English
-    shows up on both — a plain scan won't re-read streams after an in-place remux."""
-    from .pipeline import plex_refresh
+    """Refresh + analyze this episode on every PMS (master + replica) and in BOTH libraries that
+    hold it — Series/Anime and their -EN mirrors. A plain scan won't re-read streams after an
+    in-place remux, and the -EN entry points at the same file, so it needs analysing too."""
+    from .pipeline import plex_refresh, mirror_to_en
     try:
         folder = os.path.dirname(ep["french_path"]).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-        plex_refresh(cfg, folder, ep["series_title"], season=ep["season"], episode=ep["episode"])
+        en_dir = mirror_to_en(ep["french_path"], cfg)     # ensure the -EN symlink exists first
+        plex_refresh(cfg, [folder, en_dir], ep["series_title"],
+                     season=ep["season"], episode=ep["episode"])
     except Exception as e:
         core.log(f"tv plex refresh {ep['id']}: {e}")
 
@@ -640,7 +646,6 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             core.log(f"tv merge {ep['id']}: MULTI used directly")
             try: _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
             except Exception: pass
-            mirror_to_en(fr, cfg)
             _plex_ep_refresh(ep, cfg)
         else:
             core.set_ep_status(ep["id"], "error", error="multi remux failed")
@@ -672,7 +677,6 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         # episode file already has English -> already filled (stale tag / prior merge), mark done
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"tv merge {ep['id']}: already has English -> done")
-        mirror_to_en(fr, cfg)
         _plex_ep_refresh(ep, cfg)
         return
     # manual offset skips detection; honour a stored stretch ratio (see pipeline)
@@ -722,7 +726,6 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
     except Exception:
         pass
-    mirror_to_en(fr, cfg)          # add to Series-EN/Anime-EN + refresh that section now
     _plex_ep_refresh(ep, cfg)      # + analyze the episode on both PMS so the new audio shows
     return (offset, drift)         # cache as the pack hint for the next episode
 

@@ -116,6 +116,11 @@ DEFAULTS = {
                                            # won't grab another until a merge finishes + donor is
                                            # freed, dropping the count below the cap.
     "enabled": False,                      # master switch; off until configured
+    "paused": False,                       # temporary brake: no NEW searches, grabs or merges.
+                                           # Work already in flight finishes (killing mkvmerge
+                                           # mid-write would leave a corrupt file), so the load
+                                           # drops as the current merge ends. Scans still run —
+                                           # pausing is how you let a rescan finish undisturbed.
 }
 
 _lock = threading.Lock()

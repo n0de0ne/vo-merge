@@ -1258,6 +1258,36 @@ function Logs() {
 }
 
 // ---------------- App ----------------
+// Global brake, in the header so it's reachable from every tab. Pausing stops NEW searches,
+// grabs and merges; anything already merging finishes (killing mkvmerge mid-write would leave a
+// corrupt library file), so the header says how many are still in flight.
+function PauseControl() {
+  const [st, setSt] = useState<Status | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.status().then(setSt).catch(() => {}), 5000);
+  if (!st) return null;
+  const toggle = async () => {
+    setBusy(true);
+    try { await api.pause(!st.paused); await api.status().then(setSt); }
+    finally { setBusy(false); }
+  };
+  return (
+    <>
+      {st.paused
+        ? <span className="badge paused">⏸ paused
+            {!!st.merging_now && <> · {st.merging_now} merge(s) finishing</>}</span>
+        : st.hold === "scanning" &&
+            <span className="badge">⏳ scan running — grabs held</span>}
+      <button className="btn sec" disabled={busy} onClick={toggle}
+        title={st.paused
+          ? "Resume searches, grabs and merges"
+          : "Stop starting new searches, grabs and merges. Work already running finishes; scans keep going."}>
+        {st.paused ? "▶ Resume" : "⏸ Pause"}
+      </button>
+    </>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("overview");
   const tabs: [string, string][] = [
@@ -1269,6 +1299,8 @@ export default function App() {
       <header className="top">
         <h1>🎬 VO Merger</h1>
         <span className="badge">multi-language library builder</span>
+        <div className="spacer" />
+        <PauseControl />
       </header>
       <nav>
         {tabs.map(([k, label]) =>

@@ -51,6 +51,21 @@ FINISH_LOCK = threading.Lock()
 # Same for a search sweep: hammering the indexers twice over concurrently gets you rate-limited.
 SEARCH_LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()   # a library probe takes minutes; never run two at once
+def hold_reason(cfg=None):
+    """Why no NEW work should start right now, or None. One answer shared by every stage so the
+    UI and the pipeline can never disagree:
+      "paused"   - the operator pulled the brake (config `paused`)
+      "scanning" - a library re-read is in progress. Grabbing off a half-finished scan picks
+                   releases for gaps that may not exist and wastes slots the scan is about to
+                   re-price, so searches wait for it rather than racing it."""
+    cfg = cfg or core.load_config()
+    if cfg.get("paused"):
+        return "paused"
+    if SCAN_LOCK.locked():
+        return "scanning"
+    return None
+
+
 # progress of the current/last full rescan, so the UI can show a multi-minute job is alive
 SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
               "films": None, "episodes": None, "error": None}
@@ -994,7 +1009,9 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         # filled (stale vo-gap tag or a prior merge). Mark done, don't error on "nothing to add".
         core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
         core.log(f"merge {tmdb_id}: library already has the wanted audio -> done")
-        mirror_to_en(fr, cfg)
+        en_dir = mirror_to_en(fr, cfg)
+        plex_refresh(cfg, [os.path.dirname(fr).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1),
+                           en_dir], mv.get("title"), year=mv.get("year"))
         return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     # A manually-set offset skips detection. Honour a stored stretch ratio too, so a
@@ -1112,16 +1129,19 @@ def _plex_targets(cfg):
     return out
 
 
-def plex_refresh(cfg, folder, title, year=None, season=None, episode=None):
-    """Refresh + analyze an item on ALL configured PMS (master + replica), so a freshly grafted
-    audio track shows up on both. A plain scan won't re-read streams after an in-place remux —
-    analyze does. Best-effort per server; never raises into the merge flow."""
+def plex_refresh(cfg, folders, title, year=None, season=None, episode=None):
+    """Refresh + analyze an item on ALL configured PMS (master + replica), across ALL the
+    libraries that hold it — the FR library AND its -EN mirror. Grafting audio or subtitles
+    rewrites the file IN PLACE, and a plain scan does not re-read streams of a file whose path
+    and name are unchanged; only `analyze` does. Best-effort per server; never raises into the
+    merge flow."""
     res = []
+    folders = [f for f in ([folders] if isinstance(folders, str) else folders) if f]
     for p in _plex_targets(cfg):
         host = p.url.split("//")[-1]
         try:
-            rk = p.refresh_analyze(folder, title, year=year, season=season, episode=episode)
-            res.append(f"{host}={'analyzed' if rk else 'scan-only'}")
+            keys = p.refresh_analyze(folders, title, year=year, season=season, episode=episode)
+            res.append(f"{host}={len(keys)} analyzed" if keys else f"{host}=scan-only")
         except Exception as e:
             res.append(f"{host}=ERR:{str(e)[:40]}")
     return res
@@ -1131,27 +1151,30 @@ EN_LIBS = {"Films": "Films-EN", "Series": "Series-EN", "Anime": "Anime-EN"}
 
 
 def mirror_to_en(libfile, cfg=None):
-    """A just-merged file now has English -> add its symlink to the matching -EN library and
-    refresh that -EN Plex section immediately, so it shows up without waiting for the scheduled
-    mirror script. Best-effort; never raises into the merge flow."""
+    """A just-merged file now has English -> add its symlink to the matching -EN library, and
+    return that library's folder as Plex sees it so the caller can refresh + ANALYZE it in the
+    same pass as the FR folder. Returns None when the file isn't in a mirrored library.
+
+    This used to fire a bare `scan_path` here, which is not enough: the -EN entry is a symlink
+    to the same file, so when a merge rewrites it in place (adding subtitles to a title that
+    already had English audio, say) the -EN item's path and name never change and Plex won't
+    re-read its streams. Best-effort; never raises into the merge flow."""
     cfg = cfg or core.load_config()
     try:
         rel = os.path.relpath(libfile, cfg["media_mount"])     # e.g. Films/Movie (2003)/file.mkv
         parts = rel.split(os.sep, 1)
         en_top = EN_LIBS.get(parts[0]) if len(parts) == 2 else None
         if not en_top:
-            return
+            return None
         link = os.path.join(cfg["media_mount"], en_top, parts[1])
         if not os.path.lexists(link):
             os.makedirs(os.path.dirname(link), exist_ok=True)
             os.symlink(os.path.relpath(libfile, os.path.dirname(link)), link)
-        en_dir = os.path.dirname(link).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-        for p in _plex_targets(cfg):          # new symlink -> a scan makes each PMS read it fresh
-            try: p.scan_path(en_dir)
-            except Exception: pass
-        core.log(f"mirror: EN symlink + Plex scan for {en_top}/{parts[1]}")
+            core.log(f"mirror: EN symlink for {en_top}/{parts[1]}")
+        return os.path.dirname(link).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
     except Exception as e:
         core.log(f"mirror EN failed for {libfile}: {e}")
+        return None
 
 
 def finish_movie(tmdb_id, cfg=None):
@@ -1180,12 +1203,13 @@ def finish_movie(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "merged", merged_file=dest)
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
-        # re-read the changed file's streams on every PMS (analyze — a plain scan won't refresh
-        # audio after an in-place remux)
+        # Mirror FIRST so the -EN symlink exists, then refresh + ANALYZE both folders on every
+        # PMS in one pass — a plain scan won't re-read streams after an in-place remux, and the
+        # -EN copy is the same file under a different path, so it needs analysing too.
         plex_dir = libdir.replace(cfg["media_mount"], cfg["plex_media_prefix"], 1)
-        res = plex_refresh(cfg, plex_dir, mv.get("title"), year=mv.get("year"))
+        en_dir = mirror_to_en(dest, cfg)
+        res = plex_refresh(cfg, [plex_dir, en_dir], mv.get("title"), year=mv.get("year"))
         core.log(f"finish {tmdb_id}: placed {dest}; Radarr rescan + Plex refresh {res}")
-        mirror_to_en(dest, cfg)        # add to the -EN library + refresh that section now
         if mv.get("dl_hash"):          # donor served its purpose -> free the space
             try:
                 qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
@@ -1201,6 +1225,9 @@ def stage_search(cfg=None):
     cfg = cfg or core.load_config()
     if not cfg["enabled"]:
         return
+    why = hold_reason(cfg)
+    if why:
+        core.log(f"search films: holding off ({why})"); return
     budget = grab_budget(cfg)                      # flow control: cap downloads in flight
     if budget <= 0:
         core.log(f"search films: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
@@ -1276,7 +1303,7 @@ def merge_worker(index=0):
             if index >= MERGE_GATE.limit(cfg):
                 core.log(f"merge worker #{index} retired (max_parallel_merges lowered)")
                 return
-            if cfg.get("enabled") and merge_next(cfg):
+            if cfg.get("enabled") and not cfg.get("paused") and merge_next(cfg):
                 continue                       # straight on to the next queued item
         except Exception as e:
             core.log(f"merge worker #{index} error: {e}")

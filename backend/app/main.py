@@ -28,6 +28,8 @@ api = FastAPI()
 def status():
     cfg = core.load_config()
     return {"enabled": cfg["enabled"], "grab_mode": cfg["grab_mode"],
+            "paused": bool(cfg.get("paused")), "hold": pipeline.hold_reason(cfg),
+            "merging_now": len(pipeline._merging_now()),
             "counts": core.status_counts(), "states": core.STATES}
 
 
@@ -175,6 +177,21 @@ def do_finish():
     return {"ok": True, "started": True}
 
 
+class PauseIn(BaseModel):
+    on: bool
+
+
+@api.post("/pause")
+def set_pause(body: PauseIn):
+    """Temporary brake: stop starting NEW searches, grabs and merges. Work already in flight is
+    left to finish — killing mkvmerge mid-write would leave a corrupt library file — so the load
+    drops as the current merge ends rather than instantly. Scans keep running, which is the
+    point: pause is how you let a library re-read finish before anything grabs off it."""
+    core.save_config({"paused": bool(body.on)})
+    core.log("PAUSED by operator" if body.on else "resumed by operator")
+    return {"ok": True, "paused": bool(body.on), "in_flight": pipeline._merging_now()}
+
+
 @api.post("/search_all")
 def search_all():
     """Run the search stage NOW over every pending record, instead of waiting for the search
@@ -185,6 +202,13 @@ def search_all():
 
     if not pipeline.SEARCH_LOCK.acquire(blocking=False):
         return {"ok": True, "started": False, "note": "a search run is already in progress"}
+    why = pipeline.hold_reason()
+    if why:
+        pipeline.SEARCH_LOCK.release()
+        return {"ok": True, "started": False,
+                "note": ("paused — resume first" if why == "paused"
+                         else "a library re-read is running; searching would grab off a "
+                              "half-finished scan")}
 
     pending = len(core.get_movies("pending")) + len(core.get_episodes("pending"))
     try:
