@@ -281,7 +281,10 @@ def init_tv():
                                      # what the FILE actually holds (see movies table)
                                      "audio_langs": "TEXT", "sub_langs": "TEXT",
                                      "needs": "TEXT", "added_subs": "TEXT",
-                                     "need_audio": "TEXT", "need_subs": "TEXT"})
+                                     "need_audio": "TEXT", "need_subs": "TEXT",
+                                     # series' original language — the merge needs the same
+                                     # inputs the scan used, or the two pick different profiles
+                                     "orig_lang": "TEXT"})
 
 
 def init_probe_cache():

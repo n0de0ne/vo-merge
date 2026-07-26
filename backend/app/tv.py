@@ -211,11 +211,12 @@ def scan(cfg=None):
                     if cur and cur["status"] in ("pending", "no_release", "searching"):
                         core.set_ep_status(ep_id, "merged", added_langs="", progress="", error=None,
                                            audio_langs=alangs, sub_langs=slangs, needs="",
-                                           need_audio="", need_subs="")
+                                           need_audio="", need_subs="", orig_lang=orig_name)
                         filled += 1
                     elif cur:
                         core.set_ep_status(ep_id, cur["status"], audio_langs=alangs,
-                                           sub_langs=slangs, needs="", need_audio="", need_subs="")
+                                           sub_langs=slangs, needs="", need_audio="",
+                                           need_subs="", orig_lang=orig_name)
                     continue
             core.upsert_episode({
                 "id": ep_id, "series_id": s["id"],
@@ -228,7 +229,8 @@ def scan(cfg=None):
                 cur = core.get_episode(ep_id)
                 core.set_ep_status(ep_id, (cur or {}).get("status") or "pending",
                                    audio_langs=alangs, sub_langs=slangs, needs=need,
-                                   need_audio=",".join(miss_a), need_subs=",".join(miss_s))
+                                   need_audio=",".join(miss_a), need_subs=",".join(miss_s),
+                                   orig_lang=orig_name)
             n += 1
     if by_files:
         core.log(f"tv scan(files): {n} gap(s) of {seen} episode(s) probed"
@@ -643,7 +645,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     base, bi, donor, di = (fr, fi, en_file, ei) if fq >= eq else (en_file, ei, fr, fi)
     have = {a["lang"] for a in bi["auds"]}
     # only the profile's target languages the base lacks (anime keeps its JPN VO), one per lang
-    kind = media.kind_of(fr, None, cfg, series_type=ep.get("series_type") or "standard")
+    kind = media.kind_of(fr, ep.get("orig_lang"), cfg,
+                         series_type=ep.get("series_type") or "standard")
     want_a, _ = media.profile(kind, cfg)
     picked = media.wanted_audio(di, bi, want_a)
     ids = [a["id"] for a in picked]
