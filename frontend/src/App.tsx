@@ -1119,6 +1119,14 @@ function Settings() {
           stale tag or an un-analysed file can't hide a gap</span>
         <label>Scan all films</label>{Check("scan_all_movies")}
         <span className="muted">files mode: consider every Radarr film, not just vo-gap tagged ones</span>
+        <label>Counts as filled</label>
+        <select value={val("gap_target") ?? "eng"} onChange={e => set("gap_target", e.target.value)}>
+          <option value="eng">English audio only</option>
+          <option value="eng_or_vo">English or original language</option>
+        </select>
+        <span className="muted">"English only": a FR anime that already has its Japanese track is
+          still a gap — it gets hunted for an English dub. "English or original": that file counts
+          as fine and is left alone (far fewer downloads)</span>
         <label>Add subtitles</label>{Check("want_subs")}
         <span className="muted">take the donor's subtitles while grafting its audio</span>
         <label>Subtitle languages</label>

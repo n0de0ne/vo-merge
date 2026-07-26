@@ -62,6 +62,13 @@ DEFAULTS = {
     "scan_mode": "files",
     "scan_all_movies": True,               # files mode: consider EVERY Radarr movie, not just
                                            # the tagged ones (the tag is what we're replacing)
+    # What counts as "already fine":
+    #   "eng"       -> the target is English. A French anime that also carries its Japanese VO
+    #                  is STILL a gap (this is the point of the app).
+    #   "eng_or_vo" -> English or the original language counts as filled — the host mirror
+    #                  script's "is it watchable" rule. Far fewer downloads; leaves every
+    #                  FRE+JPN anime and every foreign film with its VO alone.
+    "gap_target": "eng",
     "want_subs": True,                     # also graft the donor's subtitles for `sub_langs`
     "sub_langs": ["eng"],                  # subtitle languages worth adding
     "max_sub_tracks": 2,                   # per language, keep at most this many (packs ship 6+)

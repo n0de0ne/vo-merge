@@ -100,8 +100,16 @@ the gap decision itself.
   the file reads as a gap. That errs toward adding a real English track; the opposite error
   leaves a French-only file forever. **`VOSTFR`/`VOST`/`SUBFRENCH` in a filename suppress the
   French hint** — they describe the *subtitles*, so the audio is the original language.
-- **The gap is "no English AND no original-language track"** — the same rule the host mirror
-  script uses, so a Norwegian film that already carries its VO isn't downloaded again.
+- **`gap_target` decides what counts as filled**, and the two answers differ sharply for anime:
+  - **`eng`** (default) — the target is ENGLISH. A French anime rip that also carries its Japanese
+    VO is still missing English, so it IS a gap. This is what the app is for, and it's what the
+    original `_no_eng()` did. It also means every foreign-language film without an English track
+    becomes a gap, so expect a large backlog on a big library (the in-flight cap throttles it).
+  - **`eng_or_vo`** — English *or* the original language counts as filled, i.e. the host mirror
+    script's "is this watchable" rule. Much more conservative: leaves every FRE+JPN anime and
+    every foreign film already carrying its VO alone.
+  The VO **merge** fallback is unaffected either way — when no English release exists, the
+  original-language track is still what gets grafted.
 - **A probe failure is not "no English."** Unreadable files are skipped and counted in the scan
   log, never guessed at.
 - **Probe cache** (`probes` table, keyed by path, invalidated by size+mtime) — the first pass over
@@ -294,7 +302,7 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
-Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `want_subs`/`sub_langs`/
+Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `gap_target` (**eng**|eng_or_vo), `want_subs`/`sub_langs`/
 `max_sub_tracks`/`subs_only_gap`, `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads,

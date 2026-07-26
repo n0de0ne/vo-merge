@@ -238,14 +238,21 @@ def _split(v):
 def gap_kind(auds, subs, orig_codes, cfg):
     """What this file is missing: "audio", "subs", "audio+subs", or "" when nothing.
 
-    Audio is missing when there is neither English NOR the title's original language — the same
-    rule the host mirror script uses to decide a file is watchable, so a Norwegian film that
-    already carries its Norwegian VO isn't downloaded again just for English.
+    `gap_target` decides what "not missing" means, and the two answers differ sharply for anime:
+    - **"eng"** (default) — the target is ENGLISH. A French anime rip that also carries its
+      Japanese VO is still missing English, so it's a gap. This is what the app is for, and it
+      matches the original `_no_eng()` behaviour.
+    - **"eng_or_vo"** — English *or* the title's original language counts as filled, i.e. the
+      rule the host mirror script uses to decide a file is watchable. Much more conservative:
+      every FRE+JPN anime and every foreign film already carrying its VO is left alone.
+
     Subtitles are missing when none of `sub_langs` is present. A subs-only shortfall counts as a
     gap only if `subs_only_gap` is on; otherwise subs ride along with an audio graft and a file
     that merely lacks subtitles doesn't trigger a whole download on its own."""
+    has_audio = ("eng" in auds) or (
+        cfg.get("gap_target", "eng") == "eng_or_vo" and bool(orig_codes & auds))
     need = []
-    if not (("eng" in auds) or (orig_codes & auds)):
+    if not has_audio:
         need.append("audio")
     if cfg.get("want_subs", True):
         want = {norm_lang(x) for x in (cfg.get("sub_langs") or ["eng"])}
