@@ -255,3 +255,20 @@ header.top { display: flex; align-items: center; gap: 10px; }
   letter-spacing: .03em; color: var(--muted); background: var(--panel2);
   border: 1px solid var(--border); vertical-align: middle;
 }
+
+/* Attention rows. Built so nothing depends on the panel being wide: the title takes one line
+   and ellipsis-truncates, the pills sit next to it and never wrap into their own column, and
+   the message spans the full width below, clamped to two lines with the rest in the tooltip. */
+.attn { padding: 8px 2px; border-bottom: 1px solid #232c38; min-width: 0; }
+.attn:last-child { border-bottom: 0; }
+.attn-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.attn-title {
+  flex: 1 1 auto; min-width: 0; font-weight: 550;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attn-head > .pill, .attn-head > .cnt { flex: 0 0 auto; }
+.attn .sub { margin-top: 2px; }
+.attn-head .cnt {
+  padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 700;
+  color: var(--muted); background: var(--panel2); border: 1px solid var(--border);
+}

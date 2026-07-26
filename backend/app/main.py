@@ -874,7 +874,7 @@ def dashboard():
             g["eps"].append((r["season"], r["episode"]))
         for (title, status, err, ai), g in groups.items():
             r = g["row"]
-            span = _tv.fmt_se(g["eps"][:60])
+            span = _tv.fmt_se(g["eps"], max_parts=3)
             attention.append({
                 "kind": "episode", "key": f"e{r['id']}", "count": len(g["eps"]),
                 "title": f"{title} {span}" if len(g["eps"]) == 1 else f"{title} · {span}",

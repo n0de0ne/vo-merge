@@ -541,18 +541,19 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                 onClick={() => goto("review")}>Open review →</button>}</div>
             {d.attention.length === 0 && <div className="muted">All clear 🎉</div>}
             {d.attention.map(a => (
-              <div className="dashrow" key={a.key}>
-                <div className="dashrow-main">
-                  <div className="dashrow-title">{a.title}
-                    {(a.count ?? 1) > 1 && <span className="cnt">{a.count} episodes</span>}</div>
-                  {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
-                  {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
-                  {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
-                </div>
-                <div className="col-end">
+              // Title on ONE truncated line with the pills pinned beside it, then the message
+              // below at full width. The old shape put the pills in a right-hand COLUMN, which
+              // stole ~110px from the text and stacked them vertically as the panel narrowed.
+              <div className="attn" key={a.key}>
+                <div className="attn-head">
+                  <span className="attn-title" title={a.title}>{a.title}</span>
+                  {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
                   <Pill s={a.status} />
                   <AiPill s={a.ai_status} />
                 </div>
+                {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
+                {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
               </div>
             ))}
           </div>

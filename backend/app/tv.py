@@ -40,10 +40,13 @@ def _parse_se(relpath):
     return season, int(em.group(1))
 
 
-def fmt_se(pairs):
+def fmt_se(pairs, max_parts=None):
     """(season, episode) pairs -> a compact human string: 'S01E01-E06, S04E15'. The raw Python
     tuple list this replaces leaked into error messages and the dashboard, where it was both
-    unreadable and long enough to push everything else out of the row."""
+    unreadable and long enough to push everything else out of the row.
+
+    `max_parts` caps the number of ranges shown ('S01E11, S01E16 +6 more'); a scattered set of
+    226 episodes otherwise renders as eight ranges and swamps the row it's meant to label."""
     out, run = [], []
 
     def flush():
@@ -60,6 +63,8 @@ def fmt_se(pairs):
             continue
         flush(); run.append((s_, e_))
     flush()
+    if max_parts and len(out) > max_parts:
+        return ", ".join(out[:max_parts]) + f" +{len(out) - max_parts} more"
     return ", ".join(out)
 
 
