@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState } from "./api";
+import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -327,6 +327,92 @@ function RescanButton({ scope, label }: { scope: "films" | "anime" | "series"; l
   );
 }
 
+// How much of the library actually meets its language targets. Sourced from the probe table —
+// the only complete inventory, since scan() records a movie/episode only when it HAS a gap.
+const LANG_NAME: Record<string, string> = {
+  fre: "French", eng: "English", jpn: "Japanese", spa: "Spanish", ger: "German",
+  ita: "Italian", por: "Portuguese", rus: "Russian", kor: "Korean", zho: "Chinese",
+};
+const lang = (c: string) => LANG_NAME[c] ?? c.toUpperCase();
+
+function LibBar({ l }: { l: CoverageLib }) {
+  const n = Math.max(l.total, 1);
+  const pct = (v: number) => (v / n) * 100;
+  const seg = [
+    { k: "complete", v: l.complete, cls: "ok", label: "meets target" },
+    { k: "subs", v: l.missing_subs, cls: "warn", label: "missing subtitles" },
+    { k: "audio", v: l.missing_audio, cls: "bad", label: "missing audio" },
+    { k: "both", v: l.missing_both, cls: "bad2", label: "missing audio + subtitles" },
+    { k: "unread", v: l.unreadable, cls: "unk", label: "unreadable" },
+  ].filter(s => s.v > 0);
+  return (
+    <div className="covlib">
+      <div className="covhead">
+        <b>{l.name}</b>
+        <span className="muted">{l.total.toLocaleString()} files · targets {l.targets.audio.join("/")} audio</span>
+        <div className="spacer" />
+        <span className="covpct">{Math.round(pct(l.complete))}%</span>
+      </div>
+      <div className="covbar" role="img"
+        aria-label={`${Math.round(pct(l.complete))}% of ${l.name} meets its language target`}>
+        {seg.map(s => (
+          <span key={s.k} className={`seg ${s.cls}`} style={{ width: `${pct(s.v)}%` }}
+            title={`${s.label}: ${s.v.toLocaleString()} (${pct(s.v).toFixed(1)}%)`} />
+        ))}
+      </div>
+      <div className="covlegend">
+        {seg.map(s => (
+          <span key={s.k}><i className={`dot ${s.cls}`} />{s.label} {s.v.toLocaleString()}</span>
+        ))}
+      </div>
+      <div className="covlangs">
+        {(["audio", "subs"] as const).map(which => (
+          <div className="covlangrow" key={which}>
+            <span className="covlangkind">{which === "audio" ? "🔊 audio" : "💬 subs"}</span>
+            {l.targets[which].map(code => {
+              const have = (which === "audio" ? l.audio : l.subs)[code] ?? 0;
+              const p = pct(have);
+              return (
+                <span className="covlang" key={code} title={`${have.toLocaleString()} of ${l.total.toLocaleString()} files have ${lang(code)} ${which}`}>
+                  <span className="covlangname">{lang(code)}</span>
+                  <span className="covmini"><span className={p >= 95 ? "ok" : p >= 50 ? "warn" : "bad"}
+                    style={{ width: `${p}%` }} /></span>
+                  <span className="covlangpct">{Math.round(p)}%</span>
+                </span>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CoveragePanel() {
+  const [c, setC] = useState<Coverage | null>(null);
+  usePoll(() => api.coverage().then(setC).catch(() => {}), 60000);
+  if (!c) return null;
+  if (!c.probed)
+    return (
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 6 }}><b>Language coverage</b></div>
+        <div className="muted">Nothing probed yet — run “Re-read files” on a library tab.</div>
+      </div>
+    );
+  const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 10 }}>
+        <b>Language coverage</b>
+        <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
+          files meet their target · {pct}%
+          {c.unreadable > 0 && <> · <span className="bad">{c.unreadable.toLocaleString()} unreadable</span></>}</span>
+      </div>
+      {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+    </div>
+  );
+}
+
 // ---------------- Interactive release search modal ----------------
 function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
   { title: string; load: () => Promise<Candidate[]>; onGrab: (c: Candidate) => Promise<any>;
@@ -510,6 +596,8 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           <Tile label="Donor disk" value={fmtBytes(d.disk.free)} tone={diskPct! >= 90 ? "bad" : diskPct! >= 80 ? "warn" : undefined}
             sub={<>free · {diskPct}% used</>} />}
       </div>
+
+      <CoveragePanel />
 
       <div className="dash-cols">
         <div className="panel">

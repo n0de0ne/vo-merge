@@ -147,6 +147,65 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     return {"ok": True, "started": True, "scope": scope, "probes": core.probe_stats()}
 
 
+@api.get("/coverage")
+def coverage():
+    """How much of the library actually meets its language targets.
+
+    Reads the `probes` table, which is the ONLY complete inventory: `scan()` deliberately
+    inserts a movies/episodes record only when a file HAS a gap, so those tables can't say what
+    is already fine. Every probed file is here with the languages read off it, so a file that
+    needs nothing is counted too.
+
+    Grouped by top-level library folder, because that is how the operator thinks about it, and
+    each folder is scored against the profile its kind targets."""
+    from . import tv  # noqa: F401  (kept for symmetry with the other endpoints)
+    cfg = core.load_config()
+    mount = (cfg.get("media_mount") or "/media").rstrip("/")
+    anime = {x.lower() for x in (cfg.get("anime_dirs") or ["Anime"])}
+    series = {x.lower() for x in (cfg.get("series_dirs") or ["Series"])}
+    mirrors = {v.lower() for v in pipeline.EN_LIBS.values()}   # symlinks to the same files
+
+    libs = {}
+    with core.db() as c:
+        rows = c.execute("SELECT path, auds, subs, err FROM probes").fetchall()
+    for r in rows:
+        path = r["path"] or ""
+        top = path[len(mount) + 1:].split(os.sep, 1)[0] if path.startswith(mount + "/") else "?"
+        if top.lower() in mirrors:
+            continue                      # the -EN libraries point at the same files
+        kind = "anime" if top.lower() in anime else ("series" if top.lower() in series else "movie")
+        want_a, want_s = media.profile(kind, cfg)
+        L = libs.setdefault(top, {"name": top, "kind": kind, "total": 0, "unreadable": 0,
+                                  "complete": 0, "missing_audio": 0, "missing_subs": 0,
+                                  "missing_both": 0,
+                                  "audio": {k: 0 for k in want_a},
+                                  "subs": {k: 0 for k in want_s},
+                                  "targets": {"audio": want_a, "subs": want_s}})
+        L["total"] += 1
+        if r["err"]:
+            L["unreadable"] += 1
+            continue
+        have_a = {x for x in (r["auds"] or "").split(",") if x}
+        have_s = {x for x in (r["subs"] or "").split(",") if x}
+        for k in want_a:
+            if k in have_a: L["audio"][k] += 1
+        for k in want_s:
+            if k in have_s: L["subs"][k] += 1
+        miss_a = [k for k in want_a if k not in have_a]
+        miss_s = [k for k in want_s if k not in have_s]
+        if miss_a and miss_s:   L["missing_both"] += 1
+        elif miss_a:            L["missing_audio"] += 1
+        elif miss_s:            L["missing_subs"] += 1
+        else:                   L["complete"] += 1
+    order = {"movie": 0, "anime": 1, "series": 2}
+    out = sorted(libs.values(), key=lambda x: (order.get(x["kind"], 9), x["name"]))
+    tot = sum(l["total"] for l in out)
+    return {"libraries": out, "total": tot,
+            "complete": sum(l["complete"] for l in out),
+            "unreadable": sum(l["unreadable"] for l in out),
+            "probed": tot}
+
+
 @api.get("/rescan")
 def rescan_state():
     """Progress of a running (or the last) rescan — it takes minutes, so the UI can say so."""

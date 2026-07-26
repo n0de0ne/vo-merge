@@ -72,6 +72,9 @@ DEFAULTS = {
     },
     "anime_dirs": ["Anime"],               # top-level library folders that mean "anime"; a
                                            # Japanese-original title also gets the anime profile
+    "series_dirs": ["Series"],             # ...and the ones that mean "TV series". Only used to
+                                           # pick a profile for the coverage report, where there
+                                           # is no Sonarr record to ask.
     "want_subs": True,                     # graft the donor's subtitles, not just its audio
     "max_sub_tracks": 2,                   # per language, keep at most this many (packs ship 6+)
     "subs_only_gap": False,                # a file that has English AUDIO but no English SUBS:

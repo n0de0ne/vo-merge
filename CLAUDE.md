@@ -188,6 +188,22 @@ in seconds. Point Radarr/Sonarr **Connect → Webhook** (POST, *On Import* + *On
   everything else (`hold_reason`, `SEARCH_LOCK`, the in-flight cap).
 - `webhook_token` (empty = no check) adds `?token=…` if you ever expose the endpoint.
 
+## Language coverage (`GET /api/coverage`)
+
+"How much of the library is actually correct?" cannot be answered from `movies`/`episodes` —
+`scan()` deliberately inserts a record only when a file HAS a gap, so those tables are a list of
+problems, not an inventory. The **`probes` table is the only complete inventory**: every file the
+scanner has read, with the languages read off it, gap or no gap.
+
+`/api/coverage` groups probes by top-level library folder, scores each against the profile its
+kind targets (`anime_dirs` / `series_dirs` decide which), and returns per library: total,
+`complete`, `missing_audio`, `missing_subs`, `missing_both`, `unreadable`, plus a per-language
+count for every target code. The Overview renders it as a stacked bar + per-language mini bars.
+The `-EN` mirrors are skipped — they're symlinks to the same files and would double-count.
+
+Coverage only reflects what has been **probed**, so it is empty until a scan or "Re-read files"
+has run, and it grows as the library is read.
+
 ## Pause & holds
 
 `paused` (header button, `POST /api/pause`) is a brake, not a kill switch: no NEW searches,

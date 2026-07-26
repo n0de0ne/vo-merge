@@ -33,6 +33,15 @@ export interface RescanState {
   films: number | null; episodes: number | null; error: string | null;
   probes: { cached: number; unreadable: number };
 }
+export interface CoverageLib {
+  name: string; kind: string; total: number; unreadable: number;
+  complete: number; missing_audio: number; missing_subs: number; missing_both: number;
+  audio: Record<string, number>; subs: Record<string, number>;
+  targets: { audio: string[]; subs: string[] };
+}
+export interface Coverage {
+  libraries: CoverageLib[]; total: number; complete: number; unreadable: number; probed: number;
+}
 export interface DL {
   progress: number; dlspeed: number; eta: number; state: string;
   seeds: number; size: number; downloaded: number;
@@ -119,6 +128,7 @@ export const api = {
     j<{ ok: boolean; started: boolean; note?: string }>(
       `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
+  coverage: () => j<Coverage>("/api/coverage"),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),
