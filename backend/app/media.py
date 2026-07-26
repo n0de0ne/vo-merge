@@ -226,6 +226,95 @@ def wanted_audio(donor_info, base_info, want, extra=()):
     return sorted(out, key=lambda t: t["id"])
 
 
+# ------------------------------------------------- what a RELEASE NAME advertises
+# Scoring used to know exactly two things: "French dub" (reject) and "English/MULTI" (boost).
+# That is the right rule for one library shape and blind for every other — a profile targeting
+# German or Spanish got no signal at all, and a Spanish-dub release wasn't recognised as a dub.
+# These markers are the scene tags a release uses to advertise the audio it carries, per
+# language, so scoring can ask the only question that generalises: does this release appear to
+# carry a language this file is still missing?
+#
+# Only full words and the unambiguous short tags are listed. Two-letter codes (NL, DE, IT…) are
+# deliberately absent: they collide with resolution/source tokens and with ordinary title words,
+# and a false positive here REJECTS a good release.
+_DUB_MARKERS = {
+    "fre": r'VFF|VFQ|VFI|VF2|VFNF|TRUEFRENCH|FRENCH|FRANCAIS|FRAN[CÇ]AIS|(?<![A-Z])VF(?![A-Z])',
+    "eng": r'ENGLISH|(?<![A-Z])ENG(?![A-Z])',
+    "ger": r'GERMAN|DEUTSCH|(?<![A-Z])GER(?![A-Z])',
+    "spa": r'SPANISH|ESPANOL|ESPA[NÑ]OL|CASTELLANO|LATINO|(?<![A-Z])SPA(?![A-Z])',
+    "ita": r'ITALIAN|ITALIANO|(?<![A-Z])ITA(?![A-Z])',
+    "jpn": r'JAPANESE|JAPONAIS|(?<![A-Z])JPN(?![A-Z])',
+    "por": r'PORTUGUESE|DUBLADO|(?<![A-Z])POR(?![A-Z])',
+    "rus": r'RUSSIAN|(?<![A-Z])RUS(?![A-Z])',
+    "kor": r'KOREAN|(?<![A-Z])KOR(?![A-Z])',
+    "zho": r'CHINESE|MANDARIN|CANTONESE',
+    "nld": r'DUTCH|NEDERLANDS',
+    "pol": r'POLISH|LEKTOR|POLSKI',
+    "tur": r'TURKISH|TURKCE',
+    "swe": r'SWEDISH', "nor": r'NORWEGIAN', "dan": r'DANISH', "fin": r'FINNISH',
+    "ces": r'CZECH', "hun": r'HUNGARIAN', "ell": r'GREEK', "ron": r'ROMANIAN',
+    "ara": r'ARABIC', "heb": r'HEBREW', "hin": r'HINDI', "tha": r'THAI',
+    "vie": r'VIETNAMESE', "ukr": r'UKRAINIAN', "cat": r'CATALAN',
+}
+_DUB_RX = {c: re.compile(rf'(?<![A-Za-z])(?:{p})(?![a-z])', re.I) for c, p in _DUB_MARKERS.items()}
+# "carries several audio languages" — not a language of its own
+_MULTI_RX = re.compile(r'(?<![A-Za-z])(MULTI|DUAL[\s._-]?AUDIO|DUAL)(?![A-Za-z])', re.I)
+# "original audio, foreign subs" — says what the audio ISN'T (a dub), so never reject on it
+_ORIG_RX = re.compile(r'(?<![A-Za-z])(VOSTFR|VOSTA|VOST|SUBFRENCH|SUBBED|VO)(?![A-Za-z])', re.I)
+
+
+# Scene names are `Title . <year|SxxExx|resolution|source> . TAGS…`, so the tags live after the
+# first of those. Scanning only that zone is what stops a film called "The German Doctor" from
+# reading as a German dub — while still seeing the real GERMAN tag when the same title has one.
+_TAGZONE_RX = re.compile(
+    r'(?<![0-9])(19\d{2}|20\d{2})(?![0-9])|(?<![A-Za-z])[Ss]\d{1,3}([Ee]\d{1,4})?(?![0-9])'
+    r'|(?<![A-Za-z0-9])(2160p|1080p|720p|480p)|(?<![A-Za-z])(blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|dvdrip|remux)',
+    re.I)
+
+
+def release_langs(title, ignore_title=""):
+    """(advertised languages, multi, original) read off a RELEASE NAME.
+
+    Only the tag zone — everything after the year / SxxExx / resolution / source — is inspected,
+    because that is where a scene release states its audio. `ignore_title` is used only as a
+    fallback for names with no such anchor, where its words are dropped before scanning."""
+    t = title or ""
+    m = _TAGZONE_RX.search(t)
+    if m:
+        t = t[m.start():]
+    elif ignore_title:
+        drop = _toks(ignore_title)
+        if drop:
+            t = " ".join(w for w in re.split(r'([^A-Za-z0-9]+)', t) if w.lower() not in drop)
+    return ({c for c, rx in _DUB_RX.items() if rx.search(t)},
+            bool(_MULTI_RX.search(t)), bool(_ORIG_RX.search(t)))
+
+
+def _toks(s):
+    return set(re.findall(r'[a-z0-9]+', (s or '').lower()))
+
+
+def useless_release(title, need, media_title=""):
+    """True when a release advertises dubs and NONE of them is a language this file still needs.
+
+    This is the generalised form of the old French-dub-only reject: the library file already
+    carries its own dub, so a release offering only that same language adds nothing and would
+    burn a download slot. A release that advertises nothing (the common `Movie.2019.1080p.BluRay`
+    shape) says nothing about its audio and is never rejected here; nor is MULTI, nor an
+    original-audio/VOST release."""
+    langs_, multi, orig = release_langs(title, media_title)
+    if multi or orig or not langs_:
+        return False
+    return not (langs_ & {norm_lang(x) for x in (need or ())})
+
+
+def lang_hits(title, need, media_title=""):
+    """How many of the still-missing languages this release name advertises — direct evidence
+    it is worth grabbing, and the language-agnostic replacement for the old English-only boost."""
+    langs_, _, _ = release_langs(title, media_title)
+    return len(langs_ & {norm_lang(x) for x in (need or ())})
+
+
 # ------------------------------------------------------------------ audit (cached)
 def audit(path, refresh=False):
     """(audio langs, subtitle langs, error) for a library file, read from the container and

@@ -70,11 +70,9 @@ def hold_reason(cfg=None):
 SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
               "films": None, "episodes": None, "error": None}
 
-FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)
-EN_OK  = re.compile(r'\b(MULTI|VOSTFR|VOST|ENGLISH|VO)\b', re.I)
-# strong signals the release actually carries an English track (esp. anime: "Dual Audio" =
-# Japanese + English). Used to boost/prefer English-bearing releases.
-EN_AUDIO = re.compile(r'(DUAL[\s._-]?AUDIO|\bDUAL\b|\bENG\b|\bENGLISH\b)', re.I)
+# Language detection in release names now lives in media._DUB_MARKERS, which carries a marker
+# per language so scoring works for any profile — the old FR_DUB / EN_OK / EN_AUDIO trio only
+# knew "French dub" and "English/MULTI" and was blind to every other target.
 RES    = re.compile(r'(2160p|1080p|720p|480p)', re.I)
 SRC    = re.compile(r'(blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|dvdrip|remux)', re.I)
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -438,12 +436,16 @@ def _scan_tagged(cfg):
 def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=()):
     """Score a Prowlarr result for this title, or None to reject it.
 
-    `need` = the audio languages this file is still missing (its `need_audio`). It only matters
-    for French-dub-only releases: the library file is normally ALREADY the French dub, so such a
-    release adds nothing and is rejected — that guard is why "French" was never downloadable.
-    When `fre` is genuinely one of the missing languages (an English-only or JP-only file), a
-    French release IS the thing that fills the gap, so let it through. It earns no MULTI bonus,
-    so a MULTI or English release still outranks it whenever one exists."""
+    `need` = the audio languages this file is still missing (its `need_audio`), and it drives
+    both halves of the language judgement — for ANY language, not just French and English:
+
+    - **reject** a release that advertises dubs and none of them is missing here. The library
+      file already carries its own dub, so such a release adds nothing and burns a slot.
+    - **boost** a release that names a language this file lacks (+60 each), on top of the MULTI
+      bonus. So a MULTI still outranks a single-language dub, and a dub of a language we need
+      outranks an unmarked release.
+
+    With no `need` recorded nothing is rejected on language grounds — the conservative default."""
     t = r.get("title", ""); tl = t.lower()
     idok = (imdb and r.get("imdbId") == imdb) or (tmdb and r.get("tmdbId") == tmdb)
     titleok = idok or (_toks(otitle) and
@@ -451,13 +453,14 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=()):
               any(str(year + d) in t for d in (-1, 0, 1)))
     if not titleok:
         return None
-    if FR_DUB.search(t) and not EN_OK.search(t) and "fre" not in set(need):
-        return None                      # French-dub-only, and French isn't missing -> skip
+    if media.useless_release(t, need, otitle):
+        return None                      # advertises only dubs we already have -> adds nothing
     sc = min(int(r.get("seeders") or 0), 100)
     if want_res and want_res.lower() in tl: sc += 60
     if want_src and re.search(want_src[:3], tl): sc += 30
     if idok: sc += 80
-    if re.search(r'\bMULTI\b', t, re.I): sc += 200   # MULTI = both langs, native sync -> strongly prefer
+    if re.search(r'\bMULTI\b', t, re.I): sc += 200   # several langs, natively synced -> prefer
+    sc += 60 * media.lang_hits(t, need, otitle)      # names a language this file is missing
     return sc
 
 
@@ -987,13 +990,14 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         core.set_status(tmdb_id, "error", error="merge: probe failed"); return
     # The "wanted" foreign track is English; if this title's original language isn't English
     # and no English exists, the original-language VO is the fallback (e.g. Norwegian Kraken).
-    rel_langs = {a["lang"] for a in ei["auds"]}
     orig_codes = _orig_codes(mv.get("original_lang"))
-    # A release is "complete" when it has French + a wanted track (English, or the VO when
-    # the release carries no English). Use it DIRECTLY only if its video isn't worse than the
-    # library file; otherwise keep the library video and graft the wanted audio (fall through).
-    has_wanted = ("eng" in rel_langs) or (bool(orig_codes & rel_langs) and "eng" not in rel_langs)
-    if "fre" in rel_langs and has_wanted:
+    # A release is "complete" when it ALONE satisfies this title's audio profile — asked of the
+    # probed file, not of the release name. Use it DIRECTLY only if its video isn't worse than
+    # the library file; otherwise keep the library video and graft what's missing (fall through).
+    # This used to be a literal `"fre" in rel_langs and "eng" in rel_langs`, which is the right
+    # question for exactly one library shape and blind to every other profile.
+    kind0 = media.kind_of(fr, mv.get("original_lang"), cfg)
+    if not media.gap_langs(*media.langs(ei), kind0, cfg)[0]:
         if _video_quality(en, ei["dur"]) >= _video_quality(fr, fi["dur"]):
             core.set_status(tmdb_id, "merging")
             _place_multi(en, mv, cfg, tmdb_id); return

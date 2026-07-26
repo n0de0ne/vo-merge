@@ -4,12 +4,17 @@ Guidance for Claude (and humans) working on this repo.
 
 ## What this is
 
-**vo-merge** is a self-hosted app that makes movie/TV files multi-language. The library
-(managed by Radarr/Sonarr, served by Plex) holds many titles that exist only as a **French
-dub**. vo-merge finds an **English** (or, as a fallback, the **original-language / VO**)
-release on Prowlarr, downloads it via qBittorrent, and **grafts the missing audio track into
-the existing library file** — keeping the existing (usually higher-res) video, A/V-synced —
-then replaces the library file in place so Plex/Radarr paths stay valid.
+**vo-merge** is a **language companion to Radarr and Sonarr**: they decide *what* the library
+holds, vo-merge decides *which languages each file carries*. You declare a target per kind of
+title (`lang_profiles` — e.g. films fre+eng, anime fre+eng+jpn), it probes every file to see what
+is actually there, finds a release on Prowlarr carrying what's missing, downloads it via
+qBittorrent, and **grafts the missing audio and subtitle tracks into the existing library file**
+— keeping the existing (usually higher-res) video, A/V-synced — then replaces the file in place
+so Plex/Radarr paths stay valid.
+
+The original case was a library of French-only dubs needing English, and that is still the
+common one, but nothing in the gap decision, the scoring or the merge is specific to those two
+languages any more.
 
 Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alanstrok/vo-merge`.
 
@@ -45,9 +50,10 @@ merged / review / sync_fail / error / ignored.
 
 1. **scan** — decide the gap by **probing the files** (see "Gap detection" below); Radarr/Sonarr
    supply only metadata. Skip French-origin if `exclude_french_origin`.
-2. **search/score** — Prowlarr search; `score_release` rejects French-dub-only, **strongly
-   prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers both the
-   auto-picker and the UI's interactive search.
+2. **search/score** — Prowlarr search; `score_release` asks one language-agnostic question:
+   *does this release carry something this file is missing?* (see "Release language scoring"),
+   **strongly prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers
+   both the auto-picker and the UI's interactive search.
 3. **grab** — `qb_grab()` adds to qB (see VPN gotcha) and records the real infohash.
 4. **promote** (`promote_completed`, own 1-min timer) — any download at 100% leaves
    `downloading` immediately: resolve `en_file` and move it to **`ready`** = the merge queue.
@@ -209,6 +215,33 @@ Now `mirror_to_en()` creates the symlink and *returns* the EN folder, and `plex_
 [fr_dir, en_dir], …)` scans both folders and analyses **every** matching ratingKey, on **every**
 configured PMS (`plex_url` + `plex2_url`). Verified: 2 servers x 2 folders scanned, 2 servers x 2
 library copies analysed.
+
+## Release language scoring (`media._DUB_MARKERS`)
+
+Scoring used to know exactly two things — "French dub" (reject) and "English/MULTI" (boost) —
+which is right for one library shape and blind to every other: a profile targeting German or
+Spanish got no signal at all, and a Spanish-dub release wasn't recognised as a dub. Now the
+markers are a **per-language table**, so the same rule works for any profile:
+
+- `media.release_langs(title)` → *(languages advertised, multi, original)*.
+- `media.useless_release(title, need)` — reject when a release advertises dubs and **none** is a
+  language this file still needs. A release advertising nothing (`Movie.2019.1080p.BluRay`, the
+  common shape) says nothing about its audio and is never rejected; nor is MULTI, nor VOST/VOSTFR
+  (which state the audio is *original*, i.e. not a dub).
+- `media.lang_hits(title, need)` — +60 (films) / +120 (TV candidates) per missing language the
+  name advertises, so a dub of a language we need beats an unmarked release, and MULTI still
+  beats both.
+
+**Only the tag zone is inspected** — everything after the first year / SxxExx / resolution /
+source token. That's where a scene release states its audio, and scanning only there is what
+stops a film called *The German Doctor* from reading as a German dub. Verified both ways: that
+title alone advertises nothing, while `The German Doctor 2013 GERMAN 1080p` advertises `ger`.
+Two-letter codes (NL, DE, IT…) are deliberately absent from the table — they collide with
+source/resolution tokens, and a false positive here **rejects** a good release.
+
+`_place_multi` (films) and the direct-remux branch (TV) ask the same generalised question of the
+*probed* release: `media.gap_langs(...)` reporting no audio gap means the download alone
+satisfies the profile. Both were literal `fre`+`eng` checks before.
 
 ## Merge rules (important, non-obvious)
 

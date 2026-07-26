@@ -10,8 +10,8 @@ from collections import defaultdict
 from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
-                       _qb_to_local, _free_donor, grab_budget, MERGE_GATE, FR_DUB,
-                       EN_OK, EN_AUDIO, RES, MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
+                       _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
+                       MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
@@ -304,9 +304,8 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
-           and "fre" not in set(need):
-            continue
+        if media.useless_release(t, need, query):
+            continue                     # advertises only dubs this episode already has
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
         if want_pack:
@@ -325,7 +324,7 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
         sc = min(int(r.get("seeders") or 0), 100)
         if RES.search(t): sc += 20
         if re.search(r'\bMULTI\b', t, re.I): sc += 20
-        if EN_AUDIO.search(t): sc += 60          # explicit English / Dual-Audio (anime)
+        sc += 60 * media.lang_hits(t, need, query)   # names a language this episode is missing
         link = _pick_link(r)
         if best is None or sc > best[0]:
             best = (sc, r.get("seeders") or 0, t, link)
@@ -359,8 +358,7 @@ def season_candidates(series_id, season, cfg=None):
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
-           and "fre" not in need:
+        if media.useless_release(t, need, title):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -373,7 +371,7 @@ def season_candidates(series_id, season, cfg=None):
         if is_pack: sc += 50
         if RES.search(t): sc += 20
         if re.search(r"\bMULTI\b", t, re.I): sc += 200
-        if EN_AUDIO.search(t): sc += 120         # explicit English / Dual-Audio (anime)
+        sc += 120 * media.lang_hits(t, need, title)   # names a language this file is missing
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
@@ -459,8 +457,7 @@ def episode_candidates(ep_id, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if FR_DUB.search(t) and not EN_OK.search(t) and not EN_AUDIO.search(t) \
-           and "fre" not in need:
+        if media.useless_release(t, need, title):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -475,7 +472,7 @@ def episode_candidates(ep_id, cfg=None):
         if is_pack: sc += 30
         if RES.search(t): sc += 20
         if re.search(r"\bMULTI\b", t, re.I): sc += 200
-        if EN_AUDIO.search(t): sc += 120          # explicit English / Dual-Audio
+        sc += 120 * media.lang_hits(t, need, title)   # names a language this file is missing
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
@@ -648,9 +645,13 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     ei, fi = probe(en_file), probe(fr)
     if not ei or not fi:
         core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
-    # MULTI episode: download has both langs -> remux directly, but ONLY if its video isn't
-    # worse than the library file; otherwise keep the library video and graft English (below).
-    if {"eng", "fre"} <= {a["lang"] for a in ei["auds"]} \
+    # The download alone satisfies this episode's audio profile -> remux it directly, but ONLY
+    # if its video isn't worse than the library file; otherwise keep the library video and graft
+    # what's missing (below). Asked of the probed file against the profile, not of a literal
+    # eng+fre pair, so it generalises to whatever languages the profile targets.
+    kind0 = media.kind_of(fr, ep.get("orig_lang"), cfg,
+                          series_type=ep.get("series_type") or "standard")
+    if not media.gap_langs(*media.langs(ei), kind0, cfg)[0] \
        and _video_quality(en_file, ei["dur"]) >= _video_quality(fr, fi["dur"]):
         out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
         os.makedirs(os.path.dirname(out), exist_ok=True)
