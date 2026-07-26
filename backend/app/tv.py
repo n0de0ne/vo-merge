@@ -5,7 +5,7 @@ audio onto each French episode (best video kept), in place.
 
 Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scope_series.
 """
-import os, re, subprocess, shutil, time
+import os, re, subprocess, shutil, time, threading
 from collections import defaultdict
 from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
@@ -17,6 +17,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
 _TV_NOT_VISIBLE = {}      # dl_hash -> consecutive sweeps its completed path wasn't visible
+TV_PROMOTE_LOCK = threading.Lock()   # see pipeline.PROMOTE_LOCK — one promote pass at a time
 
 
 def _parse_se(relpath):
@@ -867,6 +868,16 @@ def merge_ready_episode(ep_id, cfg=None):
 
 
 def promote_completed(cfg=None):
+    """Wrapper: only ever one TV promote pass at a time (see pipeline.PROMOTE_LOCK)."""
+    if not TV_PROMOTE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        return _promote_completed(cfg)
+    finally:
+        TV_PROMOTE_LOCK.release()
+
+
+def _promote_completed(cfg=None):
     """Fast sweep: map completed pack/episode downloads onto episodes and queue them for
     merging. No ffmpeg here — just a qB poll and a directory walk."""
     cfg = cfg or core.load_config()
@@ -914,6 +925,7 @@ def promote_completed(cfg=None):
         gap = {(x["season"], x["episode"]): x for x in core.get_episodes()
                if x["series_id"] == sid and x["status"] not in ("merged", "ignored")}
         claimed = 0
+        mapped = 0            # files that DID find a library episode, claimed or not
         taken = set()
         for (s, ep), vid in sorted(files.items()):
             tgt = gap.get((s, ep))
@@ -926,7 +938,10 @@ def promote_completed(cfg=None):
                         core.log(f"tv promote: donor S{s:02d}E{ep:02d} -> {tgt['id']} "
                                  f"(aired/absolute numbering)")
                         break
-            if not tgt or tgt["id"] in taken or tgt["status"] in ("ready", "merging"):
+            if not tgt:
+                continue
+            mapped += 1
+            if tgt["id"] in taken or tgt["status"] in ("ready", "merging"):
                 continue                       # already queued or being merged — don't disturb
             # conditional on the status we just read: if the worker claimed it in between,
             # this fails and we leave the live merge alone (never re-queue a merging episode)
@@ -938,6 +953,13 @@ def promote_completed(cfg=None):
         if claimed:
             queued += claimed
             core.log(f"tv queued: {t['name'][:50]} -> {claimed} episode(s) on the merge queue")
+        elif mapped:
+            # The pack DOES contain these episodes — they were simply already queued, already
+            # merging, or claimed by a concurrent pass a moment ago. Claiming nothing here is a
+            # no-op, NOT a failure: erroring on it (which this used to do, because `claimed == 0`
+            # was treated as "nothing matched") overwrote perfectly good `ready` records and
+            # produced the nonsense "parsed X, wanted X" with both sides identical.
+            core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already queued/merging")
         elif not files:
             # complete, dir present, but ZERO parseable video -> dead release
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")

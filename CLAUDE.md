@@ -339,9 +339,16 @@ Completed-download dead-ends all now terminate instead of looping forever in `do
 - **path never becomes visible** (mount race) — retried `NOT_VISIBLE_MAX` (10) promote passes,
   then `error`.
 - **TV: files parsed but none map to a gap episode** — after aired↔absolute translation has been
-  tried (below), the pack genuinely doesn't hold these episodes. Sets the episodes `error` with
-  the parsed keys *and* the wanted keys in the message, so it surfaces in Review/AI instead of
-  squatting a slot.
+  tried (below), the pack genuinely doesn't hold these episodes. Sets the episodes `error` naming
+  what the download holds vs what's needed (`tv.fmt_se`, e.g. "download has S01E01-E06, this
+  needs S01E138-E145"), so it surfaces in Review/AI instead of squatting a slot.
+  **"Claimed nothing" is not the same as "matched nothing".** `promote_completed` tracks `mapped`
+  (a file found a library episode) separately from `claimed` (it won the race to queue it). A
+  file whose target is already `ready`/`merging` is a no-op; treating that as failure — which the
+  `claimed == 0` test used to do — overwrote correctly queued records with `error` and produced
+  the tell-tale message with *identical* parsed and wanted lists. `promote_completed` also runs
+  behind `PROMOTE_LOCK`/`TV_PROMOTE_LOCK`, because it is driven by its own 1-min timer AND by
+  `stage_finish` every 10 min, so the two passes overlapped and raced each other's claims.
 
 ## Episode numbering: aired ↔ absolute (anime)
 

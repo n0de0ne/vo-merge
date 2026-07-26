@@ -51,6 +51,10 @@ FINISH_LOCK = threading.Lock()
 # Same for a search sweep: hammering the indexers twice over concurrently gets you rate-limited.
 SEARCH_LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()   # a library probe takes minutes; never run two at once
+# promote_completed runs on its own 1-min timer AND inside stage_finish (every 10 min), so the
+# two overlap regularly. Two passes over the same completed torrent race each other's claims,
+# and a loser used to read as "this pack contains none of these episodes".
+PROMOTE_LOCK = threading.Lock()
 def hold_reason(cfg=None):
     """Why no NEW work should start right now, or None. One answer shared by every stage so the
     UI and the pipeline can never disagree:
@@ -1360,6 +1364,16 @@ NOT_VISIBLE_MAX = 10       # ~10 min at the 1-min promote cadence, then stop wai
 
 
 def promote_completed(cfg=None):
+    """Wrapper: only ever one promote pass at a time (see PROMOTE_LOCK)."""
+    if not PROMOTE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        return _promote_completed(cfg)
+    finally:
+        PROMOTE_LOCK.release()
+
+
+def _promote_completed(cfg=None):
     """Fast sweep: every download that reached 100% leaves 'downloading' NOW and joins the
     merge queue. Cheap (one qB poll, no ffmpeg) so it runs every minute — the UI never shows
     a finished torrent as 'downloading', and the freed slot lets a new release start."""
