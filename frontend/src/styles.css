@@ -66,7 +66,12 @@ tr.needshuman > td { background: rgba(74, 29, 51, .35); }
 tr.needshuman > td:first-child { box-shadow: inset 3px 0 0 #ff5ea0; }
 /* stacked pills at a dashboard row's end */
 .col-end { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-.form-grid { display: grid; grid-template-columns: 200px 1fr auto; gap: 10px 14px; align-items: center; }
+/* same trap as .dash-cols: an `auto` help-text column grows to its longest sentence and pushes
+   the inputs off. Bound it so the help wraps instead. */
+.form-grid { display: grid; grid-template-columns: 200px minmax(180px, 1fr) minmax(0, 1.6fr);
+             gap: 10px 14px; align-items: center; }
+.form-grid > * { min-width: 0; }
+.form-grid .muted { line-height: 1.35; }
 .form-grid label { color: var(--muted); }
 .form-grid input[type=text], .form-grid input[type=password], .form-grid input[type=number], .form-grid select {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
@@ -196,14 +201,21 @@ input.sync { width: 110px; }
 .tile.good .t-num { color: #5ee9a0; }
 .tile.warn .t-num { color: #ffc06b; }
 .tile.bad .t-num { color: #ff8585; }
-.dash-cols { display: grid; grid-template-columns: 3fr 2fr; gap: 14px; align-items: start; }
-@media (max-width: 980px) { .dash-cols { grid-template-columns: 1fr; } }
+/* An `fr` track's minimum is auto, NOT zero — so a long unbreakable release name in the left
+   panel (with white-space:nowrap, its min-content is the whole string) pushes that track past
+   3fr and starves the right one, which collapsed to ~100px and wrapped one letter per line.
+   minmax(0, …) lets the left column shrink so its rows ellipsis instead, and the right column
+   gets a real floor. */
+.dash-cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
+             gap: 14px; align-items: start; }
+.dash-cols > * { min-width: 0; }
+@media (max-width: 980px) { .dash-cols { grid-template-columns: minmax(0, 1fr); } }
 .dashrow { display: flex; gap: 10px; align-items: center; padding: 7px 2px; border-bottom: 1px solid #232c38; min-width: 0; }
 .dashrow:last-child { border-bottom: 0; }
 .dashrow .poster { width: 34px; height: 51px; flex: 0 0 34px; }
 .dashrow-main { flex: 1; min-width: 0; }
 .dashrow-main .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dashrow-title { font-weight: 550; line-height: 1.3; overflow-wrap: anywhere; }
+.dashrow-title { font-weight: 550; line-height: 1.3; overflow-wrap: break-word; }
 .dashrow .pill { flex: 0 0 auto; }
 .lang-badge {
   display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 5px;
