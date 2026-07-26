@@ -231,3 +231,15 @@ header.top { display: flex; align-items: center; gap: 10px; }
   background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
   padding: 5px 9px; margin: 5px 0; color: var(--text); user-select: all; word-break: break-all;
 }
+
+/* Attention rows: an error may be a whole sentence. One clipped line hides the useful half,
+   so allow two and ellipsis after that (the full text is still the title= tooltip). */
+.dashrow-main .sub.clamp2 {
+  white-space: normal; display: -webkit-box; -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35;
+}
+.dashrow-title .cnt {
+  margin-left: 8px; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 700;
+  letter-spacing: .03em; color: var(--muted); background: var(--panel2);
+  border: 1px solid var(--border); vertical-align: middle;
+}

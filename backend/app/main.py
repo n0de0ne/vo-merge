@@ -857,18 +857,30 @@ def dashboard():
         active.sort(key=lambda x: (order.get(x["status"], 9), x["title"]))
 
         attention = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
-                      "status": r["status"], "error": r["error"],
+                      "status": r["status"], "error": r["error"], "count": 1,
                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"],
                       "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"]}
                      for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qn}) "
                                         "ORDER BY updated DESC LIMIT 8", ATTN)]
-        attention += [{"kind": "episode", "key": f"e{r['id']}",
-                       "title": f"{r['series_title']} S{r['season']:02d}E{r['episode']:02d}",
-                       "status": r["status"], "error": r["error"],
-                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"],
-                       "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"]}
-                      for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
-                                         "ORDER BY updated DESC LIMIT 8", ATTN)]
+        # Episodes fail in packs: one bad season pack puts 30 identical rows in a row, and with a
+        # flat LIMIT 8 those 30 crowd every other problem off the panel. Group a series' episodes
+        # that share a status+error into ONE row spanning their episode range, then take 8 groups.
+        from . import tv as _tv
+        groups = {}
+        for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
+                           "ORDER BY updated DESC LIMIT 400", ATTN):
+            g = groups.setdefault((r["series_title"], r["status"], r["error"], r["ai_status"]),
+                                  {"eps": [], "row": r})
+            g["eps"].append((r["season"], r["episode"]))
+        for (title, status, err, ai), g in groups.items():
+            r = g["row"]
+            span = _tv.fmt_se(g["eps"][:60])
+            attention.append({
+                "kind": "episode", "key": f"e{r['id']}", "count": len(g["eps"]),
+                "title": f"{title} {span}" if len(g["eps"]) == 1 else f"{title} · {span}",
+                "status": status, "error": err, "sync_delta": r["sync_delta"],
+                "poster": r["poster"], "ts": r["updated"],
+                "ai_status": ai, "ai_verdict": r["ai_verdict"]})
         attention = sorted(attention, key=lambda x: x["ts"] or 0, reverse=True)[:8]
 
         recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],

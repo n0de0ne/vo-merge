@@ -39,6 +39,29 @@ def _parse_se(relpath):
     return season, int(em.group(1))
 
 
+def fmt_se(pairs):
+    """(season, episode) pairs -> a compact human string: 'S01E01-E06, S04E15'. The raw Python
+    tuple list this replaces leaked into error messages and the dashboard, where it was both
+    unreadable and long enough to push everything else out of the row."""
+    out, run = [], []
+
+    def flush():
+        if not run:
+            return
+        s0, a = run[0]
+        b = run[-1][1]
+        out.append(f"S{s0:02d}E{a:02d}" + (f"-E{b:02d}" if b != a else ""))
+        run.clear()
+
+    for s_, e_ in sorted(pairs):
+        if run and run[-1][0] == s_ and e_ == run[-1][1] + 1:
+            run.append((s_, e_))
+            continue
+        flush(); run.append((s_, e_))
+    flush()
+    return ", ".join(out)
+
+
 def _no_eng(al):
     """True if the file is MISSING an English audio track (a gap to fill) — covers fre, fre/jpn
     (anime), jpn-only, etc. Unknown audio (no mediaInfo) -> False, to avoid flagging
@@ -924,13 +947,12 @@ def promote_completed(cfg=None):
             # translation — the pack genuinely doesn't contain these episodes (wrong season,
             # or Sonarr has no absolute numbers to translate with). This used to log forever
             # while the pack squatted a slot; surface it for review/AI instead.
-            want = sorted({_release_se(e, cfg) for e in eps})[:6]
+            has = fmt_se(list(files.keys())[:40])
+            want = fmt_se([_release_se(e, cfg) for e in eps][:40])
+            msg = f"download has {has or 'no numbered episodes'}, this needs {want}"
             for e in eps:
-                core.set_ep_status(e["id"], "error", progress="",
-                                   error=f"download complete but no episode files matched "
-                                         f"(parsed {sorted(files.keys())[:6]}, wanted {want})")
-            core.log(f"tv promote: {t['name'][:50]} complete but no files mapped to episodes "
-                     f"(parsed {sorted(files.keys())[:6]}, wanted {want}) -> error")
+                core.set_ep_status(e["id"], "error", progress="", error=msg)
+            core.log(f"tv promote: {t['name'][:50]} -> error ({msg})")
     if queued:
         MERGE_WAKE.set()
     return queued

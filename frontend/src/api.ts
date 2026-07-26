@@ -50,6 +50,7 @@ export interface DashAttention {
   kind: string; key: string; title: string; status: string; error?: string | null;
   sync_delta?: number | null; poster?: string | null; ts: number;
   ai_status?: string | null; ai_verdict?: string | null;
+  count?: number;            // episodes sharing this status+error (a failed pack groups into one)
 }
 export interface DashRecent {
   kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
