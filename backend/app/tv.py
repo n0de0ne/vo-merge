@@ -143,8 +143,17 @@ def _alt_keys(series_id, s, e, cfg=None):
 
 
 # ------------------------------------------------------------------ SCAN
-def scan(cfg=None):
-    """Find episodes whose library file is missing English.
+def series_kind(s, cfg):
+    """"anime" or "series" for a whole Sonarr series — Sonarr's own seriesType, else the library
+    folder it lives in, else a Japanese original language."""
+    return media.kind_of(media.to_media(s.get("path"), cfg) or (s.get("path") or ""),
+                         (s.get("originalLanguage") or {}).get("name"), cfg,
+                         series_type=s.get("seriesType") or "standard")
+
+
+def scan(cfg=None, kinds=None):
+    """Find episodes whose library file is missing English. `kinds` limits the pass to one kind
+    of library — ("anime",) or ("series",) — so the UI can re-read one tab at a time.
 
     In `scan_mode="files"` (default) the gap comes from probing the FILE, not from Sonarr's
     `mediaInfo.audioLanguages`. That field is a snapshot of whatever Sonarr parsed at import: it
@@ -162,6 +171,8 @@ def scan(cfg=None):
     pilot = set(cfg.get("series_pilot") or [])
     n = seen = filled = unmapped = unreadable = 0
     for s in son.series():
+        if kinds and series_kind(s, cfg) not in kinds:
+            continue
         if tagid is not None and not by_files and tagid not in s.get("tags", []):
             continue
         if cfg.get("exclude_french_origin", True) and \
@@ -232,8 +243,9 @@ def scan(cfg=None):
                                    need_audio=",".join(miss_a), need_subs=",".join(miss_s),
                                    orig_lang=orig_name)
             n += 1
+    what = "/".join(kinds) if kinds else "series+anime"
     if by_files:
-        core.log(f"tv scan(files): {n} gap(s) of {seen} episode(s) probed"
+        core.log(f"tv scan(files, {what}): {n} gap(s) of {seen} episode(s) probed"
                  f"{f', {filled} already filled' if filled else ''}"
                  f"{f', {unmapped} path not found' if unmapped else ''}"
                  f"{f', {unreadable} unreadable' if unreadable else ''}"

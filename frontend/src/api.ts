@@ -26,7 +26,7 @@ export interface Episode {
 }
 export interface TvStatus { counts: Record<string, number>; }
 export interface RescanState {
-  running: boolean; phase: string; started: number; finished: number;
+  running: boolean; scope: string; phase: string; started: number; finished: number;
   films: number | null; episodes: number | null; error: string | null;
   probes: { cached: number; unreadable: number };
 }
@@ -108,8 +108,9 @@ export const api = {
   tvEpisodes: (status?: string) =>
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
   tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
-  rescan: (forget = false) =>
-    j<{ ok: boolean; started: boolean; note?: string }>(`/api/rescan?forget=${forget}`, { method: "POST" }),
+  rescan: (scope: "all" | "films" | "anime" | "series" = "all", forget = false) =>
+    j<{ ok: boolean; started: boolean; note?: string }>(
+      `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>

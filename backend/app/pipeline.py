@@ -52,7 +52,7 @@ FINISH_LOCK = threading.Lock()
 SEARCH_LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()   # a library probe takes minutes; never run two at once
 # progress of the current/last full rescan, so the UI can show a multi-minute job is alive
-SCAN_STATE = {"running": False, "phase": "", "started": 0, "finished": 0,
+SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
               "films": None, "episodes": None, "error": None}
 
 FR_DUB = re.compile(r'\b(VFF|VFQ|VFI|VF2|TRUEFRENCH|FRENCH|VFNF)\b', re.I)

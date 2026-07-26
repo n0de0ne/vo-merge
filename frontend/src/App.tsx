@@ -295,32 +295,34 @@ function Tracks({ a, s, na, ns }:
 // Re-read every library file with mkvmerge and re-decide the gaps. Covers films, series and
 // anime in one pass regardless of the enabled scopes, and takes minutes on a big library — so
 // it reports live progress rather than looking hung.
-function RescanButton() {
+function RescanButton({ scope, label }: { scope: "films" | "anime" | "series"; label: string }) {
   const [st, setSt] = useState<RescanState | null>(null);
   const [busy, setBusy] = useState(false);
   usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000, [st?.running]);
 
   async function go() {
     setBusy(true);
-    try { await api.rescan(true); await api.rescanState().then(setSt); }
+    try { await api.rescan(scope, true); await api.rescanState().then(setSt); }
     finally { setBusy(false); }
   }
-  const done = st && !st.running && st.finished > 0;
+  // one scan runs at a time (SCAN_LOCK), so a pass started from another tab disables this one
+  const mine = st?.scope === scope;
+  const running = !!st?.running;
+  const done = mine && st && !running && st.finished > 0;
+  const found = scope === "films" ? st?.films : st?.episodes;
   return (
     <>
-      <button className="btn sec" disabled={busy || !!st?.running} onClick={go}
-        title="Re-read EVERY library file with mkvmerge — films, series and anime — and re-decide
-               what each one is missing. Takes a few minutes the first time.">
-        {st?.running ? "Re-reading…" : "Re-read files"}
+      <button className="btn sec" disabled={busy || running} onClick={go}
+        title={`Re-read every ${label} file with mkvmerge and re-decide what it is missing. `
+               + "Takes a few minutes the first time; only changed files are re-read after that."}>
+        {running && mine ? "Re-reading…" : `Re-read ${label}`}
       </button>
-      {st?.running &&
-        <span className="muted">probing {st.phase === "films" ? "films" : "series & anime"}
-          {st.films != null && <> · {st.films} film gap(s)</>}</span>}
+      {running && <span className="muted">
+        {mine ? `probing ${st!.phase}…` : `busy: ${st!.scope} scan running`}</span>}
       {done && !st.error &&
-        <span className="muted">last re-read: {st.films ?? "?"} film · {st.episodes ?? "?"} episode
-          gap(s) · {st.probes.cached} file(s) cached
+        <span className="muted">last: {found ?? "?"} gap(s) · {st.probes.cached} file(s) cached
           {st.probes.unreadable > 0 && <span className="bad"> · {st.probes.unreadable} unreadable</span>}</span>}
-      {st?.error && <span className="bad">rescan failed: {st.error}</span>}
+      {mine && st?.error && <span className="bad">rescan failed: {st.error}</span>}
     </>
   );
 }
@@ -642,7 +644,7 @@ function Films() {
             title="Search every pending title now instead of waiting for the timer (grabs up to the free download slots)">
             🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
-          <RescanButton />
+          <RescanButton scope="films" label="films" />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {STATES.map(s => (
@@ -863,8 +865,9 @@ function Series({ anime }: { anime: boolean }) {
           <button className="btn sec" disabled={busy} onClick={searchAll}
             title="Search every pending episode now instead of waiting for the timer">
             🔍 Search pending</button>
-          <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
-          <RescanButton />
+          <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>
+            Scan {anime ? "anime" : "series"}</button>
+          <RescanButton scope={anime ? "anime" : "series"} label={anime ? "anime" : "TV shows"} />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {TV_STATES.map(s => (
