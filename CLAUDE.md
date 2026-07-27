@@ -202,9 +202,41 @@ usually ships them — so taking them costs one extra mkvmerge argument, not ano
 - **Subtitles get the same `--sync` as the audio** — they're timed to the donor's video, so an
   offset *and* a PAL rate stretch apply identically (verified: a cue at 1000 ms lands at 1293 ms
   under `+250 ms, ×1.0427083`).
-- `media.sub_rank()` picks *which* track when a pack ships six: full translation > forced/signs >
-  SDH, and text beats image (PGS/VobSub). Grafted subs are **never default-flagged** — a default
-  subtitle starts burned-in for every viewer.
+- `media.sub_rank()` picks *which* track when a pack ships six: full translation > forced > SDH >
+  **signs & songs**, and text beats image (PGS/VobSub). Grafted subs are **never default-flagged**
+  — a default subtitle starts burned-in for every viewer.
+
+### "English Signs" is not an English subtitle (`media.is_signs`)
+
+A *signs & songs* track translates on-screen text and the OP/ED lyrics — **nothing that is
+spoken**. It exists for viewers watching a dub, who need the billboards translated and nothing
+else. It is tagged `eng` like any other subtitle, so it used to satisfy the profile's `eng`
+subtitle target, and Blue Lock S01E03 ended up with exactly one English subtitle track — "English
+Signs" — while reading as complete. Someone who doesn't understand the audio cannot watch the
+episode with it.
+
+Three places had to agree, or the fix leaks:
+
+- **`media.langs()` excludes a signs-only track** from that language's subtitle set, exactly like
+  `und`. So the gap stays open, coverage counts the file as incomplete, and (since `merged` is
+  re-opened when a scan still sees a gap) the record gets another release. A language that *also*
+  has a real track is of course still present — only signs-only is excluded.
+- **`sub_rank` sorts signs LAST, below even forced.** A forced track at least subtitles the
+  dialogue it covers. Signs used to sort *ahead* of forced, which is how a donor carrying both
+  handed over the signs track.
+- **`wanted_subs` takes nothing at all** for a language the donor covers only with signs. Grafting
+  it would neither close the gap nor help anyone — and since the gap stays open, the next donor
+  would graft its signs track too, and the one after that, until the file carries five useless
+  tracks and still isn't subtitled. With nothing to add, the existing "nothing to add" path
+  blocklists that release and searches for another.
+
+Sidecars follow the same rule: `<stem>.en.signs.ass` doesn't count (`_SIGNS_QUAL`), while
+`<stem>.en.srt` does. Detection is by track/file name (`signs`, `songs`, `S&S` — mkvmerge has no
+flag for it); `Designs` and `English SDH` are correctly not matched.
+
+**Files already probed keep their cached answer** — the probe cache stores the resulting language
+codes, not the track list — so a library grafted before this fix needs a **re-read** (Library tab
+→ "Re-read everything", which drops the cache) before those records re-open.
 - **`subs_only_gap` (default on): chasing a subtitle-only gap.** Bazarr is the cheaper tool —
   a 50 KB `.srt` beats a multi-GB release — but it searches subtitle *providers*, and when the
   subtitle exists only inside a *release*, an indexer is the only place to get it. Two scoring

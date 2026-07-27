@@ -117,6 +117,18 @@ def _track_lang(props, name):
     return hint_lang(name) or "und"
 
 
+# A "signs & songs" track translates on-screen text and the opening/ending lyrics — nothing that
+# is SPOKEN. It exists for viewers watching a dub, who need the billboards translated and nothing
+# else. Tagged `eng` like any other subtitle, it is not an English subtitle in the sense the
+# profile means: someone who doesn't understand the audio cannot watch the show with it. Blue Lock
+# S01E03 ended up with exactly one English subtitle track, "English Signs", and read as complete.
+_SIGNS_RX = re.compile(r'\b(signs?|songs?|s\s*[&+/]\s*s)\b', re.I)
+
+
+def is_signs(name):
+    return bool(_SIGNS_RX.search(name or ""))
+
+
 def probe(path):
     """Full track inventory for one media file, or None if it can't be read.
 
@@ -149,6 +161,7 @@ def probe(path):
         elif t.get("type") == "subtitles":
             subs.append({"id": t["id"], "lang": lang, "codec": t.get("codec"), "name": name,
                          "forced": bool(p.get("forced_track")),
+                         "signs": is_signs(name),
                          "sdh": bool(p.get("flag_hearing_impaired"))
                                 or bool(re.search(r'\b(sdh|cc|hearing)\b', name, re.I)),
                          "default": bool(p.get("default_track"))})
@@ -176,6 +189,9 @@ def probe(path):
 _SUB_EXT = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup")
 # tokens that qualify a subtitle rather than naming its language
 _SUB_QUAL = {"forced", "sdh", "hi", "cc", "full", "foreign", "signs", "songs", "default"}
+# ...and the subset of those that means "this doesn't subtitle the dialogue at all", so the file
+# doesn't count as carrying that language (same rule as an embedded signs & songs track).
+_SIGNS_QUAL = {"signs", "songs"}
 
 
 _DIRCACHE = {}
@@ -229,7 +245,10 @@ def sidecar_subs(path):
         # "<stem>.en.forced.srt" -> ["en", "forced"];  "<stem>.srt" -> []
         mid = low[len(stem) + 1:]
         mid = mid[:mid.rfind(".")] if "." in mid else ""       # drop the extension
-        for tok in mid.split("."):
+        toks = mid.split(".")
+        if any(t in _SIGNS_QUAL for t in toks):
+            continue        # "<stem>.en.signs.ass" translates on-screen text, not the dialogue
+        for tok in toks:
             # Only a KNOWN language counts. norm_lang falls back to the first three characters
             # of anything it doesn't recognise, which would turn "srt", "default" or a release
             # group's name into a language and mark the file as already subtitled.
@@ -287,20 +306,30 @@ def _fps(path):
 
 def langs(info):
     """(audio langs, subtitle langs) as sets of canonical codes; 'und' is excluded because an
-    untyped track proves nothing about which languages are present."""
+    untyped track proves nothing about which languages are present.
+
+    A signs & songs track does not count as that language's subtitles either — it translates the
+    on-screen text for someone who is listening to a dub, not the dialogue. Counting it is how a
+    file whose only English subtitle says "English Signs" reads as meeting an eng subtitle target.
+    A language that ALSO has a real track is of course still present; only signs-only is excluded."""
     if not info:
         return set(), set()
-    return ({a["lang"] for a in info["auds"]} - {"und"},
-            {s["lang"] for s in info["subs"]} - {"und"})
+    real = {s["lang"] for s in info["subs"] if not s.get("signs")} - {"und"}
+    return ({a["lang"] for a in info["auds"]} - {"und"}, real)
 
 
 def sub_rank(s):
     """Sort key for picking WHICH subtitle track to graft when a release ships several.
-    A full translation beats a forced/signs-only track, which beats an SDH variant; image
-    subs (VobSub/PGS) lose to text so a text track wins when both exist."""
+
+    Signs & songs sorts LAST — below even a forced track. A forced track at least subtitles the
+    dialogue it covers; a signs track subtitles no dialogue at all, so it is the worst possible
+    answer to "this file is missing English subtitles". It used to sort ahead of forced, which is
+    how a donor carrying both handed over the signs track.
+
+    Then forced below full, SDH below that, and image subs (VobSub/PGS) below text."""
     image = 1 if re.search(r'(pgs|vobsub|dvd|hdmv)', str(s.get("codec") or ""), re.I) else 0
-    signs = 1 if re.search(r'\b(signs?|songs?|s&s)\b', s.get("name") or "", re.I) else 0
-    return (1 if s.get("forced") else 0, 1 if s.get("sdh") else 0, signs, image, s["id"])
+    signs = 1 if (s.get("signs") if "signs" in s else is_signs(s.get("name"))) else 0
+    return (signs, 1 if s.get("forced") else 0, 1 if s.get("sdh") else 0, image, s["id"])
 
 
 def has_lang(info, code):
@@ -311,7 +340,12 @@ def has_lang(info, code):
 
 def wanted_subs(donor_info, base_info, want, limit=2):
     """Donor subtitle tracks worth adding: a wanted language the base file doesn't already have,
-    best variant first, capped at `limit` (anime packs routinely carry 6+ English sub tracks)."""
+    best variant first, capped at `limit` (anime packs routinely carry 6+ English sub tracks).
+
+    A language the donor covers ONLY with a signs & songs track is skipped entirely. Grafting it
+    would neither close the gap (`langs` doesn't count signs) nor help anyone watch the episode —
+    and since the gap stays open, the next donor would graft its signs track too, and the one
+    after that, until the file carries five useless tracks and still isn't subtitled."""
     if not donor_info or not want:
         return []
     _, have = langs(base_info)
@@ -320,6 +354,9 @@ def wanted_subs(donor_info, base_info, want, limit=2):
         if code in have:
             continue
         cands = sorted((s for s in donor_info["subs"] if s["lang"] == code), key=sub_rank)
+        if not any(not (s.get("signs") if "signs" in s else is_signs(s.get("name")))
+                   for s in cands):
+            continue                      # signs-only for this language — take nothing
         out += cands[:max(1, limit)]
     return out
 
