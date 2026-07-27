@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from . import core, scheduler, pipeline, media
+from . import agent, core, scheduler, pipeline, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
 app = FastAPI(title="VO Merger")
@@ -46,6 +46,7 @@ def get_settings():
     cfg["radarr_key"] = bool(cfg["radarr_key"])
     cfg["sonarr_key"] = bool(cfg.get("sonarr_key"))
     cfg["plex_token"] = bool(cfg["plex_token"])
+    cfg["anthropic_key"] = bool(cfg.get("anthropic_key"))
     return cfg
 
 
@@ -58,7 +59,8 @@ def post_settings(body: SettingsIn):
     # drop masked/unchanged secret placeholders
     d = {k: v for k, v in body.data.items()
          if not (k in ("qb_pass",) and v == "********")
-         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token") and v in (True, False))}
+         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token",
+                        "anthropic_key") and v in (True, False))}
     cfg = core.save_config(d)
     scheduler.reschedule()
     return {"ok": True}
@@ -855,120 +857,51 @@ def another(tmdb_id: int):
     return core.get_movie(tmdb_id)
 
 
+def _escalate(kind, summary, ctx, stamp, cfg=None):
+    """Hand ONE record to whichever dispatcher is configured (`ai_mode`).
+
+    Both dispatchers get the identical brief — `agent.movie_context`/`episode_context` build it —
+    so "it worked from the CLI but not in-app" can't happen. In `builtin` mode no ticket file is
+    written: that is what stops the host cron, if it is still installed, from working the same
+    record in parallel with the in-process agent."""
+    cfg = cfg or core.load_config()
+    m = agent.mode(cfg)
+    if m == "off":
+        return {"ok": True, "queued": False, "mode": m}
+    if m == "builtin":
+        stamp()
+        agent.wake()
+        return {"ok": True, "queued": True, "mode": m}
+    queued = core.ticket(kind, summary, ctx, force=True)
+    if queued:
+        stamp()
+    return {"ok": True, "queued": bool(queued), "mode": m}
+
+
 @api.post("/movie/{tmdb_id}/ai")
 def movie_to_ai(tmdb_id: int):
-    """Operator pressed 'Send to AI' on a Review item: file a ticket for the host's
-    AI dispatcher with the full record + how to act on it, so the on-call agent can
-    manage the item end-to-end (resync, pick another release, or report back)."""
+    """Operator pressed 'Send to AI' on a Review item: hand the full record + how to act on it
+    to the on-call agent, so it can manage the item end-to-end (resync, pick another release,
+    or report back)."""
     mv = core.get_movie(tmdb_id)
     if not mv:
         raise HTTPException(404, "unknown movie")
-    record = {k: mv.get(k) for k in
-              ("tmdb_id", "title", "original_title", "year", "original_lang", "status",
-               "error", "sync_delta", "sync_offset_ms", "candidate_title",
-               "candidate_score", "candidate_seeders", "attempts", "tried",
-               "french_path", "en_file", "merged_file", "quality", "dl_hash")}
-    summary = f"operator escalated from Review: {mv['title']} ({mv['year']}) — {mv['status']}"
-    if mv.get("error"):
-        summary += f": {mv['error']}"
-    queued = core.ticket(
-        f"review-m{tmdb_id}", summary,
-        {"record": record,
-         "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
-         "read_this_first": f"GET /movie/{tmdb_id}/context — the record, a probe of BOTH files "
-                            "(fps/duration/audio tracks) and the matching log lines. Comparing "
-                            "the two probes is the diagnosis for most sync and 'nothing to add' "
-                            "failures.",
-         "actions": [
-             "GET  /movie/{id}/context — probes of both files + the relevant log lines",
-             "GET  /movie/{id}/candidates — list releases (incl. already-tried)",
-             "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
-             "POST /movie/{id}/sync_probe {\"max_lag_s\":300} — MEASURE the offset and report "
-             "it WITHOUT merging, searching much further out than the merge path does. On any "
-             "\"couldn't sync\" this is the call to make FIRST: the merge path only searches "
-             "+/-sync_max_lag_s, so a consistent offset beyond that reads as \"different cut\" "
-             "when it is really a sponsor card or a 'previously on'. Returns every window's own "
-             "answer, so a real re-edit (windows disagree) looks different from a large constant "
-             "offset (windows agree). Add \"apply\":true to merge with what it finds.",
-             "POST /movie/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a KNOWN "
-             "offset and/or rate stretch with no detection (drift = donor_fps/base_fps; "
-             "1.0427083 is film->PAL). Use when /context shows the two files' fps differ.",
-             "POST /movie/{id}/another — blocklist current release, grab next best",
-             "POST /movie/{id}/research — search again (keeps blocklist)",
-             "POST /search_releases {\"query\":\"...\"} — run an ARBITRARY Prowlarr query and "
-             "grab from the results. The built-in search composes its own query from the library "
-             "title, so a title it never matches can never be found however often it re-searches; "
-             "try the original/romaji/alternate title with no year.",
-             "POST /movie/{id}/unfixable {\"reason\":\"...\"} — terminal give-up WITH a recorded "
-             "reason (preferred over /ignore, which reads as an unexamined skip)",
-             "POST /movie/{id}/ignore — give up on this title",
-         ],
-         "report_back": (
-             f"When done, POST /movie/{tmdb_id}/ai_result with "
-             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
-             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue "
-             "(needs_human = a person must decide)."),
-         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md"},
-        force=True)
-    if queued:
-        core.set_status(tmdb_id, mv["status"], ai_status="pending", ai_at=time.time())
-    return {"ok": True, "queued": bool(queued)}
+    summary, ctx = agent.movie_context(mv)
+    return _escalate(f"review-m{tmdb_id}", f"operator escalated from Review: {summary}", ctx,
+                     lambda: core.set_status(tmdb_id, mv["status"], ai_status="pending",
+                                             ai_at=time.time()))
 
 
 @api.post("/episode/{ep_id}/ai")
 def episode_to_ai(ep_id: str):
-    """TV mirror of movie_to_ai: escalate one episode to the host AI dispatcher."""
+    """TV mirror of movie_to_ai: escalate one episode to the on-call agent."""
     e = core.get_episode(ep_id)
     if not e:
         raise HTTPException(404, "unknown episode")
-    record = {k: e.get(k) for k in
-              ("id", "series_title", "season", "episode", "status", "error", "sync_delta",
-               "sync_offset_ms", "candidate_title", "candidate_score", "candidate_seeders",
-               "attempts", "tried", "french_path", "en_file", "quality", "dl_hash")}
-    summary = f"operator escalated from Review: {e['series_title']} S{e['season']:02d}E{e['episode']:02d} — {e['status']}"
-    if e.get("error"):
-        summary += f": {e['error']}"
-    queued = core.ticket(
-        f"review-e{ep_id}", summary,
-        {"record": record,
-         "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
-         "diagnose_first": (
-             f"GET /episode/{ep_id}/context — the record, a probe of both files, the log lines, "
-             "every donor file with the (season,episode) the parser read, the series' episode "
-             "list, and a `numbering` block (library S/E vs the release's S/E and absolute "
-             "number). vo-merge translates aired<->absolute itself from Sonarr, so "
-             "`translated: true` means search and donor mapping already use the aired numbering."),
-         "read_this_first": f"GET /episode/{ep_id}/context — the record, a probe of both files, "
-                            "the matching log lines, EVERY donor file with the (season, episode) "
-                            "parsed from it, and the series' episode list. Comparing those two "
-                            "lists IS the diagnosis for a numbering mismatch.",
-         "actions": [
-             "GET  /episode/{id}/context — probes, log lines, donor files vs the episode list",
-             "GET  /episode/{id}/candidates — list releases (incl. already-tried)",
-             "POST /episode/{id}/retry — blocklist current release, drop donor, re-search",
-             "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map one donor file to this "
-             "episode and queue the merge (when automatic numbering translation can't apply)",
-             "POST /episode/{id}/sync_probe {\"max_lag_s\":300} — MEASURE the offset without "
-             "merging, searching further out than the merge path does. Make this call FIRST on "
-             "any \"couldn't sync\": windows that AGREE on a large offset mean extra material at "
-             "the head (fixable with --sync), windows that DISAGREE mean a genuinely different "
-             "cut (not fixable). Add \"apply\":true to merge with what it finds.",
-             "POST /episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a known "
-             "offset / rate stretch with no detection",
-             "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query (original/"
-             "romaji/alternate title, no year) for the no_release backlog",
-             "POST /episode/{id}/unfixable {\"reason\":\"...\"} — terminal give-up WITH a reason",
-             "POST /episode/{id}/ignore — give up on this episode",
-         ],
-         "report_back": (
-             f"When done, POST /episode/{ep_id}/ai_result with "
-             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
-             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue."),
-         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md"},
-        force=True)
-    if queued:
-        core.set_ep_status(ep_id, e["status"], ai_status="pending", ai_at=time.time())
-    return {"ok": True, "queued": bool(queued)}
+    summary, ctx = agent.episode_context(e)
+    return _escalate(f"review-e{ep_id}", f"operator escalated from Review: {summary}", ctx,
+                     lambda: core.set_ep_status(ep_id, e["status"], ai_status="pending",
+                                                ai_at=time.time()))
 
 
 class AiResultIn(BaseModel):
@@ -1527,6 +1460,10 @@ def dashboard():
         ai["last_callback"] = last_cb
         ai["enabled"] = bool(cfg.get("ai_tickets", True))
         ai["stale_min"] = cfg.get("ai_stale_min", 60)
+        # Which dispatcher is answering, and — in builtin mode — whether it is actually able to
+        # run. "no verdict ever received" means something very different when the loop is ours
+        # (a missing key or SDK, visible right here) than when it is a host cron we can't see.
+        ai["agent"] = agent.status(cfg)
 
     try:
         inflight = pipeline.inflight_downloads(cfg)

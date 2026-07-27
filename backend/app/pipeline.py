@@ -6,7 +6,7 @@ Search & merge logic is ported verbatim from the validated dry-run scripts.
 import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
-from . import core, sync, media
+from . import agent, core, sync, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 class _MergeGate:
@@ -711,10 +711,14 @@ _WEDGE_SINCE = {"ts": None}
 
 
 def ai_health_check(cfg=None):
-    """Page the on-call AI (core.ticket -> host dispatcher runs Claude Code) when the
-    pipeline is stuck: (a) the in-flight cap is saturated for >2h with NOTHING in
-    'downloading' state — dead/orphaned donors are holding every slot (the 2026-07-12
-    two-day deadlock); (b) records newly landed in error or review."""
+    """Page the on-call AI when the pipeline is stuck: (a) the in-flight cap is saturated for
+    >2h with NOTHING in 'downloading' state — dead/orphaned donors are holding every slot (the
+    2026-07-12 two-day deadlock); (b) records newly landed in error or review.
+
+    WHO gets paged is `ai_mode`: `host` files a ticket into /config/ai-tickets/ for the Unraid
+    cron that runs the Claude Code CLI; `builtin` leaves the records stamped `ai_status='pending'`
+    (which is the in-process agent's queue) and wakes it. Either way the staleness sweep at the
+    bottom still catches a dispatcher that goes silent."""
     cfg = cfg or core.load_config()
     if not cfg.get("ai_tickets", True):
         return
@@ -769,7 +773,14 @@ def ai_health_check(cfg=None):
             news.append({"type": "episode", "status": st, "id": e["id"],
                          "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
                          "error": (e.get("error") or "")[:200]})
-    if news:
+    if news and agent.mode(cfg) == "builtin":
+        # vo-merge runs the agent itself: the records are already stamped 'pending', which IS the
+        # queue (agent._queue reads exactly this). No ticket file — writing one would let a host
+        # cron that is still installed work the same records in parallel.
+        json.dump(sorted(seen), open(seen_path, "w"))
+        core.log(f"ai(builtin): {len(news)} new record(s) queued for the on-call agent")
+        agent.wake()
+    elif news:
         json.dump(sorted(seen), open(seen_path, "w"))
         key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
         core.ticket("errors-review",

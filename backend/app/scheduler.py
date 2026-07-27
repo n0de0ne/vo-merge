@@ -1,7 +1,7 @@
 """APScheduler: runs the pipeline stages on configurable intervals, plus the merge worker."""
 import threading
 from apscheduler.schedulers.background import BackgroundScheduler
-from . import core, pipeline, tv
+from . import agent, core, pipeline, tv
 
 _sched = BackgroundScheduler(daemon=True)
 _merge_threads = {}          # pool slot index -> worker thread
@@ -118,6 +118,10 @@ def start():
                    id="promote", replace_existing=True)
     _sched.start()
     ensure_merge_workers()          # background merger(s) draining the 'ready' queue
+    # The on-call agent gets its OWN thread rather than a scheduler job: a run works several
+    # records and can sit for minutes inside a sync_probe, and APScheduler's max_instances=1
+    # would silently drop the stall sweep behind it.
+    agent.start()
     core.log("scheduler started")
 
 

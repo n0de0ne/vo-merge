@@ -39,9 +39,21 @@ DEFAULTS = {
     "delete_donor": True,
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "no_seed_public": True,                        # public donors: stop at 100%, never seed
-    "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
+    "ai_tickets": True,                            # master switch for AI escalation
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
+    # WHO answers the page. "host" writes a ticket file to /config/ai-tickets/ and waits for the
+    # Unraid user-script cron to run the Claude Code CLI on it — which is invisible when it stops
+    # running (tickets pile up, everything ages out to "AI did not respond"). "builtin" runs the
+    # same agent in-process over the Anthropic API: no host script, no cron, no Node in the image,
+    # and the callback can't go missing because vo-merge owns the loop. "off" = no escalation.
+    "ai_mode": "host",                             # host | builtin | off
+    "anthropic_key": "",                           # required by builtin mode
+    "ai_model": "claude-opus-5",
+    "ai_effort": "medium",                         # low | medium | high | xhigh | max
+    "ai_max_steps": 30,                            # tool calls per record before it must report
+    "ai_max_records": 3,                           # records handled per sweep (this costs money)
+    "ai_api_base": "http://127.0.0.1:8080/api",    # how the agent reaches this app's own API
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -179,7 +191,7 @@ def save_config(updates: dict):
 _SECRET_QS = re.compile(r'((?:api_?key|apikey|token|passkey|rss_?key|auth|pass(?:word)?)=)[^&\s]+',
                         re.I)
 _SECRET_KEYS = ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token", "plex2_token",
-                "qb_pass", "webhook_token")
+                "qb_pass", "webhook_token", "anthropic_key")
 _SECRETS = set()      # the configured values themselves, refreshed whenever config is read
 
 
