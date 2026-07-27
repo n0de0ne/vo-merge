@@ -360,7 +360,10 @@ const LANG_NAME: Record<string, string> = {
 const lang = (c: string) => LANG_NAME[c] ?? c.toUpperCase();
 
 function LibBar({ l }: { l: CoverageLib }) {
+  // percentages are over what is actually TARGETED — files the pipeline deliberately skips
+  // (French-origin) are real inventory, but scoring them as failures is not meaningful
   const n = Math.max(l.total, 1);
+  const scored = Math.max(l.total - (l.excluded ?? 0), 1);
   const pct = (v: number) => (v / n) * 100;
   const seg = [
     { k: "complete", v: l.complete, cls: "ok", label: "meets target" },
@@ -368,14 +371,18 @@ function LibBar({ l }: { l: CoverageLib }) {
     { k: "audio", v: l.missing_audio, cls: "bad", label: "missing audio" },
     { k: "both", v: l.missing_both, cls: "bad2", label: "missing audio + subtitles" },
     { k: "unread", v: l.unreadable, cls: "unk", label: "unreadable" },
+    { k: "excl", v: l.excluded ?? 0, cls: "off", label: "not targeted" },
   ].filter(s => s.v > 0);
   return (
     <div className="covlib">
       <div className="covhead">
         <b>{l.name}</b>
-        <span className="muted">{l.total.toLocaleString()} files · targets {l.targets.audio.join("/")} audio</span>
+        <span className="muted">{l.total.toLocaleString()} files
+          {(l.excluded ?? 0) > 0 && <> · {l.excluded.toLocaleString()} not targeted</>}
+          {" "}· targets {l.targets.audio.join("/")} audio</span>
         <div className="spacer" />
-        <span className="covpct">{Math.round(pct(l.complete))}%</span>
+        <span className="covpct" title={`${l.complete.toLocaleString()} of ${scored.toLocaleString()} targeted files meet it`}>
+          {Math.round((l.complete / scored) * 100)}%</span>
       </div>
       <div className="covbar" role="img"
         aria-label={`${Math.round(pct(l.complete))}% of ${l.name} meets its language target`}>
@@ -423,13 +430,14 @@ function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
         <div className="muted">Nothing probed yet — run “Re-read everything” on the Library tab.</div>
       </div>
     );
-  const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
+  const pct = Math.round((c.complete / Math.max(c.targeted ?? c.probed, 1)) * 100);
   return (
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>
         <b>Language coverage</b>
-        <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
-          files meet their target · {pct}%
+        <span className="muted">{c.complete.toLocaleString()} of
+          {" "}{(c.targeted ?? c.probed).toLocaleString()} targeted files meet their target · {pct}%
+          {(c.excluded ?? 0) > 0 && <> · {c.excluded.toLocaleString()} not targeted</>}
           {c.unreadable > 0 && <> · <span className="bad">{c.unreadable.toLocaleString()} unreadable</span></>}</span>
         {goto && <><div className="spacer" />
           <button className="btn sec" onClick={() => goto("library")}>Browse files →</button></>}
@@ -467,9 +475,11 @@ function LibRow({ i }: { i: LibItem }) {
             </>}
       </div>
       <div className="libmiss">
-        {i.state === "complete"
-          ? <span className="ok-txt">✓ meets target</span>
-          : miss.length > 0 ? <span className="needs">missing {miss.join(" · ")}</span> : null}
+        {i.state === "excluded"
+          ? <span className="muted" title="French-origin: exclude_french_origin is on, so the pipeline never hunts a dub for it. Counted as a file, not scored against the target.">not targeted</span>
+          : i.state === "complete"
+            ? <span className="ok-txt">✓ meets target</span>
+            : miss.length > 0 ? <span className="needs">missing {miss.join(" · ")}</span> : null}
       </div>
     </div>
   );
@@ -555,7 +565,8 @@ function RepairPanel({ n, onDone }: { n: number; onDone: () => void }) {
 }
 
 function Library() {
-  const [state, setState] = useState<"incomplete" | "complete" | "unreadable">("incomplete");
+  const [state, setState] =
+    useState<"incomplete" | "complete" | "unreadable" | "excluded">("incomplete");
   const [lib, setLib] = useState("");
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
@@ -575,6 +586,7 @@ function Library() {
     ["incomplete", "Target not met", d?.counts.incomplete ?? 0],
     ["complete", "Complete", d?.counts.complete ?? 0],
     ["unreadable", "Unreadable", d?.counts.unreadable ?? 0],
+    ["excluded", "Not targeted", d?.counts.excluded ?? 0],
   ];
   const shown = d?.items.length ?? 0;
   const pages = Math.ceil((d?.total ?? 0) / PAGE);

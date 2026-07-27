@@ -70,6 +70,10 @@ def hold_reason(cfg=None):
     return None
 
 
+# Why files Radarr/Sonarr know about did NOT become inventory rows. The library file count not
+# matching what's on disk is otherwise unexplainable from the UI.
+SCAN_SKIPS = {"films": {}, "episodes": {}}
+
 # progress of the current/last full rescan, so the UI can show a multi-minute job is alive
 SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
               "films": None, "episodes": None, "error": None,
@@ -344,7 +348,7 @@ def _scan_files(cfg):
         tagid = next((t["id"] for t in rad.tags() if t["label"] == cfg["vo_gap_tag"]), None)
         if tagid is None:
             core.log(f"scan: tag '{cfg['vo_gap_tag']}' not found in Radarr"); return 0
-    gaps = filled = unmapped = unreadable = 0
+    gaps = filled = unmapped = unreadable = excluded = nofile = 0
     seen = 0
     for m in rad.movies():
         if tagid is not None and tagid not in m.get("tags", []):
@@ -355,9 +359,17 @@ def _scan_files(cfg):
         filled += r == "filled"
         unmapped += r == "unmapped"
         unreadable += r == "unreadable"
+        excluded += r == "excluded"
+        nofile += r == "no file"
     mount = cfg["media_mount"]
+    # Every reason a Radarr movie did NOT become an inventory row, so a file count that doesn't
+    # match the library can be explained from the log instead of guessed at.
+    SCAN_SKIPS.update(films={"no_file": nofile, "unmapped": unmapped, "unreadable": unreadable,
+                             "excluded": excluded, "probed": seen})
     core.log(f"scan(files): {gaps} gap(s) of {seen} movie(s) probed"
              f"{f', {filled} already filled' if filled else ''}"
+             f"{f', {excluded} French-origin (probed, not targeted)' if excluded else ''}"
+             f"{f', {nofile} with no file in Radarr' if nofile else ''}"
              f"{f', {unmapped} path not found under {mount}' if unmapped else ''}"
              f"{f', {unreadable} unreadable' if unreadable else ''}")
     return gaps
@@ -374,18 +386,24 @@ def ingest_movie(m, cfg, refresh=False):
     if not (mf.get("id") or mf.get("path")):
         return "no file"                                 # not downloaded yet — nothing to fix
     lang = (m.get("originalLanguage") or {}).get("name", "?")
-    if cfg["exclude_french_origin"] and lang == "French":
-        return "ok"
+    # exclude_french_origin means "don't HUNT English for a French film". It used to return here,
+    # before the file was ever probed — so those films were absent from the probes table
+    # entirely, which is the library inventory: they vanished from the Library tab, from the
+    # per-library file counts and from the coverage denominator. Probe first, then decide.
+    excluded = bool(cfg["exclude_french_origin"] and lang == "French")
     fr_path = _radarr_file_path(m, cfg)
     if not fr_path:
         return "unmapped"
     if refresh:
         core.forget_probe(fr_path)
     auds, subs, err = media.audit(fr_path)
+    core.mark_probe_excluded(fr_path, excluded)
     if err:
         # unreadable != "has no English" — probing failed, so we know nothing. Skipping is
         # the only honest option; the count is logged so a systemic problem is visible.
         return "unreadable"
+    if excluded:
+        return "excluded"            # counted as inventory, never inserted as a gap record
     kind = media.kind_of(fr_path, lang, cfg)
     miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
     need = "+".join([x for x in (("audio" if miss_a else ""), ("subs" if miss_s else "")) if x])

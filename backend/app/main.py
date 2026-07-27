@@ -209,7 +209,7 @@ def do_rescan(forget: bool = False, scope: str = "all"):
 BROKEN_ERR = "no audio track"
 
 
-def _inventory(cfg, cols="path, auds, subs, err"):
+def _inventory(cfg, cols="path, auds, subs, err, excluded"):
     """Every probed library file, classified against the profile its library targets.
 
     The `probes` table is the ONLY complete inventory: `scan()` deliberately inserts a
@@ -219,7 +219,11 @@ def _inventory(cfg, cols="path, auds, subs, err"):
     disagree about what "complete" means.
 
     Yields (row, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s). `-EN` mirrors are
-    skipped: they are symlinks to the same files and would double-count."""
+    skipped: they are symlinks to the same files and would double-count.
+
+    A row flagged `excluded` is inventory the pipeline deliberately does not target
+    (`exclude_french_origin`). It is counted and listable — it is a real file on disk — but it is
+    not scored as a failure for a gap nobody intends to fill."""
     mount = (cfg.get("media_mount") or "/media").rstrip("/")
     anime = {x.lower() for x in (cfg.get("anime_dirs") or ["Anime"])}
     series = {x.lower() for x in (cfg.get("series_dirs") or ["Series"])}
@@ -255,11 +259,14 @@ def coverage():
     for r, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s in _inventory(cfg):
         L = libs.setdefault(top, {"name": top, "kind": kind, "total": 0, "unreadable": 0,
                                   "complete": 0, "missing_audio": 0, "missing_subs": 0,
-                                  "missing_both": 0,
+                                  "missing_both": 0, "excluded": 0,
                                   "audio": {k: 0 for k in want_a},
                                   "subs": {k: 0 for k in want_s},
                                   "targets": {"audio": want_a, "subs": want_s}})
         L["total"] += 1
+        if r["excluded"]:
+            L["excluded"] += 1        # counted as a file, not scored against the target
+            continue
         if have_a is None:
             L["unreadable"] += 1
             continue
@@ -274,9 +281,14 @@ def coverage():
     order = {"movie": 0, "anime": 1, "series": 2}
     out = sorted(libs.values(), key=lambda x: (order.get(x["kind"], 9), x["name"]))
     tot = sum(l["total"] for l in out)
+    excl = sum(l["excluded"] for l in out)
     return {"libraries": out, "total": tot,
             "complete": sum(l["complete"] for l in out),
             "unreadable": sum(l["unreadable"] for l in out),
+            "excluded": excl,
+            # the percentage is over what is actually TARGETED, so files we deliberately skip
+            # neither inflate nor deflate it
+            "targeted": tot - excl,
             "probed": tot}
 
 
@@ -290,23 +302,25 @@ def library(state: str = "incomplete", lib: str = "", q: str = "",
     `state`: complete | incomplete | unreadable | all. `lib` filters to one top-level library,
     `q` is a case-insensitive substring of the path. The counts returned are for the whole
     (lib+q) selection, not just the returned page, so the tab headers stay honest while paging."""
-    if state not in ("complete", "incomplete", "unreadable", "all"):
-        raise HTTPException(422, "state must be complete | incomplete | unreadable | all")
+    if state not in ("complete", "incomplete", "unreadable", "excluded", "all"):
+        raise HTTPException(422,
+                            "state must be complete | incomplete | unreadable | excluded | all")
     cfg = core.load_config()
     mount = (cfg.get("media_mount") or "/media").rstrip("/")
     ql, libl = q.strip().lower(), lib.strip().lower()
-    counts = {"complete": 0, "incomplete": 0, "unreadable": 0}
+    counts = {"complete": 0, "incomplete": 0, "unreadable": 0, "excluded": 0}
     errs = {}          # unreadable broken down by WHY — they are rarely all the same problem
     libs, hits = {}, []
     for (r, top, kind, want_a, want_s, have_a, have_s, miss_a,
-         miss_s) in _inventory(cfg, "path, auds, subs, err, dur, probed"):
+         miss_s) in _inventory(cfg, "path, auds, subs, err, excluded, dur, probed"):
         libs[top] = libs.get(top, 0) + 1
         if libl and top.lower() != libl:
             continue
         path = r["path"] or ""
         if ql and ql not in path.lower():
             continue
-        row_state = ("unreadable" if have_a is None else
+        row_state = ("excluded" if r["excluded"] else
+                     "unreadable" if have_a is None else
                      "incomplete" if (miss_a or miss_s) else "complete")
         counts[row_state] += 1
         if row_state == "unreadable":
@@ -519,7 +533,10 @@ def rescan_state():
     `read`/`reused` are live counters, so a progressive pass can show it is working through new
     files rather than looking identical to a scan that found nothing to do."""
     return {**pipeline.SCAN_STATE, "probes": core.probe_stats(),
-            "read": media.STATS["probed"], "reused": media.STATS["cached"]}
+            "read": media.STATS["probed"], "reused": media.STATS["cached"],
+            # why *arr-known files did not become inventory rows — so "the count is wrong" can be
+            # explained (no file in Radarr / path not under /media / unreadable / not targeted)
+            "skips": pipeline.SCAN_SKIPS}
 
 
 @api.post("/finish")

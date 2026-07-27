@@ -37,17 +37,19 @@ export interface RescanState {
   full?: boolean | null;      // true = the cache was dropped first; false = progressive
   read?: number;              // files actually re-read this pass (live)
   reused?: number;            // files served from the probe cache (live)
+  // why *arr-known files did not become inventory rows, so a wrong file count is explainable
+  skips?: { films?: Record<string, number>; episodes?: Record<string, number> };
 }
 export interface LibItem {
   path: string; rel: string; lib: string; kind: string;
-  title: string; file: string; state: "complete" | "incomplete" | "unreadable";
+  title: string; file: string; state: "complete" | "incomplete" | "unreadable" | "excluded";
   audio: string[]; subs: string[]; missing_audio: string[]; missing_subs: string[];
   targets: { audio: string[]; subs: string[] };
   dur: number | null; probed: number | null; err: string | null;
 }
 export interface LibPage {
   items: LibItem[]; total: number; offset: number;
-  counts: { complete: number; incomplete: number; unreadable: number };
+  counts: { complete: number; incomplete: number; unreadable: number; excluded: number };
   // unreadable broken down by WHY — "no audio track" is a broken file, the rest are our tools
   error_kinds: Record<string, number>;
   repairable: number;    // files carrying no audio at all: deletable + re-searchable
@@ -77,11 +79,13 @@ export interface RepairState {
 export interface CoverageLib {
   name: string; kind: string; total: number; unreadable: number;
   complete: number; missing_audio: number; missing_subs: number; missing_both: number;
+  excluded: number;   // real files the pipeline deliberately doesn't target (French-origin)
   audio: Record<string, number>; subs: Record<string, number>;
   targets: { audio: string[]; subs: string[] };
 }
 export interface Coverage {
   libraries: CoverageLib[]; total: number; complete: number; unreadable: number; probed: number;
+  excluded: number; targeted: number;   // percentage is over `targeted`, not the raw total
 }
 export interface DL {
   progress: number; dlspeed: number; eta: number; state: string;

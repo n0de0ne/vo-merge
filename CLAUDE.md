@@ -289,6 +289,29 @@ pass at a time) with `GET /api/library/repair` reporting progress. The Library t
 view breaks the count down by error and only offers the panel when something is genuinely
 audio-less.
 
+### Inventory is not the same as targeting (`probes.excluded`)
+
+`exclude_french_origin` means "don't hunt an English dub for a French film". It used to `return`
+/ `continue` **before the file was ever probed**, so those titles were absent from the `probes`
+table — which is the library inventory. They vanished from the Library tab, from the per-library
+file counts and from the coverage denominator: Films reported 2,041 files against 2,429 on disk.
+A whole French-origin *series* disappeared the same way in `tv.scan`.
+
+The scan does two jobs and they need separating: decide the gap (where the exclusion belongs) and
+build the inventory (where it does not). Both scans now probe the file first, stamp
+`probes.excluded`, and only then skip creating a pipeline record. So the file is counted and
+listable, but never chased, and never scored as a failure for a gap nobody intends to fill:
+
+- `/api/coverage` returns `excluded` and `targeted`; **percentages are over `targeted`**.
+- `/api/library?state=excluded` is the Library tab's **"Not targeted"** filter.
+- The flag is re-stamped every scan, so flipping `exclude_french_origin` takes effect next pass.
+
+`pipeline.SCAN_SKIPS` (surfaced on `GET /api/rescan` as `skips`) records every reason an
+*arr-known file did NOT become an inventory row — `no_file` / `unmapped` / `unreadable` /
+`excluded` — so a file count that doesn't match the library can be explained instead of guessed
+at. `unmapped` in particular means `media.to_media` couldn't find the path under `/media`, which
+is a mount/prefix problem, not a missing file.
+
 ### A scan adds what's new; the prune drops what's gone
 
 Nothing used to remove a probe or a record, so a title deleted from the library kept being counted
