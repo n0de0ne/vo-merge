@@ -55,6 +55,11 @@ export interface LibPage {
   repairable: number;    // files carrying no audio at all: deletable + re-searchable
   libraries: { name: string; total: number }[];
 }
+export interface RecheckState {
+  running: boolean; scope: string; started: number; finished: number;
+  checked: number; total: number; reopened: number; complete: number;
+  unreadable: number; gone: number; error: string | null;
+}
 export interface RepairPlan {
   dry_run: true; total: number; unknown: number;
   candidates: { path: string; title: string; kind: string; known: boolean }[];
@@ -188,6 +193,11 @@ export const api = {
       `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   coverage: () => j<Coverage>("/api/coverage"),
+  // re-probe everything in a settled state (merged / no_release) and re-open what's below target
+  recheck: (scope: "all" | "films" | "tv" | "anime" | "series" = "all") =>
+    j<{ ok: boolean; started: boolean; note?: string }>(
+      `/api/recheck?scope=${scope}`, { method: "POST" }),
+  recheckState: () => j<RecheckState>("/api/recheck"),
   library: (o: { state?: string; lib?: string; q?: string; limit?: number; offset?: number } = {}) =>
     j<LibPage>("/api/library?" + new URLSearchParams({
       state: o.state ?? "incomplete", lib: o.lib ?? "", q: o.q ?? "",

@@ -512,6 +512,47 @@ def library_repair_state():
     return pipeline.REPAIR_STATE
 
 
+@api.post("/recheck")
+def do_recheck(scope: str = "all"):
+    """Treat everything below target NOW, whatever settled state it is parked in.
+
+    Two dead ends, for different reasons: `merged` never meant "complete" — it meant a merge ran,
+    and the file can still be short of something the donor didn't carry. `no_release` means
+    nothing suitable existed WHEN WE LOOKED, which indexers make untrue over time. `stage_search`
+    only reads `pending`, so neither is ever reconsidered on its own.
+
+    The scan re-opens both on its own terms (merged immediately, no_release after
+    `no_release_retry_h`); this ignores the cooldown and walks only the settled records instead
+    of the whole library. `ignored` is never touched — that is a deliberate give-up. The release
+    already tried stays blocklisted, so a re-opened record searches for a different one.
+
+    Runs in a thread under SCAN_LOCK (one heavy file pass at a time); GET reports progress."""
+    import threading
+    if scope not in ("all", "films", "tv", "anime", "series"):
+        raise HTTPException(422, "scope must be all | films | tv | anime | series")
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan or re-check is already running"}
+
+    def _run():
+        st = pipeline.RECHECK_STATE
+        try:
+            pipeline.recheck_settled(scope, state=st)
+        except Exception as e:
+            st.update(running=False, finished=time.time(), error=str(e))
+            core.log(f"recheck({scope}) error: {e}")
+        finally:
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "scope": scope}
+
+
+@api.get("/recheck")
+def recheck_state():
+    """Progress of a running (or the last) re-check."""
+    return pipeline.RECHECK_STATE
+
+
 @api.get("/rescan")
 def rescan_state():
     """Progress of a running (or the last) rescan — it takes minutes, so the UI can say so.

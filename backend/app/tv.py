@@ -12,7 +12,7 @@ from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _pick_subs, _donor_opts, hold_reason, REOPEN_STATES)
+                       _pick_subs, _donor_opts, hold_reason, reopen_status)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -274,8 +274,8 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                 # See pipeline.ingest_movie: a terminal status on a file that still has a gap
                 # is a dead end, because stage_search only looks at `pending`.
                 prev = (cur or {}).get("status")
-                st_ = "pending" if prev in REOPEN_STATES else (prev or "pending")
-                if st_ != prev:
+                st_ = reopen_status(prev, (cur or {}).get("updated"), cfg)
+                if st_ != prev and prev:
                     core.log(f"tv scan: {ep_id} is marked {prev} but still needs "
                              f"{'+'.join(miss_a + miss_s)} -> re-opening")
                 core.set_ep_status(ep_id, st_,

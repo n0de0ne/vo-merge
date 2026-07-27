@@ -465,12 +465,23 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
   subtitle-only shortfall when `subs_only_gap` is off, exactly the case this must not ignore.
   Sidecar `.srt` files survive either way — the replacement keeps the library file's name, so
   they still match its stem.
-- **`merged` is not a promise that the file is complete.** A merge adds what the donor had; the
-  file can still be short of something else. Keeping the terminal status left those records
-  "done" while incomplete, and since `stage_search` only ever looks at `pending` they were never
-  reconsidered — the "merged but still missing English" rows. A scan that finds a gap on a record
-  in `REOPEN_STATES` (`merged`) resets it to `pending` and logs why. `ignored` is NOT in that set:
-  it is a deliberate give-up (a human, or the AI via `/unfixable`) and must survive a rescan.
+- **A settled state is not a promise that the file meets its target.** `stage_search` only ever
+  reads `pending`, so every other settled state is a dead end for a file that still has a gap.
+  Two must be re-opened, on different terms (`pipeline.reopen_status`, shared by both scans):
+  - **`merged`** never meant "complete", only "a merge ran" — the file can still be short of what
+    the donor didn't carry. Re-opened as soon as a scan notices; "done while incomplete" is just
+    wrong. These are the "merged but still missing English" rows.
+  - **`no_release`** means nothing suitable existed *when we looked*, which indexers make untrue
+    over time. Re-opened after `no_release_retry_h` (default 24), measured from `updated` —
+    which, since it only moves on a real state change, is exactly when the record entered
+    `no_release`. Without a cooldown an hourly sweep would re-query hundreds of titles that
+    genuinely don't exist.
+  - **`ignored` is in neither set**: it is a deliberate give-up (a human, or the AI via
+    `/unfixable`) and must survive a rescan.
+- **`POST /api/recheck?scope=`** ("Re-check finished", on the Films and TV tabs) is the operator
+  saying *treat everything below target now*: it walks only the settled records instead of the
+  whole library and ignores the cooldown. The release already tried stays blocklisted (`tried`),
+  so a re-opened record searches for a DIFFERENT one; only `attempts` is refreshed.
 - **`finish_movie` re-reads the file it just wrote.** Otherwise the record keeps the languages
   recorded at SCAN time, so a merge that added English still displayed the pre-merge track list —
   and one that fell short looked complete — until the next library scan.

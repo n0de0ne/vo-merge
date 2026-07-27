@@ -111,6 +111,12 @@ DEFAULTS = {
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
+    "no_release_retry_h": 24,              # a record that found nothing is re-searched after this
+                                           # many hours. Indexers gain releases constantly, so
+                                           # "nothing existed when we looked" must not be
+                                           # permanent — but re-querying every hourly sweep for
+                                           # titles that genuinely don't exist is just abuse.
+                                           # 0 = retry on every scan, negative = never.
     "search_interval_min": 60,
     "finish_interval_min": 10,
     "stall_timeout_min": 5,                # an incomplete download not moving (no seeds/0 speed) for

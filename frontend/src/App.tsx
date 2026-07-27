@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog } from "./api";
+  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -290,6 +290,44 @@ function Tracks({ a, s, na, ns }:
       {na && <span className="needs">+ {na} audio</span>}
       {ns && <span className="needs">+ {ns} subs</span>}
     </div>
+  );
+}
+
+// Treat everything below target, whatever settled state it is parked in. "merged" only ever
+// meant "a merge ran" — the file can still be short of what the donor didn't carry — and
+// "no release" only meant nothing existed WHEN WE LOOKED. stage_search reads only `pending`, so
+// neither is reconsidered on its own. The release already tried stays blocklisted, so a
+// re-opened record searches for a different one. `ignored` is never touched.
+function RecheckButton({ scope }: { scope: "films" | "tv" | "anime" | "series" }) {
+  const [st, setSt] = useState<RecheckState | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.recheckState().then(setSt).catch(() => {}), st?.running ? 3000 : 60000,
+    [st?.running]);
+  async function go() {
+    setBusy(true);
+    try { await api.recheck(scope); await api.recheckState().then(setSt); }
+    finally { setBusy(false); }
+  }
+  const mine = st?.scope === scope;
+  const running = !!st?.running;
+  const done = mine && st && !running && st.finished > 0;
+  return (
+    <>
+      <button className="btn sec" disabled={busy || running} onClick={go}
+        title={"Re-read every file parked in a finished state — merged, or no-release — and "
+             + "re-open the ones that still don't meet their target. \"Merged\" only means a "
+             + "merge ran, and \"no release\" only means nothing existed when we last looked. "
+             + "The release already tried stays blocklisted; ignored titles are left alone."}>
+        {running && mine ? "Re-checking…" : "Re-check finished"}
+      </button>
+      {running && mine && <span className="muted">
+        re-probed {st!.checked} of {st!.total} · re-opened {st!.reopened}</span>}
+      {done && !st.error && <span className="muted">
+        last: {st.reopened} re-opened of {st.total} · {st.complete} genuinely complete
+        {st.gone > 0 && <> · {st.gone} file(s) gone</>}
+        {st.unreadable > 0 && <span className="bad"> · {st.unreadable} unreadable</span>}</span>}
+      {mine && st?.error && <span className="bad">re-check failed: {st.error}</span>}
+    </>
   );
 }
 
@@ -1033,6 +1071,7 @@ function Films() {
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
           <RescanButton scope="films" label="films" />
           <RescanButton scope="films" label="films" full />
+          <RecheckButton scope="films" />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {STATES.map(s => (
@@ -1257,6 +1296,7 @@ function Series({ anime }: { anime: boolean }) {
             Scan {anime ? "anime" : "series"}</button>
           <RescanButton scope={anime ? "anime" : "series"} label={anime ? "anime" : "TV shows"} />
           <RescanButton scope={anime ? "anime" : "series"} label={anime ? "anime" : "TV shows"} full />
+          <RecheckButton scope={anime ? "anime" : "series"} />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {TV_STATES.map(s => (

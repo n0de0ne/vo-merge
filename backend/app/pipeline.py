@@ -242,11 +242,34 @@ def _free_donor(qb, h, cfg, tag=""):
 # here is what let two finished packs squat the cap with the merger idle.
 ACTIVE_STATES = ("downloading",)
 
-# Terminal states that mean "nothing more will happen to this record". If a scan finds the file
-# still doesn't meet its profile, the record is re-opened to `pending` — `stage_search` only
-# looks at `pending`, so anything else is a dead end. `ignored` is NOT here: it is a deliberate
-# give-up (by a human or the AI via /unfixable) and must survive a rescan.
+# `stage_search` only ever looks at `pending`, so every other settled state is a dead end for a
+# file that still doesn't meet its profile. Two of them have to be re-opened, for different
+# reasons and on different terms:
+#
+#   merged      — the merge added what the donor carried; the file can still be short of
+#                 something else. "Marked done while incomplete" is simply wrong, so it is
+#                 re-opened as soon as a scan notices.
+#   no_release  — nothing suitable existed WHEN WE LOOKED. Indexers gain releases constantly, so
+#                 this deserves another try — but not every hourly sweep, or we would re-query
+#                 hundreds of titles that genuinely don't exist. Re-opened after a cooldown,
+#                 measured from `updated`, which (since it only moves on a real state change) is
+#                 exactly when the record entered no_release.
+#
+# `ignored` is in neither: it is a deliberate give-up (a human, or the AI via /unfixable) and
+# must survive a rescan. In-flight states are obviously left alone.
 REOPEN_STATES = ("merged",)
+RETRY_STATES = ("no_release",)
+
+
+def reopen_status(prev, updated, cfg):
+    """What status a record with a REMAINING gap should carry. Shared by both scans."""
+    if prev in REOPEN_STATES:
+        return "pending"
+    if prev in RETRY_STATES:
+        cool = float(cfg.get("no_release_retry_h", 24)) * 3600
+        if cool >= 0 and time.time() - (updated or 0) >= cool:
+            return "pending"
+    return prev or "pending"
 # ...but the donor FILES must survive until the merge consumes them, so the orphan sweep keeps
 # its hands off ready/merging (and review/sync_fail, kept for manual resync).
 KEEP_DONOR_STATES = ("downloading", "ready", "merging", "review", "sync_fail")
@@ -432,8 +455,8 @@ def ingest_movie(m, cfg, refresh=False):
     # the donor had, the file was short of something else, and nothing ever reconsidered it.
     # `ignored` is left alone: that is a deliberate decision, not an oversight.
     prev = (existing or {}).get("status")
-    status = "pending" if prev in REOPEN_STATES else (prev or "pending")
-    if status != prev:
+    status = reopen_status(prev, (existing or {}).get("updated"), cfg)
+    if status != prev and prev:
         core.log(f"scan: {m.get('title')} is marked {prev} but still needs "
                  f"{'+'.join(miss_a + miss_s)} -> re-opening")
     core.set_status(m["tmdbId"], status,
@@ -919,6 +942,92 @@ def retry_errors(cfg=None, states=("error", "sync_fail")):
     n = sum(1 for st in states for m in core.get_movies(st) if retry_movie(m["tmdb_id"], cfg))
     core.log(f"retry-all films: re-queued {n} failed title(s)")
     return n
+
+
+# Progress of the current/last "re-check what we called merged" pass. It re-probes one file per
+# record, so on a few hundred records it is a minutes-long job like a scan.
+RECHECK_STATE = {"running": False, "scope": "", "started": 0, "finished": 0,
+                 "checked": 0, "total": 0, "reopened": 0, "complete": 0,
+                 "unreadable": 0, "gone": 0, "error": None}
+
+
+def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, state=None):
+    """Re-probe every record in a settled state and re-open the ones whose file still has a gap.
+
+    The scan does this too, but on its own terms: `merged` immediately, `no_release` only after
+    `no_release_retry_h`. This is the operator saying "treat everything below target NOW", so it
+    ignores the cooldown and walks only the settled records rather than the whole library.
+
+    `merged` only ever meant "a merge ran", never "the file is complete": the merge adds what the
+    donor carried, and the file can still be short of something else. Those records sat terminal
+    and `stage_search` only looks at `pending`, so nothing reconsidered them. A library re-read
+    now fixes this as a side effect, but it re-probes every file in the library to correct a few
+    hundred records — this walks only the merged ones.
+
+    The release that was already used stays blocklisted (`tried`), so a re-opened record searches
+    for something DIFFERENT; only `attempts` is refreshed, because an operator asking for another
+    go means the budget starts over."""
+    cfg = cfg or core.load_config()
+    st = state if state is not None else dict(RECHECK_STATE)
+    movies = ([] if scope in ("anime", "series")
+              else [m for st in states for m in core.get_movies(st)])
+    eps = [] if scope == "films" else [
+        e for st in states for e in core.get_episodes(st)
+        if scope in ("all", "tv")
+        or (scope == "anime") == ((e.get("series_type") or "standard") == "anime")]
+    st.update(running=True, scope=scope, started=time.time(), finished=0, checked=0,
+              total=len(movies) + len(eps), reopened=0, complete=0, unreadable=0, gone=0,
+              error=None)
+    media.reset_stats()
+
+    def _one(path, kind, orig, series_type="standard"):
+        """-> 'gone' | 'unreadable' | 'complete' | (miss_a, miss_s)"""
+        if not path or not os.path.exists(path):
+            return "gone"
+        auds, subs, err = media.audit(path, refresh=True)
+        if err:
+            return "unreadable"
+        k = media.kind_of(path, orig, cfg, series_type=series_type)
+        miss_a, miss_s = media.gap_langs(auds, subs, k, cfg)
+        if not miss_a and not miss_s:
+            return "complete"
+        return (auds, subs, miss_a, miss_s)
+
+    for mv in movies:
+        st["checked"] += 1
+        r = _one(mv.get("french_path"), "movie", mv.get("original_lang"))
+        if isinstance(r, str):
+            st[r] = st.get(r, 0) + 1
+            continue
+        auds, subs, miss_a, miss_s = r
+        core.set_status(mv["tmdb_id"], "pending", attempts=0, error=None, progress="",
+                        audio_langs=",".join(sorted(auds)), sub_langs=",".join(sorted(subs)),
+                        need_audio=",".join(miss_a), need_subs=",".join(miss_s),
+                        needs="+".join([x for x in (("audio" if miss_a else ""),
+                                                    ("subs" if miss_s else "")) if x]))
+        st["reopened"] += 1
+        core.log(f"recheck: {mv.get('title')} ({mv['status']}) still needs "
+                 f"{'+'.join(miss_a + miss_s)} -> pending")
+    for e in eps:
+        st["checked"] += 1
+        r = _one(e.get("french_path"), "episode", e.get("orig_lang"),
+                 e.get("series_type") or "standard")
+        if isinstance(r, str):
+            st[r] = st.get(r, 0) + 1
+            continue
+        auds, subs, miss_a, miss_s = r
+        core.set_ep_status(e["id"], "pending", attempts=0, error=None, progress="",
+                           audio_langs=",".join(sorted(auds)), sub_langs=",".join(sorted(subs)),
+                           need_audio=",".join(miss_a), need_subs=",".join(miss_s),
+                           needs="+".join([x for x in (("audio" if miss_a else ""),
+                                                       ("subs" if miss_s else "")) if x]))
+        st["reopened"] += 1
+    st.update(running=False, finished=time.time())
+    bad = f", {st['unreadable']} unreadable" if st["unreadable"] else ""
+    gone = f", {st['gone']} file(s) gone" if st["gone"] else ""
+    core.log(f"recheck({scope}): {st['reopened']} of {st['total']} settled record(s) re-opened, "
+             f"{st['complete']} genuinely complete{bad}{gone}")
+    return st
 
 
 # ---------------------------------------------------------------- PROBE (local bins)
