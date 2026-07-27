@@ -430,6 +430,43 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
   hwaccel failure (rc≠0 / 0 cuts) — never on a merely low-action window.
 - Audio cross-correlation (`offdet.py`) is the fallback when video windows don't resolve.
 
+### The offset search has a ceiling (`sync_max_lag_s`)
+
+`detect_offset_video_ms` cross-correlates the two files' scene-cut patterns and takes the argmax
+over lags within **±`sync_max_lag_s`**. That bound was hard-coded at **20s**, which is a real
+ceiling and not a tuning knob: a BD-vs-WEB anime pair routinely differs by **30–60s** — a sponsor
+or logo card the WEB version carries, a "previously on" the BD drops. Past the bound the true
+correlation peak is sliced off *before* the argmax, so every window locks onto noise (conf ~0.06–0.09,
+under the 0.3 per-window gate), the windows disagree, and `detect()` concluded **"different cut"** —
+for a plain constant offset that `--sync` would have fixed.
+
+Verified end to end on real files (donor = base + 40s of leader): at ±20s it reports +8.84s with
+conf 0.09 and the window is discarded; at ±60s and above it reports −40.00s with conf 0.89.
+
+Widening is **free** — the FFT already covers the whole window, only the slice the argmax runs
+over changes — and **safe**: the confidence is normalised, so unrelated files don't correlate at
+any lag (0/200 random cut-train pairs cleared the 0.3 gate at ±20, ±90 or ±180s), and the
+multi-window consensus (several windows agreeing within 150ms) still has to be satisfied. Default
+is now **120s**, configurable. The reject log says how far it searched instead of guessing
+"different cut?".
+
+### Measuring an offset without merging (`POST /movie|episode/{id}/sync_probe`)
+
+The AI could re-run detection (`/sync`, which fails the same way) or apply an offset (`/set_sync`)
+— but it had no way to **ask what the offset is**, so on a "couldn't sync" it could only guess or
+give up. That is why those tickets came back as "different cut; manual pick or ignore".
+
+`sync_probe` runs detection with a much wider `max_lag_s` (default 300, up to 900) and **reports
+the result without merging**; `apply: true` merges with what it finds. It returns the duration
+delta alongside the offset, which is the discriminator:
+
+- duration differs **and** the windows agree on an offset → extra material at the head/tail, which
+  `--sync` fixes;
+- duration differs and the windows **disagree** → material inserted in the middle, a genuinely
+  different cut that no single offset can align.
+
+Both ticket templates advertise it as the FIRST call to make on a sync failure.
+
 ### Rate-ratio detection — the PAL path (`sync.ratio_detect` / `offdet_video.ratio_scan`)
 
 A PAL transfer plays 24/23.976fps content at 25fps, so the FR copy runs **~4.27% short**. Window
