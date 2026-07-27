@@ -1215,8 +1215,13 @@ def dashboard():
         # that share a status+error into ONE row spanning their episode range, then take 8 groups.
         from . import tv as _tv
         groups = {}
+        # Read them ALL before grouping. A flat LIMIT here is a window over the most recently
+        # updated rows, so with ~400 failing episodes (which is normal after one bad season) the
+        # window silently cut groups off the panel, and any write that touched a row changed
+        # which ones were visible. Grouping a few thousand rows in Python is nothing; the cap is
+        # only a runaway backstop.
         for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
-                           "ORDER BY updated DESC LIMIT 400", ATTN):
+                           "ORDER BY updated DESC LIMIT 5000", ATTN):
             g = groups.setdefault((r["series_title"], r["status"], r["error"], r["ai_status"]),
                                   {"eps": [], "row": r})
             g["eps"].append((r["season"], r["episode"]))

@@ -442,14 +442,7 @@ def upsert_episode(e: dict):
 
 
 def set_ep_status(ep_id, status, **fields):
-    fields["status"] = status; fields["updated"] = time.time()
-    if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
-        fields["error"] = redact(fields["error"])
-    if status == "merged":                 # stamp once; later `updated` churn won't touch it
-        fields.setdefault("merged_at", time.time())
-    keys = ",".join(f"{k}=?" for k in fields)
-    with db() as c:
-        c.execute(f"UPDATE episodes SET {keys} WHERE id=?", tuple(fields.values()) + (ep_id,))
+    _set_row("episodes", "id", ep_id, status, fields)
 
 
 def get_episodes(status=None):
@@ -492,17 +485,49 @@ def upsert_movie(m: dict):
                       tuple(m.get(k) for k in cols) + (time.time(),))
 
 
-def set_status(tmdb_id, status, **fields):
-    fields["status"] = status
-    fields["updated"] = time.time()
+def _set_row(table, key_col, key, status, fields):
+    """The one writer for both tables. Two timestamps that look incidental decide what the whole
+    Overview shows, and both used to be re-stamped by writes that changed nothing:
+
+    - **`updated` means "when the pipeline state last changed"**, not "when we last touched the
+      row". It is the sort key for Needs attention and the FIFO order of the merge queue. But
+      every scan re-writes each record with its CURRENT status just to refresh the language
+      columns, and the AI sweep re-writes error records to stamp `ai_status` — so a record that
+      had not changed in days jumped to the top of the panel whenever a scan or the 3-minute
+      sweep ran. The CASE keeps the old value when the status is unchanged; SQLite evaluates
+      every SET expression against the ORIGINAL row, so it sees the stored status even though
+      the same statement is assigning a new one.
+    - **`merged_at` is stamped on the TRANSITION into merged, and never again.** `setdefault`
+      only checked whether the CALLER passed one, not whether the row already had one, so every
+      later write with status='merged' — including a scan re-reading an already-merged file —
+      reset it to now, floating old merges back into "Recently merged" and inflating the 24h/7d
+      counters. Keying off the transition (rather than "is it NULL") also leaves pre-column rows
+      alone, so an upgrade doesn't dump the whole back catalogue into "Recently merged" at once;
+      those fall back to `updated`, which is now stable too.
+
+    Pass `updated=<ts>` explicitly to force a bump."""
     if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
         fields["error"] = redact(fields["error"])
-    if status == "merged":                 # stamp once; later `updated` churn won't touch it
-        fields.setdefault("merged_at", time.time())
-    keys = ",".join(f"{k}=?" for k in fields)
+    now = fields.pop("updated", None)
+    forced = now is not None
+    now = time.time() if now is None else now
+    stamp = fields.pop("merged_at", None) or now
+    fields["status"] = status
+    sets = ",".join(f"{k}=?" for k in fields)
+    vals = list(fields.values())
+    if forced:
+        sets += ",updated=?"; vals.append(now)
+    else:
+        sets += ",updated=CASE WHEN status=? THEN updated ELSE ? END"; vals += [status, now]
+    if status == "merged":
+        sets += ",merged_at=CASE WHEN status=? THEN merged_at ELSE ? END"
+        vals += ["merged", stamp]
     with db() as c:
-        c.execute(f"UPDATE movies SET {keys} WHERE tmdb_id=?",
-                  tuple(fields.values()) + (tmdb_id,))
+        c.execute(f"UPDATE {table} SET {sets} WHERE {key_col}=?", tuple(vals) + (key,))
+
+
+def set_status(tmdb_id, status, **fields):
+    _set_row("movies", "tmdb_id", tmdb_id, status, fields)
 
 
 def claim_movie(tmdb_id, from_status, to_status, **fields):

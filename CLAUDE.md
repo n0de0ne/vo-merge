@@ -291,6 +291,36 @@ the DB:
 `SCAN_STATE` carries `pruned` / `pruned_records` and the button reports "N deleted entries
 removed" alongside the gap count.
 
+## `updated` and `merged_at` mean specific things (`core._set_row`)
+
+Two timestamps that look incidental decide what the whole Overview shows, and both used to be
+re-stamped by writes that changed nothing — which is why "Needs attention" and "Recently merged"
+reshuffled at intervals matching the background jobs rather than matching events.
+
+- **`updated` = when the pipeline STATE last changed**, not when the row was last touched. It
+  sorts Needs attention and orders the `ready` merge queue. But `ingest_movie` re-writes every
+  record with its CURRENT status just to refresh `audio_langs`/`need_audio`, and `ai_health_check`
+  re-writes error records every 3 min to stamp `ai_status` — so a record untouched for days
+  jumped to the top whenever a scan or the sweep ran. `_set_row` writes
+  `updated = CASE WHEN status=? THEN updated ELSE ?` — SQLite evaluates every SET expression
+  against the ORIGINAL row, so the CASE sees the stored status even though the same statement
+  assigns a new one. Pass `updated=<ts>` to force a bump.
+- **`merged_at` is stamped on the TRANSITION into `merged`, and never again.** The old
+  `fields.setdefault("merged_at", now)` only checked whether the CALLER passed one, not whether
+  the row already had one, so every later write with `status='merged'` — including a scan
+  re-reading an already-merged file — reset it to now. Old merges kept floating back into
+  "Recently merged" and the 24 h / 7 d counters counted them again. Keying off the transition
+  (rather than "is it NULL") also leaves pre-column rows alone, so an upgrade doesn't dump the
+  back catalogue into "Recently merged" at once; those fall back to `updated`.
+
+Both effects compounded in the dashboard's attention query, which read only the 400
+most-recently-`updated` failing episodes before grouping — with ~400 failing episodes (one bad
+season pack) that window both truncated the panel and slid on every unrelated write. It now reads
+all of them (5000 backstop) and groups in Python.
+
+`claim_movie`/`claim_episode` always bump, correctly: they are guarded by `WHERE status=<from>`,
+so they only ever write a real transition.
+
 ## Pause & holds
 
 `paused` (header button, `POST /api/pause`) is a brake, not a kill switch: no NEW searches,
