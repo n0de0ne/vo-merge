@@ -352,10 +352,18 @@ def init_probe_cache():
             subs TEXT,               -- comma-joined canonical subtitle language codes
             ntracks INTEGER,         -- audio track count (0 with auds='' means unreadable)
             err TEXT )""")
+        # Fingerprint of the EXTERNAL subtitle files beside the media file. The .mkv's own size
+        # and mtime don't change when Bazarr drops an .srt next to it, so without this the cache
+        # would answer from a probe taken before the subtitle existed and never re-read it.
+        _ensure_cols(c, "probes", {"sidecars": "TEXT"})
 
 
-def get_probe(path):
-    """Cached probe row for `path`, but only if the file on disk still matches it."""
+def get_probe(path, sidecars=None):
+    """Cached probe row for `path`, but only if the file on disk still matches it.
+
+    `sidecars` is the caller's current external-subtitle fingerprint (media.sidecar_subs); when
+    it differs from the stored one a subtitle file has been added, removed or replaced beside
+    the media file, so the cached subtitle set is stale even though the .mkv is untouched."""
     try:
         st = os.stat(path)
     except OSError:
@@ -366,23 +374,26 @@ def get_probe(path):
         return None
     if int(r["size"] or -1) != st.st_size or abs((r["mtime"] or 0) - st.st_mtime) > 1:
         return None
+    if sidecars is not None and (r["sidecars"] or "") != sidecars:
+        return None
     return dict(r)
 
 
-def put_probe(path, dur=None, fps=None, auds="", subs="", ntracks=0, err=None):
+def put_probe(path, dur=None, fps=None, auds="", subs="", ntracks=0, err=None, sidecars=""):
     try:
         st = os.stat(path)
         size, mtime = st.st_size, st.st_mtime
     except OSError:
         size, mtime = None, None
     with db() as c:
-        c.execute("""INSERT INTO probes (path,size,mtime,probed,dur,fps,auds,subs,ntracks,err)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)
+        c.execute("""INSERT INTO probes (path,size,mtime,probed,dur,fps,auds,subs,ntracks,err,
+                                         sidecars)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)
                      ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,
                        probed=excluded.probed,dur=excluded.dur,fps=excluded.fps,
                        auds=excluded.auds,subs=excluded.subs,ntracks=excluded.ntracks,
-                       err=excluded.err""",
-                  (path, size, mtime, time.time(), dur, fps, auds, subs, ntracks, err))
+                       err=excluded.err,sidecars=excluded.sidecars""",
+                  (path, size, mtime, time.time(), dur, fps, auds, subs, ntracks, err, sidecars))
 
 
 def forget_probe(path):

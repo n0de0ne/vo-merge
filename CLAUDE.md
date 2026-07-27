@@ -161,6 +161,38 @@ the gap decision itself.
 
 ## Subtitles
 
+### External subtitles count (`media.sidecar_subs`)
+
+Bazarr — and most subtitle tooling — writes subtitles as **files beside the media**
+(`Some Film (2020).en.srt`), not muxed into the container. `mkvmerge -J` reports only what is
+inside, so counting embedded tracks alone means every subtitle Bazarr ever fetched still reads as
+missing: coverage never improves, and with `subs_only_gap` on vo-merge would download a release
+for a subtitle already sitting on disk.
+
+The library layout is `/media/<Films|Series|Anime>/<title or show>/[Season NN/]<file>`, with
+sidecars in the same folder sharing the file's stem, so "same directory, same stem" finds them.
+`audit()` returns the UNION of embedded tracks and sidecars — both play in Plex, so both satisfy
+the profile.
+
+- `<stem>.en.srt`, `<stem>.eng.forced.srt`, `<stem>.fr.sdh.srt` → forced/sdh/hi/cc/signs and
+  friends are qualifiers, not languages, and are skipped.
+- **Only a language `_ALIAS` actually knows counts.** `norm_lang` falls back to the first three
+  characters of anything unrecognised, which would read a bare `<stem>.srt` as the language
+  "srt" — and mark the file as already subtitled. A sidecar with no recognisable language token
+  stays `und`, i.e. excluded, exactly like an untagged embedded track.
+- A neighbouring episode's sidecar can't be attributed to this file: the stem must match.
+
+**The probe cache had to learn about them.** It is keyed on the media file's size and mtime, and
+neither changes when Bazarr drops an `.srt` next to it — so a progressive scan would answer from
+a probe taken before the subtitle existed and never re-read it. `probes.sidecars` stores a
+fingerprint of the sidecar set (name + size); `core.get_probe(path, sidecars=…)` treats a
+mismatch as a miss. Verified: adding *and* removing an `.srt` both force a re-read while the
+`.mkv` is untouched.
+
+A season folder is listed once, not once per episode (`_scandir`, 30 s TTL — short because the
+webhook path probes outside any scan pass and a permanent entry would go stale).
+
+
 Most French library files have no English subtitles, and the donor downloaded for its audio
 usually ships them — so taking them costs one extra mkvmerge argument, not another download.
 

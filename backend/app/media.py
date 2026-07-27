@@ -29,7 +29,7 @@ Subtitle markers are deliberately NOT read from filenames: "VOSTFR" means origin
 French subs, so the very tokens that look French describe the subtitle track, not the audio.
 Reading them as audio hints is how you conclude a Japanese file is French.
 """
-import json, os, re, subprocess
+import json, os, re, subprocess, time
 from . import core
 
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mov", ".wmv")
@@ -162,6 +162,82 @@ def probe(path):
     return {"dur": (dur / 1e9 if isinstance(dur, (int, float)) else None),
             "fps": _fps(path), "auds": auds, "subs": subs,
             "ok": bool(cont.get("recognized")) and bool(cont.get("supported"))}
+
+
+# ------------------------------------------------------------------ sidecar subtitles
+# Bazarr (and most subtitle tooling) writes EXTERNAL subtitle files next to the media file
+# rather than muxing them in: "Some Film (2020).en.srt". mkvmerge only reports what is inside
+# the container, so without this every subtitle Bazarr ever fetched reads as still missing —
+# the coverage number never improves, and with `subs_only_gap` on we would download a release
+# for a subtitle that is already sitting on disk.
+#
+# The layout is /media/<library>/<title or show>/[Season NN/]<file>.mkv, with sidecars beside
+# the file and sharing its stem, so "same directory, same stem" finds them.
+_SUB_EXT = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup")
+# tokens that qualify a subtitle rather than naming its language
+_SUB_QUAL = {"forced", "sdh", "hi", "cc", "full", "foreign", "signs", "songs", "default"}
+
+
+_DIRCACHE = {}
+_DIR_TTL = 30.0        # seconds
+_DIR_MAX = 4000        # directories held before the cache is dropped wholesale
+
+
+def _scandir(d):
+    """One listing per directory, reused briefly. A 26-episode season folder would otherwise be
+    re-listed once per episode.
+
+    Short-lived on purpose: this is a process-global dict, and the webhook path probes files
+    outside any scan pass, so an entry that lived forever would eventually answer for a
+    directory whose subtitles have since changed."""
+    now = time.time()
+    hit = _DIRCACHE.get(d)
+    if hit and now - hit[0] < _DIR_TTL:
+        return hit[1]
+    try:
+        ent = [(e.name, e.stat()) for e in os.scandir(d) if e.is_file()]
+    except OSError:
+        ent = []
+    if len(_DIRCACHE) > _DIR_MAX:
+        _DIRCACHE.clear()
+    _DIRCACHE[d] = (now, ent)
+    return ent
+
+
+def forget_dirs():
+    """Drop the per-directory listing cache (a scan pass calls this at the start)."""
+    _DIRCACHE.clear()
+
+
+def sidecar_subs(path):
+    """(languages, fingerprint) of external subtitle files belonging to `path`.
+
+    The fingerprint is what makes the probe cache notice a subtitle appearing later: the .mkv's
+    own size and mtime do not change when Bazarr drops an .srt beside it, so a progressive scan
+    would otherwise never re-read the file.
+
+    A sidecar with no recognisable language token stays `und` — excluded, exactly like an
+    untagged embedded track. Guessing would be worse than reporting the gap."""
+    d = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    langs_, fp = set(), []
+    for name, st in _scandir(d):
+        low = name.lower()
+        if not low.startswith(stem + ".") or not low.endswith(_SUB_EXT):
+            continue
+        fp.append(f"{low}:{st.st_size}")
+        # "<stem>.en.forced.srt" -> ["en", "forced"];  "<stem>.srt" -> []
+        mid = low[len(stem) + 1:]
+        mid = mid[:mid.rfind(".")] if "." in mid else ""       # drop the extension
+        for tok in mid.split("."):
+            # Only a KNOWN language counts. norm_lang falls back to the first three characters
+            # of anything it doesn't recognise, which would turn "srt", "default" or a release
+            # group's name into a language and mark the file as already subtitled.
+            code = _ALIAS.get(tok) if tok and tok not in _SUB_QUAL else None
+            if code and code != "und":
+                langs_.add(code)
+                break
+    return langs_, ";".join(sorted(fp))
 
 
 def mkv_error(r, limit=300):
@@ -363,23 +439,30 @@ STATS = {"probed": 0, "cached": 0}
 
 def reset_stats():
     STATS.update(probed=0, cached=0)
+    forget_dirs()          # a fresh pass must re-list directories, not reuse last pass's view
 
 
 def audit(path, refresh=False):
-    """(audio langs, subtitle langs, error) for a library file, read from the container and
-    cached until the file's size/mtime change. `error` is a string when the file couldn't be
-    read at all — that must NOT be mistaken for "has no English", so callers skip it."""
+    """(audio langs, subtitle langs, error) for a library file, cached until the file — or the
+    external subtitles beside it — change. `error` is a string when the file couldn't be read at
+    all; that must NOT be mistaken for "has no English", so callers skip it.
+
+    The subtitle set is the union of the container's own tracks and any sidecar files
+    (`Some Film (2020).en.srt`). Both play in Plex, so both satisfy the profile — and counting
+    only embedded tracks would mean every subtitle Bazarr ever fetched still read as missing."""
+    side, side_fp = sidecar_subs(path)
     if not refresh:
-        row = core.get_probe(path)
+        row = core.get_probe(path, sidecars=side_fp)
         if row:
             STATS["cached"] += 1
             return (_split(row["auds"]), _split(row["subs"]), row["err"])
     STATS["probed"] += 1
     info = probe(path)
     if not info:
-        core.put_probe(path, err="unreadable")
+        core.put_probe(path, err="unreadable", sidecars=side_fp)
         return set(), set(), "unreadable"
     a, s = langs(info)
+    s |= side                     # an external .srt satisfies the target exactly like a track
     if not info["auds"]:
         # Four very different situations used to collapse into one "no audio track" — including
         # a file mkvmerge simply can't parse, whose track list is empty for that reason alone.
@@ -393,10 +476,10 @@ def audit(path, refresh=False):
         elif n is None:    err = "unreadable"              # ffprobe can't open it either
         elif n > 0:        err = f"audio mkvmerge can't read ({n} stream(s) per ffprobe)"
         else:              err = "no audio track"          # both tools agree: there is none
-        core.put_probe(path, dur=info["dur"], fps=info["fps"], err=err)
+        core.put_probe(path, dur=info["dur"], fps=info["fps"], err=err, sidecars=side_fp)
         return set(), set(), err
     core.put_probe(path, dur=info["dur"], fps=info["fps"], auds=",".join(sorted(a)),
-                   subs=",".join(sorted(s)), ntracks=len(info["auds"]))
+                   subs=",".join(sorted(s)), ntracks=len(info["auds"]), sidecars=side_fp)
     return a, s, None
 
 
