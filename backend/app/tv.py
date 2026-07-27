@@ -257,7 +257,8 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                     if cur and cur["status"] in ("pending", "no_release", "searching"):
                         core.set_ep_status(ep_id, "merged", added_langs="", progress="", error=None,
                                            audio_langs=alangs, sub_langs=slangs, needs="",
-                                           need_audio="", need_subs="", orig_lang=orig_name)
+                                           need_audio="", need_subs="", orig_lang=orig_name,
+                                           merge_kind="already")
                         filled += 1
                     elif cur:
                         core.set_ep_status(ep_id, cur["status"], audio_langs=alangs,
@@ -688,7 +689,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
-            core.set_ep_status(ep["id"], "merged", merged_file=fr, added_langs="", error=None)
+            core.set_ep_status(ep["id"], "merged", merged_file=fr, added_langs="", error=None,
+                               merge_kind="replaced")
             core.log(f"tv merge {ep['id']}: MULTI used directly")
             try: _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
             except Exception: pass
@@ -728,7 +730,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
                                error="merge: release carries none of the missing languages "
                                      f"(still needs {'+'.join(still_a + still_s)})")
             return
-        core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None, added_langs="")
+        core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None,
+                           added_langs="", merge_kind="already")
         core.log(f"tv merge {ep['id']}: already has English -> done")
         _plex_ep_refresh(ep, cfg)
         return
@@ -769,7 +772,7 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         pass
     core.forget_probe(fr)           # the file changed; its cached languages are now stale
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
-                       sync_drift=drift, error=None, progress="",
+                       sync_drift=drift, error=None, progress="", merge_kind="grafted",
                        added_subs=",".join(sorted({x["lang"] for x in subs})),
                        added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms"

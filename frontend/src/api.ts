@@ -63,12 +63,17 @@ export interface DashAttention {
 }
 export interface DashRecent {
   kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
+  subs?: string | null;    // subtitle languages grafted in
+  how?: string;            // "grafted" (tracks added) | "replaced" (download became the file)
 }
 export interface Dash {
   enabled: boolean; grab_mode: string; scope_series: boolean;
   movies: Record<string, number>; episodes: Record<string, number>;
   active: DashActive[]; attention: DashAttention[]; recent: DashRecent[];
   merged_24h: number; merged_7d: number;
+  // the 'merged' population by outcome: grafted / replaced = work we did, already = the file
+  // was correct on its own and the scan simply closed the record out
+  merged_kinds?: { grafted: number; replaced: number; already: number };
   inflight: number | null; inflight_cap: number; merge_cap: number;
   disk: { path: string; total: number; free: number } | null;
   next_runs: Record<string, number>; now: number;

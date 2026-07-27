@@ -307,3 +307,8 @@ header.top { display: flex; align-items: center; gap: 10px; }
 .covmini .ok { background: #2ea36a; } .covmini .warn { background: #c8922f; }
 .covmini .bad { background: #b1453f; }
 .covlangpct { color: var(--muted); min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Recently merged: what was actually added, audio and subtitles kept distinct */
+.addrow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.lang-badge.subs { background: #123a44; color: #6fd8e9; border-color: #1b5566; }
+.lang-badge.repl { background: #2a2740; color: #b3a6f0; border-color: #3d3860; }

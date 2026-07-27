@@ -942,23 +942,39 @@ def dashboard():
                 "ai_status": ai, "ai_verdict": r["ai_verdict"]})
         attention = sorted(attention, key=lambda x: x["ts"] or 0, reverse=True)[:8]
 
+        # 'merged' is the terminal state for THREE different outcomes, and only two are work we
+        # did: grafted (we added tracks), replaced (the download became the library file), and
+        # already (the file met its profile on its own — the scan just closed the record out).
+        # Counting all three made a library re-read look like thousands of merges in a day, and
+        # filled "recently merged" with titles vo-merge never touched. Legacy rows have no
+        # merge_kind, so fall back to "did we record adding anything?".
+        DID_WORK = ("(merge_kind IN ('grafted','replaced') OR (merge_kind IS NULL AND "
+                    "(COALESCE(added_langs,'') != '' OR COALESCE(added_subs,'') != '')))")
         recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],
+                   "subs": r["added_subs"], "how": r["merge_kind"] or "grafted",
                    "poster": r["poster"], "ts": r["merged_at"] or r["updated"]}
-                  for r in c.execute("SELECT * FROM movies WHERE status='merged' "
+                  for r in c.execute(f"SELECT * FROM movies WHERE status='merged' AND {DID_WORK} "
                                      "ORDER BY COALESCE(merged_at, updated) DESC LIMIT 10")]
         recent += [{"kind": "episode",
                     "title": f"{r['series_title']} S{r['season']:02d}E{r['episode']:02d}",
-                    "langs": r["added_langs"], "poster": r["poster"],
+                    "langs": r["added_langs"], "subs": r["added_subs"],
+                    "how": r["merge_kind"] or "grafted", "poster": r["poster"],
                     "ts": r["merged_at"] or r["updated"]}
-                   for r in c.execute("SELECT * FROM episodes WHERE status='merged' "
+                   for r in c.execute(f"SELECT * FROM episodes WHERE status='merged' AND {DID_WORK} "
                                       "ORDER BY COALESCE(merged_at, updated) DESC LIMIT 10")]
         recent = sorted(recent, key=lambda x: x["ts"] or 0, reverse=True)[:10]
 
         def merged_since(secs):
-            return sum(c.execute(f"SELECT COUNT(*) n FROM {t} WHERE status='merged' "
+            return sum(c.execute(f"SELECT COUNT(*) n FROM {t} WHERE status='merged' AND {DID_WORK} "
                                  "AND COALESCE(merged_at, updated) >= ?",
                                  (now - secs,)).fetchone()["n"] for t in ("movies", "episodes"))
         merged_24h, merged_7d = merged_since(86400), merged_since(7 * 86400)
+        # how the whole 'merged' population breaks down, so the tile can say what it means
+        mk = {"grafted": 0, "replaced": 0, "already": 0}
+        for t in ("movies", "episodes"):
+            for r in c.execute(f"SELECT merge_kind, COUNT(*) n FROM {t} WHERE status='merged' "
+                               "GROUP BY merge_kind"):
+                mk[r["merge_kind"] if r["merge_kind"] in mk else "grafted"] += r["n"]
 
     try:
         inflight = pipeline.inflight_downloads(cfg)
@@ -987,7 +1003,7 @@ def dashboard():
             "scope_series": bool(cfg.get("scope_series")),
             "movies": mcounts, "episodes": ecounts,
             "active": active, "attention": attention, "recent": recent,
-            "merged_24h": merged_24h, "merged_7d": merged_7d,
+            "merged_24h": merged_24h, "merged_7d": merged_7d, "merged_kinds": mk,
             "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
             "merge_cap": pipeline.MERGE_GATE.limit(cfg),
             "disk": disk, "next_runs": next_runs, "now": now}

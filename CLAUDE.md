@@ -188,6 +188,24 @@ in seconds. Point Radarr/Sonarr **Connect → Webhook** (POST, *On Import* + *On
   everything else (`hold_reason`, `SEARCH_LOCK`, the in-flight cap).
 - `webhook_token` (empty = no check) adds `?token=…` if you ever expose the endpoint.
 
+## What "merged" actually means (`merge_kind`)
+
+`merged` is the terminal state for **three** different outcomes, and only two are work vo-merge
+did. Conflating them made a library re-read look like thousands of merges in a day and filled
+"Recently merged" with titles vo-merge never touched:
+
+| `merge_kind` | what happened | `added_langs` |
+|---|---|---|
+| `grafted` | tracks muxed into the library file | the languages added |
+| `replaced` | the download's video was ≥ the library's, so it *became* the file (`_place_multi`, TV direct remux) | `""` |
+| `already` | the file already met its profile — the scan just closed the record out | `""` |
+
+The dashboard's recent list and its 24 h / 7 d counters filter on grafted+replaced. Legacy rows
+predate the column, so the SQL falls back to "did we record adding anything?"
+(`added_langs`/`added_subs` non-empty) rather than needing a migration. The Recently merged
+header shows the whole breakdown, and rows badge audio and subtitle languages separately — a
+subtitle-only graft has an empty `added_langs` and used to render as a bare title.
+
 ## Language coverage (`GET /api/coverage`)
 
 "How much of the library is actually correct?" cannot be answered from `movies`/`episodes` —

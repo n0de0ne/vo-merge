@@ -258,7 +258,11 @@ def init_db():
                                    "needs": "TEXT",          # audio | subs | audio+subs
                                    # which target languages are still missing (comma lists)
                                    "need_audio": "TEXT", "need_subs": "TEXT",
-                                   "added_subs": "TEXT"})
+                                   "added_subs": "TEXT",
+                                   # WHY this record is 'merged': grafted (we added tracks) |
+                                   # replaced (we used the download as the file) | already (it
+                                   # met its profile on its own — we did nothing). NULL = legacy.
+                                   "merge_kind": "TEXT"})
 
 
 def _ensure_cols(c, table, cols):
@@ -295,7 +299,8 @@ def init_tv():
                                      "need_audio": "TEXT", "need_subs": "TEXT",
                                      # series' original language — the merge needs the same
                                      # inputs the scan used, or the two pick different profiles
-                                     "orig_lang": "TEXT"})
+                                     "orig_lang": "TEXT",
+                                     "merge_kind": "TEXT"})   # see movies table
 
 
 def init_probe_cache():

@@ -931,7 +931,8 @@ def _place_multi(en, mv, cfg, tmdb_id):
     r = subprocess.run(["mkvmerge", "-o", out, en], capture_output=True, text=True)
     if r.returncode not in (0, 1):
         core.set_status(tmdb_id, "error", error=f"multi remux rc={r.returncode}: {r.stderr[-200:]}"); return
-    core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None)
+    core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
+                    merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
     finish_movie(tmdb_id, cfg)
 
@@ -1045,7 +1046,8 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             reject_and_retry(tmdb_id, "release carries none of the missing languages "
                                       f"(still needs {'+'.join(still_a + still_s)})", cfg, delta)
             return
-        core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None, added_langs="")
+        core.set_status(tmdb_id, "merged", merged_file=fr, progress="", error=None,
+                        added_langs="", merge_kind="already")
         core.log(f"merge {tmdb_id}: library already meets its language profile -> done")
         en_dir = mirror_to_en(fr, cfg)
         plex_refresh(cfg, [os.path.dirname(fr).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1),
@@ -1099,7 +1101,7 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
         core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
         return
-    core.set_status(tmdb_id, "merged", merged_file=out, progress="",
+    core.set_status(tmdb_id, "merged", merged_file=out, progress="", merge_kind="grafted",
                     sync_offset_ms=offset, sync_drift=drift,
                     added_subs=",".join(sorted({s["lang"] for s in subs})),
                     added_langs=",".join(sorted({langs[i] for i in ids})))

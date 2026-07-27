@@ -579,8 +579,10 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           <button className="btn sec" style={{ marginLeft: 10 }} onClick={() => goto("settings")}>Settings</button></div>}
 
       <div className="tilegrid">
-        <Tile label="Merged" value={merged} tone="good"
-          sub={<>{d.merged_24h} in 24 h · {d.merged_7d} in 7 d</>} />
+        {/* `merged` is the terminal state for three outcomes; the sub-line counts only the work
+            vo-merge actually did, so a library re-read can't read as thousands of merges. */}
+        <Tile label="Correct now" value={merged} tone="good"
+          sub={<>{d.merged_24h} merged in 24 h · {d.merged_7d} in 7 d</>} />
         <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
           sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
           tone={d.inflight == null ? "warn" : undefined} />
@@ -647,13 +649,25 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           </div>
 
           <div className="panel">
-            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b></div>
+            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b>
+              {d.merged_kinds &&
+                <span className="muted" title="'already correct' files were never touched by vo-merge — a scan found they met their target and closed the record out">
+                  {d.merged_kinds.grafted.toLocaleString()} grafted
+                  {d.merged_kinds.replaced > 0 && <> · {d.merged_kinds.replaced.toLocaleString()} replaced</>}
+                  {d.merged_kinds.already > 0 && <> · {d.merged_kinds.already.toLocaleString()} already correct</>}
+                </span>}</div>
             {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
             {d.recent.map((r, i) => (
               <div className="dashrow" key={i}>
+                <Poster src={r.poster} alt={r.title} />
                 <div className="dashrow-main">
-                  <div className="dashrow-title">{r.title}
-                    {r.langs && <span className="lang-badge">{r.langs}</span>}</div>
+                  <div className="dashrow-title">{r.title}</div>
+                  <div className="sub addrow">
+                    {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
+                    {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
+                    {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
+                    {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+                  </div>
                 </div>
                 <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
               </div>
