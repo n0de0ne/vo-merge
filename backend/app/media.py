@@ -164,6 +164,21 @@ def probe(path):
             "ok": bool(cont.get("recognized")) and bool(cont.get("supported"))}
 
 
+def mkv_error(r, limit=300):
+    """Why a mkvmerge run failed.
+
+    mkvmerge writes its diagnostics to **stdout**, not stderr — stderr is empty even on a hard
+    failure (verified: a missing input file gives rc=2, an empty stderr, and
+    "Error: The file '…' could not be opened for reading" on stdout). Reading `r.stderr` therefore
+    recorded a bare "mkvmerge rc=2:" with the cause discarded on EVERY failure, which is how three
+    unrelated films end up with the same blank error."""
+    text = "\n".join(x for x in (r.stdout or "", r.stderr or "") if x.strip())
+    errs = [ln.strip() for ln in text.splitlines()
+            if ln.strip().startswith(("Error:", "Warning: The"))]
+    msg = " ".join(errs) or " ".join(ln.strip() for ln in text.splitlines()[-3:] if ln.strip())
+    return msg[-limit:] if msg else f"mkvmerge printed nothing (rc={r.returncode})"
+
+
 def ffprobe_audio(path):
     """How many audio streams ffmpeg sees, or None if ffprobe couldn't read the file either.
 

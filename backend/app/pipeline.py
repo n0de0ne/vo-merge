@@ -939,7 +939,8 @@ def _place_multi(en, mv, cfg, tmdb_id):
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     r = subprocess.run(["mkvmerge", "-o", out, en], capture_output=True, text=True)
     if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error", error=f"multi remux rc={r.returncode}: {r.stderr[-200:]}"); return
+        core.set_status(tmdb_id, "error",
+                        error=f"multi remux rc={r.returncode}: {media.mkv_error(r, 200)}"); return
     core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
                     merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
@@ -1108,7 +1109,7 @@ def _merge_movie_impl(tmdb_id, cfg=None):
           _donor_opts(ids, langs, subs, offset, drift) + [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
-        core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {r.stderr[-300:]}")
+        core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}")
         return
     core.set_status(tmdb_id, "merged", merged_file=out, progress="", merge_kind="grafted",
                     sync_offset_ms=offset, sync_drift=drift,
@@ -1159,7 +1160,8 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
     cmd += [f]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error", error=f"resync mkvmerge rc={r.returncode}"); return
+        core.set_status(tmdb_id, "error",
+                        error=f"resync mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
     shutil.move(out, f)
     core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
     core.log(f"resync {tmdb_id}: shifted {len(shift_ids)} {shift_pfx} track(s) {offset_ms:+d}ms")

@@ -764,7 +764,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode not in (0, 1):
-        core.set_ep_status(ep["id"], "error", error=f"mkvmerge rc={r.returncode}"); return
+        core.set_ep_status(ep["id"], "error",
+                           error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)

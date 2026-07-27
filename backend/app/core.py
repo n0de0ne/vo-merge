@@ -1,5 +1,5 @@
 """Config persistence + SQLite state + the per-movie pipeline state machine."""
-import json, os, sqlite3, threading, time
+import json, os, re, sqlite3, threading, time
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get("VO_CONFIG", "/config")
@@ -139,6 +139,8 @@ def load_config():
             cfg.update(json.load(open(CONFIG_FILE)))
         except Exception:
             pass
+    _SECRETS.clear()
+    _SECRETS.update(str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8)
     return cfg
 
 
@@ -151,8 +153,30 @@ def save_config(updates: dict):
     return load_config()
 
 
+# Secrets travel inside the URLs we report. A Prowlarr download link carries `apikey=…` in its
+# query string, so a failed grab used to store the live API key in the DB and render it in the
+# Review tab (and in every AI ticket built from that record). Errors and log lines are written
+# from dozens of places, so scrub in the two funnels they all pass through rather than at each
+# call site.
+_SECRET_QS = re.compile(r'((?:api_?key|apikey|token|passkey|rss_?key|auth|pass(?:word)?)=)[^&\s]+',
+                        re.I)
+_SECRET_KEYS = ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token", "plex2_token",
+                "qb_pass", "webhook_token")
+_SECRETS = set()      # the configured values themselves, refreshed whenever config is read
+
+
+def redact(text):
+    """Strip credentials out of anything about to be persisted or shown."""
+    if not text:
+        return text
+    out = _SECRET_QS.sub(r"\1***", str(text))
+    for v in _SECRETS:                 # a key can also appear outside a query string
+        out = out.replace(v, "***")
+    return out
+
+
 def log(msg: str):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
@@ -419,6 +443,8 @@ def upsert_episode(e: dict):
 
 def set_ep_status(ep_id, status, **fields):
     fields["status"] = status; fields["updated"] = time.time()
+    if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
+        fields["error"] = redact(fields["error"])
     if status == "merged":                 # stamp once; later `updated` churn won't touch it
         fields.setdefault("merged_at", time.time())
     keys = ",".join(f"{k}=?" for k in fields)
@@ -469,6 +495,8 @@ def upsert_movie(m: dict):
 def set_status(tmdb_id, status, **fields):
     fields["status"] = status
     fields["updated"] = time.time()
+    if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
+        fields["error"] = redact(fields["error"])
     if status == "merged":                 # stamp once; later `updated` churn won't touch it
         fields.setdefault("merged_at", time.time())
     keys = ",".join(f"{k}=?" for k in fields)
