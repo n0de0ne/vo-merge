@@ -90,6 +90,15 @@ DEFAULTS = {
     "sync_window_start": 300,              # seconds into the film to start the analysis window
     "sync_window_dur": 480,                # analysis window length (s)
     "sync_windows": 4,                     # number of windows; need >=2 to agree (consensus)
+    "sync_max_lag_s": 120,                 # largest constant offset that can be FOUND. This is a
+                                           # ceiling, not a tuning knob: it was 20s, and a
+                                           # BD-vs-WEB anime pair routinely differs by 30-60s (a
+                                           # sponsor card the WEB carries, a "previously on" the
+                                           # BD drops). Past the limit the true correlation peak
+                                           # was sliced off before the argmax, the windows
+                                           # disagreed, and it was reported as "different cut".
+                                           # Widening is free (the FFT is already computed) and
+                                           # safe (unrelated files don't correlate at any lag).
     "sync_ratio_test": True,               # test known transfer rate ratios (PAL 25fps vs 23.976
                                            # etc). Fixes the "framerates differ but no reliable
                                            # drift could be measured" dead-end.

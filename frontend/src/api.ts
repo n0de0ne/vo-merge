@@ -34,6 +34,9 @@ export interface RescanState {
   probes: { cached: number; unreadable: number };
   // files that vanished from the library since the last pass and were dropped from the DB
   pruned?: number | null; pruned_records?: number | null;
+  full?: boolean | null;      // true = the cache was dropped first; false = progressive
+  read?: number;              // files actually re-read this pass (live)
+  reused?: number;            // files served from the probe cache (live)
 }
 export interface LibItem {
   path: string; rel: string; lib: string; kind: string;

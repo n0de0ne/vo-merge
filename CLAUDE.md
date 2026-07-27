@@ -130,6 +130,16 @@ the gap decision itself.
 - **Probe cache** (`probes` table, keyed by path, invalidated by size+mtime) — the first pass over
   a big library costs one `mkvmerge` per file; after that only changed files are re-read. A merge
   calls `core.forget_probe()` on the files it rewrote. `POST /api/rescan?forget=true` clears it.
+- **Two scan modes, and the difference only shows after an interruption.** `forget=true` is a
+  **full re-read**: the probe cache for that scope is dropped first, so every file is read again
+  even if unchanged. `forget=false` is **progressive**: the cache is kept, so `mkvmerge` runs only
+  for files with no valid probe — new imports, files changed on disk, and *whatever a previous
+  pass never reached* because the container restarted mid-scan. It is resumable by construction,
+  since each file's result is committed as it is read, so re-running picks up exactly where the
+  last one stopped; on an already-probed library it costs a stat per file and no decoding.
+  `media.STATS` counts read-vs-reused so a progressive pass reports "read 412, 8998 already
+  cached" instead of looking identical to a scan that found nothing to do. Each tab has both
+  buttons ("Scan new …" / "Re-read …").
 - **`POST /api/rescan?scope=films|anime|series|all`** re-reads ONE library, so each tab has its
   own button (`tv.series_kind` partitions Sonarr into anime vs series, matching the 🎌 Anime and
   📺 TV Shows tabs; anime *films* live in Radarr so they belong to `films`). It deliberately

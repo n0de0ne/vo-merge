@@ -355,6 +355,16 @@ def lang_hits(title, need, media_title=""):
 
 
 # ------------------------------------------------------------------ audit (cached)
+# How many files a pass actually READ vs served from cache. A progressive scan is nearly all
+# cache hits, so without this it looks identical to a scan that did nothing — and the operator
+# asking "did it pick up the files it missed?" has no way to tell.
+STATS = {"probed": 0, "cached": 0}
+
+
+def reset_stats():
+    STATS.update(probed=0, cached=0)
+
+
 def audit(path, refresh=False):
     """(audio langs, subtitle langs, error) for a library file, read from the container and
     cached until the file's size/mtime change. `error` is a string when the file couldn't be
@@ -362,7 +372,9 @@ def audit(path, refresh=False):
     if not refresh:
         row = core.get_probe(path)
         if row:
+            STATS["cached"] += 1
             return (_split(row["auds"]), _split(row["subs"]), row["err"])
+    STATS["probed"] += 1
     info = probe(path)
     if not info:
         core.put_probe(path, err="unreadable")

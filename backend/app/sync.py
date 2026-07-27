@@ -224,6 +224,7 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
         try:
             m, c = detect_offset_video_ms(
                 base, donor, start=int(s), dur=int(d),
+                max_lag_s=cfg.get("sync_max_lag_s", 120),
                 threads=cfg.get("sync_ffmpeg_threads", 4),
                 hwaccel=cfg.get("sync_hwaccel", "vaapi"),
                 device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
@@ -262,7 +263,8 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
                              tag, on_progress)
             if r:
                 return r
-        core.log(f"sync{tag}: inconsistent offsets {[int(o) for o in offs]} -> reject (different cut?)")
+        core.log(f"sync{tag}: inconsistent offsets {[int(o) for o in offs]} "
+                 f"(searched +/-{cfg.get('sync_max_lag_s', 120)}s) -> reject")
         return None, max((c for _, _, c in vres), default=0.0), None, None
     # too few windows resolved — a rate mismatch smears every window, so try the ratios
     if ratio_ok and not tried_ratios:
@@ -274,7 +276,8 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
     # audio fallback at a central window
     s, d = wins[len(wins) // 2]
     try:
-        am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d))
+        am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d),
+                                  max_lag_s=cfg.get("sync_max_lag_s", 120))
     except Exception:
         am, ac = None, 0.0
     if am is not None and ac >= max(amin, 0.35):

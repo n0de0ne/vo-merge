@@ -74,7 +74,9 @@ def hold_reason(cfg=None):
 SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
               "films": None, "episodes": None, "error": None,
               # files that vanished from the library since the last pass and were dropped
-              "pruned": None, "pruned_records": None}
+              "pruned": None, "pruned_records": None,
+              # full = the probe cache was dropped first; otherwise progressive (resumable)
+              "full": None}
 
 # progress of the current/last "delete the audio-less files and re-search" pass. It re-probes
 # every candidate before touching it, so it is minutes-long and needs the same live reporting as

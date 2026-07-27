@@ -104,8 +104,20 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     operator asking to re-read a library means that whole library, not the slice currently
     enabled. Records for a disabled scope simply sit as inventory until it's turned on.
 
-    `forget=true` drops the probe cache for that library first, so every file is re-read even
-    when its size and mtime are unchanged (use after fixing track tags by hand)."""
+    Two modes, and the difference matters after an interruption:
+
+    - **`forget=true` — full re-read.** Drops the probe cache for that scope first, so every file
+      is read again even when its size and mtime are unchanged (use after fixing track tags by
+      hand, or when you don't trust the cached answer).
+    - **`forget=false` — progressive.** Keeps the cache, so an `mkvmerge` runs only for files
+      with no valid probe: ones never read, ones changed on disk, and — the case this exists for —
+      **whatever a previous pass never reached** because the container restarted mid-scan. It is
+      resumable by construction: each file's result is committed as it is read, so re-running
+      picks up exactly where the last one stopped, and a library that is already fully probed
+      costs a stat per file and no decoding at all.
+
+    Both walk the whole scope and both prune what has vanished; they differ only in whether the
+    cache is thrown away first."""
     import threading
     from . import tv
 
@@ -145,7 +157,9 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     def _run():
         st = pipeline.SCAN_STATE
         st.update(running=True, scope=scope, started=time.time(), finished=0, phase="starting",
-                  films=None, episodes=None, error=None, pruned=None, pruned_records=None)
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None,
+                  full=bool(forget))
+        media.reset_stats()      # so the pass can report what it actually READ vs reused
         try:
             # whatever the scopes say; pilot cleared so a pilot list can't shrink a rescan
             cfg = dict(core.load_config(), series_pilot=[])
@@ -172,7 +186,10 @@ def do_rescan(forget: bool = False, scope: str = "all"):
                 kinds = None if scope == "all" else (scope,)
                 st["episodes"] = tv.scan(cfg, kinds=kinds)
             st["phase"] = "done"
-            core.log(f"rescan({scope}): {st['films']} film gap(s), {st['episodes']} episode gap(s)")
+            core.log(f"rescan({scope}, {'full' if forget else 'progressive'}): "
+                     f"{st['films']} film gap(s), {st['episodes']} episode gap(s) · "
+                     f"read {media.STATS['probed']} file(s), "
+                     f"{media.STATS['cached']} already cached")
         except Exception as e:
             st["error"] = str(e)
             st["phase"] = "error"
@@ -497,8 +514,12 @@ def library_repair_state():
 
 @api.get("/rescan")
 def rescan_state():
-    """Progress of a running (or the last) rescan — it takes minutes, so the UI can say so."""
-    return {**pipeline.SCAN_STATE, "probes": core.probe_stats()}
+    """Progress of a running (or the last) rescan — it takes minutes, so the UI can say so.
+
+    `read`/`reused` are live counters, so a progressive pass can show it is working through new
+    files rather than looking identical to a scan that found nothing to do."""
+    return {**pipeline.SCAN_STATE, "probes": core.probe_stats(),
+            "read": media.STATS["probed"], "reused": media.STATS["cached"]}
 
 
 @api.post("/finish")
@@ -818,6 +839,13 @@ def movie_to_ai(tmdb_id: int):
              "GET  /movie/{id}/context — probes of both files + the relevant log lines",
              "GET  /movie/{id}/candidates — list releases (incl. already-tried)",
              "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
+             "POST /movie/{id}/sync_probe {\"max_lag_s\":300} — MEASURE the offset and report "
+             "it WITHOUT merging, searching much further out than the merge path does. On any "
+             "\"couldn't sync\" this is the call to make FIRST: the merge path only searches "
+             "+/-sync_max_lag_s, so a consistent offset beyond that reads as \"different cut\" "
+             "when it is really a sponsor card or a 'previously on'. Returns every window's own "
+             "answer, so a real re-edit (windows disagree) looks different from a large constant "
+             "offset (windows agree). Add \"apply\":true to merge with what it finds.",
              "POST /movie/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a KNOWN "
              "offset and/or rate stretch with no detection (drift = donor_fps/base_fps; "
              "1.0427083 is film->PAL). Use when /context shows the two files' fps differ.",
@@ -876,6 +904,11 @@ def episode_to_ai(ep_id: str):
              "POST /episode/{id}/retry — blocklist current release, drop donor, re-search",
              "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map one donor file to this "
              "episode and queue the merge (when automatic numbering translation can't apply)",
+             "POST /episode/{id}/sync_probe {\"max_lag_s\":300} — MEASURE the offset without "
+             "merging, searching further out than the merge path does. Make this call FIRST on "
+             "any \"couldn't sync\": windows that AGREE on a large offset mean extra material at "
+             "the head (fixable with --sync), windows that DISAGREE mean a genuinely different "
+             "cut (not fixable). Add \"apply\":true to merge with what it finds.",
              "POST /episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a known "
              "offset / rate stretch with no detection",
              "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query (original/"
@@ -1048,6 +1081,83 @@ def episode_set_sync(ep_id: str, body: SetSyncIn):
     core.log(f"set_sync {ep_id}: offset={body.offset_ms}ms drift={body.drift}")
     tv.merge_ready_episode(ep_id)
     return core.get_episode(ep_id)
+
+
+class SyncProbeIn(BaseModel):
+    max_lag_s: int = 300       # how far out to look; the merge path uses sync_max_lag_s (120)
+    windows: int | None = None
+    apply: bool = False        # merge with the result if one is found confidently
+
+
+def _sync_probe(rec, base_key, donor_key, body):
+    """MEASURE the offset between a record's two files and report it, without merging.
+
+    The gap this fills: the AI could re-run detection (`/sync`, which just fails the same way) or
+    apply an offset it had no way to obtain (`/set_sync`). It had no way to ASK what the offset
+    is. So on a "couldn't sync" it could only guess or give up — which is why those tickets come
+    back as "different cut, manual pick or ignore" even when the pair is a plain constant offset
+    further out than the merge path searches.
+
+    Returns every window's own answer, not just the verdict, so a real disagreement (a genuinely
+    different cut) is visibly different from a consistent offset the merge path refused."""
+    from . import sync as _sync
+    cfg = dict(core.load_config(), sync_max_lag_s=max(5, min(body.max_lag_s, 900)))
+    if body.windows:
+        cfg["sync_windows"] = max(2, min(body.windows, 12))
+    base, donor = rec.get(base_key), rec.get(donor_key)
+    if not (base and donor and os.path.exists(base) and os.path.exists(donor)):
+        raise HTTPException(409, "both the library file and the donor must exist on disk "
+                                 f"(library={base!r} donor={donor!r})")
+    bi, di = media.probe(base), media.probe(donor)
+    if not bi or not di:
+        raise HTTPException(409, "could not probe one of the files")
+    off, conf, method, drift = _sync.detect(
+        base, donor, 0, 0, bi["dur"] or di["dur"] or 0, cfg, tag=" probe")
+    return {"offset_ms": off, "confidence": conf, "method": method, "drift": drift,
+            "searched_lag_s": cfg["sync_max_lag_s"],
+            "library": {"path": base, "fps": bi["fps"], "dur": bi["dur"]},
+            "donor": {"path": donor, "fps": di["fps"], "dur": di["dur"]},
+            "duration_delta_s": round(abs((bi["dur"] or 0) - (di["dur"] or 0)), 1),
+            "hint": ("a duration difference with a consistent offset is extra material at the "
+                     "head or tail (sponsor card, 'previously on'), which --sync fixes; a "
+                     "duration difference with NO consistent offset is material inserted in the "
+                     "middle, i.e. a genuinely different cut that no single offset can align")}
+
+
+@api.post("/movie/{tmdb_id}/sync_probe")
+def movie_sync_probe(tmdb_id: int, body: SyncProbeIn):
+    """Measure the offset between this movie's library file and its donor, searching further out
+    than the merge path does. Set `apply` to merge with the result when one is found."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    out = _sync_probe(mv, "french_path", "en_file", body)
+    core.log(f"sync_probe {tmdb_id}: {out['offset_ms']}ms conf={out['confidence']} "
+             f"method={out['method']} (searched +/-{out['searched_lag_s']}s)")
+    if body.apply and out["offset_ms"] is not None:
+        _set_sync("movie", mv, tmdb_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
+                                                  drift=out["drift"]))
+        pipeline.merge_movie(tmdb_id)
+        out["applied"] = True
+    return out
+
+
+@api.post("/episode/{ep_id}/sync_probe")
+def episode_sync_probe(ep_id: str, body: SyncProbeIn):
+    """Episode mirror of movie_sync_probe."""
+    from . import tv
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    out = _sync_probe(e, "french_path", "en_file", body)
+    core.log(f"sync_probe {ep_id}: {out['offset_ms']}ms conf={out['confidence']} "
+             f"method={out['method']} (searched +/-{out['searched_lag_s']}s)")
+    if body.apply and out["offset_ms"] is not None:
+        _set_sync("episode", e, ep_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
+                                                 drift=out["drift"]))
+        tv.merge_ready_episode(ep_id)
+        out["applied"] = True
+    return out
 
 
 class FindIn(BaseModel):
