@@ -115,9 +115,32 @@ def do_rescan(forget: bool = False, scope: str = "all"):
         return {"ok": True, "started": False, "note": "a scan is already running",
                 "state": pipeline.SCAN_STATE}
     if forget:
+        # Clear only the probes this scope is about to re-read. Clearing all of them made a
+        # one-library re-read blank the OTHER libraries' coverage until they were rescanned too —
+        # the probe table is the whole inventory now, not just a speed-up cache.
+        cfg0 = core.load_config()
+        mount = (cfg0.get("media_mount") or "/media").rstrip("/")
+        anime = {x.lower() for x in (cfg0.get("anime_dirs") or ["Anime"])}
+        series = {x.lower() for x in (cfg0.get("series_dirs") or ["Series"])}
+        # by top-level folder, the same way /coverage and /library classify a file: "films" is
+        # everything that is neither an anime nor a series folder (anime *films* live in Radarr)
+        def _in_scope(path):
+            top = (path or "")[len(mount) + 1:].split(os.sep, 1)[0].lower()
+            if scope == "anime":  return top in anime
+            if scope == "series": return top in series
+            return top not in anime and top not in series
         with core.db() as c:
-            c.execute("DELETE FROM probes")
-        core.log(f"rescan({scope}): probe cache cleared — every file will be re-read")
+            if scope == "all":
+                n = c.execute("DELETE FROM probes").rowcount
+            else:
+                gone = [r["path"] for r in c.execute("SELECT path FROM probes")
+                        if _in_scope(r["path"])]
+                n = 0
+                for i in range(0, len(gone), 400):
+                    chunk = gone[i:i + 400]
+                    n += c.execute(f"DELETE FROM probes WHERE path IN ({','.join('?' * len(chunk))})",
+                                   chunk).rowcount
+        core.log(f"rescan({scope}): dropped {n} cached probe(s) — those files will be re-read")
 
     def _run():
         st = pipeline.SCAN_STATE
