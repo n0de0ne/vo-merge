@@ -933,6 +933,48 @@ def episode_ai_result(ep_id: str, body: AiResultIn):
     return {"ok": True}
 
 
+@api.get("/ai_log")
+def ai_log(outcome: str = "resolved", limit: int = 50):
+    """What the on-call AI has actually reported back, newest first.
+
+    Needed as its own query because a callback deliberately leaves the pipeline `status`
+    untouched: a record the AI fixed has usually MOVED ON (back to pending, or downloading, or
+    merged), so nothing that selects by pipeline status can find it. The Review tab lists
+    problems by status and would therefore never show a single thing the AI solved — the work
+    would be invisible exactly when it succeeded.
+
+    `outcome`: resolved | failed | needs_human | all. Only records that carry an `ai_at` are
+    returned, so the 60-min no-callback flip (which stamps `needs_human` with the sweep's own
+    timestamp) can still be told apart by its verdict text."""
+    if outcome not in _AI_STATUSES + ("all",):
+        raise HTTPException(422, f"outcome must be one of {_AI_STATUSES + ('all',)}")
+    where = "ai_at IS NOT NULL" + ("" if outcome == "all" else " AND ai_status=?")
+    args = () if outcome == "all" else (outcome,)
+    lim = max(1, min(limit, 500))
+    out = []
+    with core.db() as c:
+        for r in c.execute(f"SELECT * FROM movies WHERE {where} "
+                           f"ORDER BY ai_at DESC LIMIT {lim}", args):
+            out.append({"kind": "movie", "key": str(r["tmdb_id"]), "title": r["title"],
+                        "sub": str(r["year"] or ""), "status": r["status"],
+                        "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"],
+                        "ai_at": r["ai_at"], "error": r["error"], "poster": r["poster"]})
+        for r in c.execute(f"SELECT * FROM episodes WHERE {where} "
+                           f"ORDER BY ai_at DESC LIMIT {lim}", args):
+            out.append({"kind": "episode", "key": r["id"], "title": r["series_title"],
+                        "sub": f"S{r['season']:02d}E{r['episode']:02d}", "status": r["status"],
+                        "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"],
+                        "ai_at": r["ai_at"], "error": r["error"], "poster": r["poster"]})
+    out.sort(key=lambda x: x["ai_at"] or 0, reverse=True)
+    counts = {}
+    with core.db() as c:
+        for t in ("movies", "episodes"):
+            for r in c.execute(f"SELECT ai_status, COUNT(*) n FROM {t} "
+                               "WHERE ai_at IS NOT NULL GROUP BY ai_status"):
+                counts[r["ai_status"]] = counts.get(r["ai_status"], 0) + r["n"]
+    return {"items": out[:lim], "counts": counts, "now": time.time()}
+
+
 # ---------------------------------------------------------------- AI ACTIONS
 # The dispatcher could diagnose failures but barely act on them: it could retry,
 # ignore, or re-search, and nothing else. These give it hands for the failure

@@ -546,6 +546,16 @@ shows only `ai_status IN (failed, needs_human)` plus `review` (a human decision 
 anything still with the AI is counted ("N with the AI"), not listed. With `ai_tickets` off nothing
 could ever reach those states, so the filter falls back to showing everything.
 
+**`GET /api/ai_log?outcome=resolved|failed|needs_human|all`** is what the AI actually reported,
+newest first, and it needs its own query for a structural reason: a callback deliberately leaves
+the pipeline `status` untouched, so a record the AI FIXED has usually moved on — back to
+`pending`, or `downloading`, or `merged`. Nothing that selects by pipeline status can find it, so
+the Review tab (which lists problems by status) would never show a single thing the AI solved:
+its work was invisible exactly when it succeeded, and the only trace left in the UI was its
+failures. The Review tab's **"🤖 What the AI did"** panel renders it — each row pairs the verdict
+with the record's CURRENT status, so "resolved · now merged" and "resolved · still error" read
+differently. Only records with a real `ai_at` are returned.
+
 **The On-call AI panel says whether the dispatcher is alive.** It runs on the host, outside this
 app, so the only evidence is whether it calls back. `resolved`/`failed` are verdicts it produced
 itself; `needs_human` is *mostly the no-callback flip*. A wall of `needs_human` with

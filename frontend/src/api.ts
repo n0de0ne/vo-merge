@@ -54,6 +54,16 @@ export interface RepairPlan {
   dry_run: true; total: number; unknown: number;
   candidates: { path: string; title: string; kind: string; known: boolean }[];
 }
+// What the on-call AI reported back. Its own query because a callback leaves the pipeline status
+// alone, so a record it fixed has usually moved on and nothing selecting by status can find it.
+export interface AiLogItem {
+  kind: string; key: string; title: string; sub: string; status: string;
+  ai_status: string; ai_verdict: string | null; ai_at: number;
+  error: string | null; poster: string | null;
+}
+export interface AiLog {
+  items: AiLogItem[]; counts: Record<string, number>; now: number;
+}
 export interface RepairState {
   running: boolean; started: number; finished: number; phase: string;
   checked: number; total: number; deleted: number; searched: number;
@@ -149,6 +159,8 @@ export const api = {
   unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
+  aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
+    j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),
   epAiSend: (id: string) =>
     j<{ ok: boolean; queued: boolean }>(`/api/episode/${encodeURIComponent(id)}/ai`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),

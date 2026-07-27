@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage, RepairPlan, RepairState, AiHealth } from "./api";
+  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -1330,6 +1330,7 @@ function Review() {
            : <span className="muted">not sent</span>;
 
   return (
+    <>
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>
         <b>Needs review</b>
@@ -1408,6 +1409,63 @@ function Review() {
         load={() => api.episodeCandidates(relEp.id)}
         onGrab={c => api.episodeGrab(relEp.id, c.link, c.rid, c.title)}
         onClose={() => setRelEp(null)} onGrabbed={refresh} />}
+    </div>
+    <AiSolvedPanel />
+    </>
+  );
+}
+
+// What the on-call AI actually did. This cannot be built from the table above: a callback leaves
+// the pipeline status untouched, so a record the AI FIXED has usually moved on (back to pending,
+// or downloading, or merged) and no query by status can find it. Without this the AI's work is
+// invisible exactly when it succeeds, and the only trace of it left in the UI is the failures.
+function AiSolvedPanel() {
+  const [outcome, setOutcome] = useState<"resolved" | "failed" | "needs_human" | "all">("resolved");
+  const [d, setD] = useState<AiLog | null>(null);
+  const [open, setOpen] = useState(true);
+  usePoll(() => api.aiLog(outcome, 50).then(setD).catch(() => {}), 15000, [outcome]);
+  if (!d) return null;
+  const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+
+  const tabs: [typeof outcome, string][] = [
+    ["resolved", "Solved"], ["failed", "Couldn’t fix"],
+    ["needs_human", "Handed back"], ["all", "All"]];
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: open ? 10 : 0 }}>
+        <button className="btn sec" style={{ padding: "2px 8px" }}
+          onClick={() => setOpen(o => !o)}>{open ? "▾" : "▸"}</button>
+        <b>🤖 What the AI did</b>
+        <span className="muted">{(d.counts.resolved ?? 0).toLocaleString()} solved of
+          {" "}{total.toLocaleString()} it reported on</span>
+        <div className="spacer" />
+        {open && <div className="segbtns">
+          {tabs.map(([k, label]) => (
+            <button key={k} className={outcome === k ? "active" : ""} onClick={() => setOutcome(k)}>
+              {label}{k !== "all" && <span className="segn">{(d.counts[k] ?? 0).toLocaleString()}</span>}
+            </button>))}
+        </div>}
+      </div>
+      {open && (d.items.length === 0
+        ? <div className="muted">Nothing in this category yet.</div>
+        : <table>
+            <thead><tr><th>Title</th><th>What it did</th><th>Now</th><th>When</th></tr></thead>
+            <tbody>
+              {d.items.map(i => (
+                <tr key={`${i.kind}${i.key}`}>
+                  <td><b>{i.title}</b>{i.sub && <span className="muted"> {i.sub}</span>}</td>
+                  <td>
+                    <AiPill s={i.ai_status} />
+                    {i.ai_verdict && <div className="sub" title={i.ai_verdict}>{i.ai_verdict}</div>}
+                  </td>
+                  <td><Pill s={i.status} />
+                    {i.error && i.ai_status !== "resolved" &&
+                      <div className="sub bad clamp2" title={i.error}>{i.error}</div>}</td>
+                  <td className="muted" style={{ whiteSpace: "nowrap" }}>{fmtAgo(i.ai_at, d.now)}</td>
+                </tr>))}
+            </tbody>
+          </table>)}
     </div>
   );
 }
