@@ -32,6 +32,20 @@ export interface RescanState {
   running: boolean; scope: string; phase: string; started: number; finished: number;
   films: number | null; episodes: number | null; error: string | null;
   probes: { cached: number; unreadable: number };
+  // files that vanished from the library since the last pass and were dropped from the DB
+  pruned?: number | null; pruned_records?: number | null;
+}
+export interface LibItem {
+  path: string; rel: string; lib: string; kind: string;
+  title: string; file: string; state: "complete" | "incomplete" | "unreadable";
+  audio: string[]; subs: string[]; missing_audio: string[]; missing_subs: string[];
+  targets: { audio: string[]; subs: string[] };
+  dur: number | null; probed: number | null; err: string | null;
+}
+export interface LibPage {
+  items: LibItem[]; total: number; offset: number;
+  counts: { complete: number; incomplete: number; unreadable: number };
+  libraries: { name: string; total: number }[];
 }
 export interface CoverageLib {
   name: string; kind: string; total: number; unreadable: number;
@@ -134,6 +148,11 @@ export const api = {
       `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   coverage: () => j<Coverage>("/api/coverage"),
+  library: (o: { state?: string; lib?: string; q?: string; limit?: number; offset?: number } = {}) =>
+    j<LibPage>("/api/library?" + new URLSearchParams({
+      state: o.state ?? "incomplete", lib: o.lib ?? "", q: o.q ?? "",
+      limit: String(o.limit ?? 200), offset: String(o.offset ?? 0),
+    })),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),

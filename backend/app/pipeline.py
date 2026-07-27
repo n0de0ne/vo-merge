@@ -72,7 +72,9 @@ def hold_reason(cfg=None):
 
 # progress of the current/last full rescan, so the UI can show a multi-minute job is alive
 SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finished": 0,
-              "films": None, "episodes": None, "error": None}
+              "films": None, "episodes": None, "error": None,
+              # files that vanished from the library since the last pass and were dropped
+              "pruned": None, "pruned_records": None}
 
 # Language detection in release names now lives in media._DUB_MARKERS, which carries a marker
 # per language so scoring works for any profile — the old FR_DUB / EN_OK / EN_AUDIO trio only

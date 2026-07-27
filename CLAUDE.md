@@ -137,7 +137,11 @@ the gap decision itself.
   on, whereas a rescan only reads files and records what's missing, so honouring them would
   silently skip most of the library. Records for a disabled scope sit as inventory until it's
   turned on. One scan runs at a time (`SCAN_LOCK`); it runs in a thread (minutes on a first pass)
-  and `GET /api/rescan` reports progress + which scope is busy.
+  and `GET /api/rescan` reports progress + which scope is busy. `scope=all` (the Library tab's
+  **"Re-read everything"**) covers films, anime and series in one pass. Every button sends
+  `forget=true`, so the probe cache is dropped first and each file really is read again — the
+  point of asking for a re-read is usually that you don't trust the cached answer. Each pass also
+  prunes what has vanished (above).
 - `scan` **only inserts records that have a gap** (a whole library of fine files would flood the
   pipeline), and a tracked record whose gap has since been filled is closed out as `merged`
   instead of being re-searched — which self-heals the DB from the stale-tag era.
@@ -206,21 +210,46 @@ predate the column, so the SQL falls back to "did we record adding anything?"
 header shows the whole breakdown, and rows badge audio and subtitle languages separately — a
 subtitle-only graft has an empty `added_langs` and used to render as a bare title.
 
-## Language coverage (`GET /api/coverage`)
+## Language coverage & the Library tab (`/api/coverage`, `/api/library`)
 
 "How much of the library is actually correct?" cannot be answered from `movies`/`episodes` —
 `scan()` deliberately inserts a record only when a file HAS a gap, so those tables are a list of
 problems, not an inventory. The **`probes` table is the only complete inventory**: every file the
 scanner has read, with the languages read off it, gap or no gap.
 
-`/api/coverage` groups probes by top-level library folder, scores each against the profile its
-kind targets (`anime_dirs` / `series_dirs` decide which), and returns per library: total,
-`complete`, `missing_audio`, `missing_subs`, `missing_both`, `unreadable`, plus a per-language
-count for every target code. The Overview renders it as a stacked bar + per-language mini bars.
-The `-EN` mirrors are skipped — they're symlinks to the same files and would double-count.
+`main._inventory(cfg)` is the single classifier over that table — it maps each probe to its
+library folder, picks the profile that folder's kind targets (`anime_dirs` / `series_dirs` decide
+which) and reports what's present vs missing. **Both endpoints read it**, so the number in the
+chart and the list you can act on can never disagree about what "complete" means. The `-EN`
+mirrors are skipped in one place — they're symlinks to the same files and would double-count.
 
-Coverage only reflects what has been **probed**, so it is empty until a scan or "Re-read files"
-has run, and it grows as the library is read.
+- **`GET /api/coverage`** aggregates: per library total, `complete`, `missing_audio`,
+  `missing_subs`, `missing_both`, `unreadable`, plus a per-language count for every target code.
+  Rendered on the Overview (and under the Library tab) as a stacked bar + per-language mini bars.
+- **`GET /api/library?state=complete|incomplete|unreadable|all&lib=&q=&limit=&offset=`** lists the
+  files themselves — coverage says *how much*, this says *which ones*, which is the only form you
+  can act on. `counts` covers the whole `lib`+`q` selection rather than the returned page, so the
+  tab headers stay honest while paging. The **Library tab** is the UI: a
+  Target-not-met / Complete / Unreadable switch, a library filter, a path search, and the global
+  **"Re-read everything"** button.
+
+Coverage only reflects what has been **probed**, so it is empty until a scan or a re-read has run,
+and it grows as the library is read.
+
+### A scan adds what's new; the prune drops what's gone
+
+Nothing used to remove a probe or a record, so a title deleted from the library kept being counted
+— and kept dragging the coverage percentage down — forever. Every rescan now starts with
+`core.prune_missing_probes()` + `core.prune_missing_records()`. Two guards keep that from eating
+the DB:
+
+- **The mount must look alive.** If `/media` is missing or empty (an unmounted share) every path
+  reads as gone, so the prune is skipped and logged rather than run.
+- **Mid-flight records are never pruned** (`core._PRUNE_SKIP`: downloading / ready / merging /
+  grabbed / searching) — a merge swaps a new file in, so the library path can be briefly absent.
+
+`SCAN_STATE` carries `pruned` / `pruned_records` and the button reports "N deleted entries
+removed" alongside the gap count.
 
 ## Pause & holds
 

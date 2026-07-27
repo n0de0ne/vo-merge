@@ -122,10 +122,25 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     def _run():
         st = pipeline.SCAN_STATE
         st.update(running=True, scope=scope, started=time.time(), finished=0, phase="starting",
-                  films=None, episodes=None, error=None)
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None)
         try:
             # whatever the scopes say; pilot cleared so a pilot list can't shrink a rescan
             cfg = dict(core.load_config(), series_pilot=[])
+            # A scan adds what is new; this is the other half — drop what is gone. Nothing else
+            # ever removes a probe or a record, so a deleted title keeps being counted (and keeps
+            # dragging coverage down) forever. Guarded on the mount actually being there: if
+            # /media is unmounted every path is "missing" and a blind prune would wipe the DB.
+            mount = (cfg.get("media_mount") or "/media").rstrip("/")
+            if os.path.isdir(mount) and os.listdir(mount):
+                st["phase"] = "pruning deleted files"
+                st["pruned"] = core.prune_missing_probes()
+                mv, ep = core.prune_missing_records()
+                st["pruned_records"] = mv + ep
+                if st["pruned"] or st["pruned_records"]:
+                    core.log(f"rescan({scope}): dropped {st['pruned']} probe(s) and "
+                             f"{mv} movie/{ep} episode record(s) whose file is gone")
+            else:
+                core.log(f"rescan({scope}): {mount} looks unmounted — skipping the prune")
             if scope in ("all", "films"):
                 st["phase"] = "films"
                 st["films"] = pipeline.scan(cfg)
@@ -147,34 +162,50 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     return {"ok": True, "started": True, "scope": scope, "probes": core.probe_stats()}
 
 
-@api.get("/coverage")
-def coverage():
-    """How much of the library actually meets its language targets.
+def _inventory(cfg, cols="path, auds, subs, err"):
+    """Every probed library file, classified against the profile its library targets.
 
-    Reads the `probes` table, which is the ONLY complete inventory: `scan()` deliberately
-    inserts a movies/episodes record only when a file HAS a gap, so those tables can't say what
-    is already fine. Every probed file is here with the languages read off it, so a file that
-    needs nothing is counted too.
+    The `probes` table is the ONLY complete inventory: `scan()` deliberately inserts a
+    movies/episodes record only when a file HAS a gap, so those tables are a list of problems,
+    not a list of files. Everything that reports on "how much of the library is correct" —
+    /coverage and /library both — reads this, so the summary and the browsable list can never
+    disagree about what "complete" means.
 
-    Grouped by top-level library folder, because that is how the operator thinks about it, and
-    each folder is scored against the profile its kind targets."""
-    from . import tv  # noqa: F401  (kept for symmetry with the other endpoints)
-    cfg = core.load_config()
+    Yields (row, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s). `-EN` mirrors are
+    skipped: they are symlinks to the same files and would double-count."""
     mount = (cfg.get("media_mount") or "/media").rstrip("/")
     anime = {x.lower() for x in (cfg.get("anime_dirs") or ["Anime"])}
     series = {x.lower() for x in (cfg.get("series_dirs") or ["Series"])}
-    mirrors = {v.lower() for v in pipeline.EN_LIBS.values()}   # symlinks to the same files
-
-    libs = {}
+    mirrors = {v.lower() for v in pipeline.EN_LIBS.values()}
+    prof = {}
     with core.db() as c:
-        rows = c.execute("SELECT path, auds, subs, err FROM probes").fetchall()
+        rows = c.execute(f"SELECT {cols} FROM probes").fetchall()
     for r in rows:
         path = r["path"] or ""
         top = path[len(mount) + 1:].split(os.sep, 1)[0] if path.startswith(mount + "/") else "?"
         if top.lower() in mirrors:
-            continue                      # the -EN libraries point at the same files
+            continue
         kind = "anime" if top.lower() in anime else ("series" if top.lower() in series else "movie")
-        want_a, want_s = media.profile(kind, cfg)
+        if kind not in prof:
+            prof[kind] = media.profile(kind, cfg)
+        want_a, want_s = prof[kind]
+        if r["err"]:
+            yield r, top, kind, want_a, want_s, None, None, None, None
+            continue
+        have_a = {x for x in (r["auds"] or "").split(",") if x}
+        have_s = {x for x in (r["subs"] or "").split(",") if x}
+        yield (r, top, kind, want_a, want_s, have_a, have_s,
+               [k for k in want_a if k not in have_a], [k for k in want_s if k not in have_s])
+
+
+@api.get("/coverage")
+def coverage():
+    """How much of the library actually meets its language targets, grouped by top-level library
+    folder — because that is how the operator thinks about it — and each folder scored against
+    the profile its kind targets."""
+    cfg = core.load_config()
+    libs = {}
+    for r, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s in _inventory(cfg):
         L = libs.setdefault(top, {"name": top, "kind": kind, "total": 0, "unreadable": 0,
                                   "complete": 0, "missing_audio": 0, "missing_subs": 0,
                                   "missing_both": 0,
@@ -182,17 +213,13 @@ def coverage():
                                   "subs": {k: 0 for k in want_s},
                                   "targets": {"audio": want_a, "subs": want_s}})
         L["total"] += 1
-        if r["err"]:
+        if have_a is None:
             L["unreadable"] += 1
             continue
-        have_a = {x for x in (r["auds"] or "").split(",") if x}
-        have_s = {x for x in (r["subs"] or "").split(",") if x}
         for k in want_a:
             if k in have_a: L["audio"][k] += 1
         for k in want_s:
             if k in have_s: L["subs"][k] += 1
-        miss_a = [k for k in want_a if k not in have_a]
-        miss_s = [k for k in want_s if k not in have_s]
         if miss_a and miss_s:   L["missing_both"] += 1
         elif miss_a:            L["missing_audio"] += 1
         elif miss_s:            L["missing_subs"] += 1
@@ -204,6 +231,58 @@ def coverage():
             "complete": sum(l["complete"] for l in out),
             "unreadable": sum(l["unreadable"] for l in out),
             "probed": tot}
+
+
+@api.get("/library")
+def library(state: str = "incomplete", lib: str = "", q: str = "",
+            limit: int = 200, offset: int = 0):
+    """Browse the probed inventory file by file, split into what meets its target and what
+    doesn't. /coverage answers "how much" as a number; this answers "which ones", which is the
+    only form you can act on.
+
+    `state`: complete | incomplete | unreadable | all. `lib` filters to one top-level library,
+    `q` is a case-insensitive substring of the path. The counts returned are for the whole
+    (lib+q) selection, not just the returned page, so the tab headers stay honest while paging."""
+    if state not in ("complete", "incomplete", "unreadable", "all"):
+        raise HTTPException(422, "state must be complete | incomplete | unreadable | all")
+    cfg = core.load_config()
+    mount = (cfg.get("media_mount") or "/media").rstrip("/")
+    ql, libl = q.strip().lower(), lib.strip().lower()
+    counts = {"complete": 0, "incomplete": 0, "unreadable": 0}
+    libs, hits = {}, []
+    for (r, top, kind, want_a, want_s, have_a, have_s, miss_a,
+         miss_s) in _inventory(cfg, "path, auds, subs, err, dur, probed"):
+        libs[top] = libs.get(top, 0) + 1
+        if libl and top.lower() != libl:
+            continue
+        path = r["path"] or ""
+        if ql and ql not in path.lower():
+            continue
+        row_state = ("unreadable" if have_a is None else
+                     "incomplete" if (miss_a or miss_s) else "complete")
+        counts[row_state] += 1
+        if state not in ("all", row_state):
+            continue
+        rel = path[len(mount) + 1:] if path.startswith(mount + "/") else path
+        parts = rel.split(os.sep)
+        hits.append({
+            "path": path, "rel": rel, "lib": top, "kind": kind,
+            # the folder under the library is the title for a film and the show for an episode;
+            # the file name is what distinguishes episodes within it
+            "title": parts[1] if len(parts) > 1 else (parts[0] if parts else rel),
+            "file": parts[-1],
+            "state": row_state,
+            "audio": sorted(have_a or []), "subs": sorted(have_s or []),
+            "missing_audio": miss_a or [], "missing_subs": miss_s or [],
+            "targets": {"audio": want_a, "subs": want_s},
+            "dur": r["dur"], "probed": r["probed"], "err": r["err"],
+        })
+    hits.sort(key=lambda x: (x["lib"].lower(), x["rel"].lower()))
+    total = len(hits)
+    off = max(0, offset)
+    return {"items": hits[off:off + max(1, min(limit, 1000))], "total": total,
+            "offset": off, "counts": counts,
+            "libraries": [{"name": k, "total": v} for k, v in sorted(libs.items())]}
 
 
 @api.get("/rescan")

@@ -312,3 +312,53 @@ header.top { display: flex; align-items: center; gap: 10px; }
 .addrow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .lang-badge.subs { background: #123a44; color: #6fd8e9; border-color: #1b5566; }
 .lang-badge.repl { background: #2a2740; color: #b3a6f0; border-color: #3d3860; }
+
+/* ---- Library browser: which files meet their target, and which don't ----
+   A row must survive a long show name AND a long file name, so the title column is the only
+   flexible one (min-width:0 or its content sets the floor and the grid can't shrink) and the
+   two data columns are sized to their content. Below 900px it stacks instead of squeezing. */
+.libfilters { gap: 8px 10px; margin-bottom: 8px; }
+.segbtns { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.segbtns button {
+  background: transparent; border: 0; border-right: 1px solid var(--border);
+  color: var(--muted); padding: 6px 11px; font-size: 12.5px; cursor: pointer;
+}
+.segbtns button:last-child { border-right: 0; }
+.segbtns button:hover { background: var(--panel2); }
+.segbtns button.active { background: var(--panel2); color: var(--text); font-weight: 600; }
+.segbtns .segn {
+  margin-left: 6px; font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+  padding: 1px 6px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border);
+}
+.libhead, .librow {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 320px) minmax(0, 240px);
+  gap: 10px; align-items: baseline;
+}
+.libhead {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  padding: 6px 2px; border-bottom: 1px solid var(--border);
+}
+.liblist { max-height: 62vh; overflow-y: auto; }
+.librow { padding: 7px 2px; border-bottom: 1px solid #232c38; }
+.librow:last-child { border-bottom: 0; }
+.librow.complete { box-shadow: inset 3px 0 0 #2ea36a; }
+.librow.incomplete { box-shadow: inset 3px 0 0 #c8922f; }
+.librow.unreadable { box-shadow: inset 3px 0 0 #465063; }
+.libmain { min-width: 0; padding-left: 9px; }
+.libtitle { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.libfile {
+  font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.libtracks { display: flex; flex-wrap: wrap; gap: 3px 12px; font-size: 12px; min-width: 0; }
+.libmiss { font-size: 12px; min-width: 0; }
+.libmiss .needs {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+  padding: 1px 7px; border-radius: 999px; display: inline-block;
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border: 1px solid rgba(255, 176, 62, .35);
+}
+.ok-txt { color: #5ee9a0; font-size: 12px; }
+@media (max-width: 900px) {
+  .libhead { display: none; }
+  .librow { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}

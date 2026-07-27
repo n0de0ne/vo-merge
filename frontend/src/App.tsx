@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib } from "./api";
+import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
+  LibItem, LibPage } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -295,7 +296,8 @@ function Tracks({ a, s, na, ns }:
 // Re-read every library file with mkvmerge and re-decide the gaps. Covers films, series and
 // anime in one pass regardless of the enabled scopes, and takes minutes on a big library — so
 // it reports live progress rather than looking hung.
-function RescanButton({ scope, label }: { scope: "films" | "anime" | "series"; label: string }) {
+function RescanButton({ scope, label, primary }:
+  { scope: "all" | "films" | "anime" | "series"; label: string; primary?: boolean }) {
   const [st, setSt] = useState<RescanState | null>(null);
   const [busy, setBusy] = useState(false);
   usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000, [st?.running]);
@@ -309,18 +311,22 @@ function RescanButton({ scope, label }: { scope: "films" | "anime" | "series"; l
   const mine = st?.scope === scope;
   const running = !!st?.running;
   const done = mine && st && !running && st.finished > 0;
-  const found = scope === "films" ? st?.films : st?.episodes;
+  const found = scope === "films" ? st?.films
+    : scope === "all" ? (st?.films ?? 0) + (st?.episodes ?? 0) : st?.episodes;
+  const dropped = (st?.pruned ?? 0) + (st?.pruned_records ?? 0);
   return (
     <>
-      <button className="btn sec" disabled={busy || running} onClick={go}
+      <button className={primary ? "btn" : "btn sec"} disabled={busy || running} onClick={go}
         title={`Re-read every ${label} file with mkvmerge and re-decide what it is missing. `
-               + "Takes a few minutes the first time; only changed files are re-read after that."}>
+               + "Every file is read again even if it looks unchanged, and files that have been "
+               + "deleted from the library are dropped. Takes a few minutes on a big library."}>
         {running && mine ? "Re-reading…" : `Re-read ${label}`}
       </button>
       {running && <span className="muted">
-        {mine ? `probing ${st!.phase}…` : `busy: ${st!.scope} scan running`}</span>}
+        {mine ? `${st!.phase}…` : `busy: ${st!.scope} scan running`}</span>}
       {done && !st.error &&
-        <span className="muted">last: {found ?? "?"} gap(s) · {st.probes.cached} file(s) cached
+        <span className="muted">last: {found ?? "?"} gap(s) · {st.probes.cached} file(s) read
+          {dropped > 0 && <> · {dropped} deleted entr{dropped === 1 ? "y" : "ies"} removed</>}
           {st.probes.unreadable > 0 && <span className="bad"> · {st.probes.unreadable} unreadable</span>}</span>}
       {mine && st?.error && <span className="bad">rescan failed: {st.error}</span>}
     </>
@@ -388,7 +394,7 @@ function LibBar({ l }: { l: CoverageLib }) {
   );
 }
 
-function CoveragePanel() {
+function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
   const [c, setC] = useState<Coverage | null>(null);
   usePoll(() => api.coverage().then(setC).catch(() => {}), 60000);
   if (!c) return null;
@@ -396,7 +402,7 @@ function CoveragePanel() {
     return (
       <div className="panel">
         <div className="row" style={{ marginBottom: 6 }}><b>Language coverage</b></div>
-        <div className="muted">Nothing probed yet — run “Re-read files” on a library tab.</div>
+        <div className="muted">Nothing probed yet — run “Re-read everything” on the Library tab.</div>
       </div>
     );
   const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
@@ -407,9 +413,123 @@ function CoveragePanel() {
         <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
           files meet their target · {pct}%
           {c.unreadable > 0 && <> · <span className="bad">{c.unreadable.toLocaleString()} unreadable</span></>}</span>
+        {goto && <><div className="spacer" />
+          <button className="btn sec" onClick={() => goto("library")}>Browse files →</button></>}
       </div>
       {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
     </div>
+  );
+}
+
+// ---------------- Library browser: which files meet the target, and which don't ----------------
+// /coverage answers "how much" as a number; this answers "which ones", the only form you can act
+// on. Both read the same probe inventory through the same classifier, so a file counted as
+// complete in the chart is in the Complete list here — they cannot disagree.
+const PAGE = 200;
+
+function LibRow({ i }: { i: LibItem }) {
+  // "French, English audio · English subs" — grouped by kind, not one clause per language, so a
+  // file short of three things still reads as one short phrase
+  const miss = [
+    i.missing_audio.length ? `${i.missing_audio.map(lang).join(", ")} audio` : "",
+    i.missing_subs.length ? `${i.missing_subs.map(lang).join(", ")} subs` : "",
+  ].filter(Boolean);
+  return (
+    <div className={`librow ${i.state}`}>
+      <div className="libmain">
+        <div className="libtitle">{i.title}</div>
+        <div className="libfile" title={i.path}>{i.file}</div>
+      </div>
+      <div className="libtracks">
+        {i.state === "unreadable"
+          ? <span className="bad" title={i.err || ""}>unreadable — {i.err || "probe failed"}</span>
+          : <>
+              <span title="audio languages read from the file">🔊 {i.audio.map(lang).join(", ") || <span className="muted">none tagged</span>}</span>
+              <span title="subtitle languages read from the file">💬 {i.subs.map(lang).join(", ") || <span className="muted">none</span>}</span>
+            </>}
+      </div>
+      <div className="libmiss">
+        {i.state === "complete"
+          ? <span className="ok-txt">✓ meets target</span>
+          : miss.length > 0 ? <span className="needs">missing {miss.join(" · ")}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+function Library() {
+  const [state, setState] = useState<"incomplete" | "complete" | "unreadable">("incomplete");
+  const [lib, setLib] = useState("");
+  const [q, setQ] = useState("");
+  const [page, setPage] = useState(0);
+  const [d, setD] = useState<LibPage | null>(null);
+  const [err, setErr] = useState("");
+
+  const load = () => api.library({ state, lib, q, limit: PAGE, offset: page * PAGE })
+    .then(x => { setD(x); setErr(""); })
+    .catch(e => setErr(e.message || "load failed"));
+  usePoll(load, 30000, [state, lib, q, page]);
+  // A filter change invalidates the page number — page 4 of a 2-page result is blank. Reset it in
+  // the same update as the filter (not in an effect) so the poll re-arms once, with both new
+  // values, instead of firing a throwaway request at the old offset first.
+  const pick = <T,>(set: (v: T) => void) => (v: T) => { set(v); setPage(0); };
+
+  const tabs: [typeof state, string, number][] = [
+    ["incomplete", "Target not met", d?.counts.incomplete ?? 0],
+    ["complete", "Complete", d?.counts.complete ?? 0],
+    ["unreadable", "Unreadable", d?.counts.unreadable ?? 0],
+  ];
+  const shown = d?.items.length ?? 0;
+  const pages = Math.ceil((d?.total ?? 0) / PAGE);
+  return (
+    <>
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 8 }}>
+          <b>Library</b>
+          <span className="muted">every file the scanner has read, scored against its language target</span>
+          <div className="spacer" />
+          <RescanButton scope="all" label="everything" primary />
+        </div>
+        <div className="row libfilters">
+          <div className="segbtns">
+            {tabs.map(([k, label, n]) => (
+              <button key={k} className={state === k ? "active" : ""} onClick={() => pick(setState)(k)}>
+                {label} <span className="segn">{n.toLocaleString()}</span>
+              </button>
+            ))}
+          </div>
+          <select value={lib} onChange={e => pick(setLib)(e.target.value)}>
+            <option value="">All libraries</option>
+            {(d?.libraries ?? []).map(l =>
+              <option key={l.name} value={l.name}>{l.name} ({l.total.toLocaleString()})</option>)}
+          </select>
+          <input placeholder="filter by title or path…" value={q}
+            onChange={e => pick(setQ)(e.target.value)} style={{ minWidth: 220 }} />
+        </div>
+        {err && <div className="bad">{err}</div>}
+        {d && d.total === 0 && !err &&
+          <div className="muted" style={{ marginTop: 10 }}>
+            {d.counts.complete + d.counts.incomplete + d.counts.unreadable === 0
+              ? "Nothing read yet — hit “Re-read everything” to probe the library."
+              : "Nothing here matches those filters."}
+          </div>}
+        {d && d.total > 0 && <>
+          <div className="libhead">
+            <span>title</span><span>on the file</span><span>gap</span>
+          </div>
+          <div className="liblist">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <span className="muted">
+              showing {(page * PAGE + 1).toLocaleString()}–{(page * PAGE + shown).toLocaleString()}
+              {" "}of {d.total.toLocaleString()}</span>
+            <div className="spacer" />
+            <button className="btn sec" disabled={page === 0} onClick={() => setPage(p => p - 1)}>← prev</button>
+            <button className="btn sec" disabled={page + 1 >= pages} onClick={() => setPage(p => p + 1)}>next →</button>
+          </div>
+        </>}
+      </div>
+      <CoveragePanel />
+    </>
   );
 }
 
@@ -599,7 +719,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
             sub={<>free · {diskPct}% used</>} />}
       </div>
 
-      <CoveragePanel />
+      <CoveragePanel goto={goto} />
 
       <div className="dash-cols">
         <div className="panel">
@@ -1416,7 +1536,8 @@ export default function App() {
   const [tab, setTab] = useState("overview");
   const tabs: [string, string][] = [
     ["overview", "Overview"],
-    ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"], ["review", "Review"],
+    ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"],
+    ["library", "Library"], ["review", "Review"],
     ["settings", "Settings"], ["logs", "Logs"]];
   return (
     <div className="app">
@@ -1434,6 +1555,7 @@ export default function App() {
       {tab === "films" && <Films />}
       {tab === "anime" && <Series anime key="anime" />}
       {tab === "series" && <Series anime={false} key="series" />}
+      {tab === "library" && <Library />}
       {tab === "review" && <Review />}
       {tab === "settings" && <Settings />}
       {tab === "logs" && <Logs />}

@@ -355,6 +355,46 @@ def forget_probe(path):
         c.execute("DELETE FROM probes WHERE path=?", (path,))
 
 
+def prune_missing_probes():
+    """Drop probe rows whose file no longer exists. Nothing else ever removes them, so a library
+    that has had titles deleted keeps counting them forever — which quietly skews every coverage
+    percentage. Returns how many were dropped."""
+    with db() as c:
+        paths = [r["path"] for r in c.execute("SELECT path FROM probes")]
+    gone = [p for p in paths if not os.path.exists(p)]
+    for i in range(0, len(gone), 400):          # chunked: SQLite caps variables per statement
+        chunk = gone[i:i + 400]
+        with db() as c:
+            c.execute(f"DELETE FROM probes WHERE path IN ({','.join('?' * len(chunk))})", chunk)
+    return len(gone)
+
+
+# A record in one of these is mid-flight: a merge writes a new file and swaps it in, so the
+# library path can be absent for a moment. Never prune those — a prune during that window would
+# delete the record whose merge is about to finish.
+_PRUNE_SKIP = ("downloading", "ready", "merging", "grabbed", "searching")
+
+
+def prune_missing_records():
+    """Drop movie/episode records whose library file is gone — the title was deleted from the
+    library, so the record can never be acted on and only clutters the counts. Returns
+    (movies, episodes) removed."""
+    out = []
+    skip = ",".join("?" * len(_PRUNE_SKIP))
+    for table, key in (("movies", "tmdb_id"), ("episodes", "id")):
+        with db() as c:
+            rows = [(r[key], r["french_path"]) for r in
+                    c.execute(f"SELECT {key}, french_path FROM {table} "
+                              f"WHERE status NOT IN ({skip})", _PRUNE_SKIP)]
+        gone = [k for k, p in rows if p and not os.path.exists(p)]
+        for i in range(0, len(gone), 400):
+            chunk = gone[i:i + 400]
+            with db() as c:
+                c.execute(f"DELETE FROM {table} WHERE {key} IN ({','.join('?' * len(chunk))})", chunk)
+        out.append(len(gone))
+    return tuple(out)
+
+
 def probe_stats():
     with db() as c:
         r = c.execute("SELECT COUNT(*) n, SUM(err IS NOT NULL) bad FROM probes").fetchone()
