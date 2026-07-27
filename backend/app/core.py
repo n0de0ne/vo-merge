@@ -54,12 +54,6 @@ DEFAULTS = {
     "qb_tv_category": "audio-merge-tv",
     "qb_tv_download_dir": "/data/.Téléchargements/completed/audio-merge-tv",
     "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
-    # Skip French-origin titles entirely — never hunt a dub for them. Made sense when this app
-    # was "add English to a French-dub library": a French ORIGINAL has no French dub to fix.
-    # It contradicts the profile model, though, where a movie's target end state is fre+eng
-    # audio + subs regardless of where it was made — so a French film missing English really is
-    # a gap. Default off; the titles are probed and counted either way (probes.excluded).
-    "exclude_french_origin": False,
     # ---- how the gap is decided ------------------------------------------------------------
     # "files": probe every library file with mkvmerge and believe the container (accurate, and
     #          the only thing that can't go stale). "tag": the old behaviour — trust Radarr's
@@ -354,18 +348,6 @@ def init_probe_cache():
             subs TEXT,               -- comma-joined canonical subtitle language codes
             ntracks INTEGER,         -- audio track count (0 with auds='' means unreadable)
             err TEXT )""")
-        # 1 = the pipeline deliberately does not target this file (exclude_french_origin). It is
-        # still INVENTORY — it exists on disk and belongs in the file count — so it is probed and
-        # listed; it just isn't scored as a failure for a gap we chose not to chase.
-        _ensure_cols(c, "probes", {"excluded": "INTEGER"})
-
-
-def mark_probe_excluded(path, flag):
-    """Record whether the pipeline targets this file. Separate from put_probe because only the
-    scan knows (it needs the *arr's originalLanguage), while the probe itself is pure file truth.
-    Re-stamped on every scan, so flipping exclude_french_origin takes effect on the next pass."""
-    with db() as c:
-        c.execute("UPDATE probes SET excluded=? WHERE path=?", (1 if flag else 0, path))
 
 
 def get_probe(path):

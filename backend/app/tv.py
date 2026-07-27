@@ -200,7 +200,7 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
     if tagid is None and not by_files:
         core.log("tv scan: vo-gap tag not found"); return 0
     pilot = set(cfg.get("series_pilot") or [])
-    n = seen = filled = unmapped = unreadable = n_excluded = 0
+    n = seen = filled = unmapped = unreadable = 0
     for s in son.series() if only_series is None else [son.series_one(only_series)]:
         if not s:
             continue
@@ -208,12 +208,6 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
             continue
         if tagid is not None and not by_files and tagid not in s.get("tags", []):
             continue
-        # "Don't hunt English for a French series" is a PIPELINE decision. This used to skip the
-        # series before any of its files were read, so a whole French show was absent from the
-        # probes table — the library inventory — and vanished from the Library tab, the file
-        # counts and the coverage denominator. Read the files, just don't record gaps for them.
-        excluded = (cfg.get("exclude_french_origin", True) and
-                    (s.get("originalLanguage") or {}).get("name") == "French")
         if pilot and only_series is None and s["title"] not in pilot:
             continue
         try:
@@ -247,12 +241,8 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                 if refresh:
                     core.forget_probe(local)
                 auds, subs, err = media.audit(local)
-                core.mark_probe_excluded(local, excluded)
                 if err:
                     unreadable += 1        # can't read it -> we know nothing; don't guess
-                    continue
-                if excluded:
-                    n_excluded += 1        # inventory only: probed, listed, never a gap record
                     continue
                 kind = media.kind_of(local, orig_name, cfg, series_type=stype)
                 miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
@@ -291,10 +281,9 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
     if by_files:
         from .pipeline import SCAN_SKIPS
         SCAN_SKIPS["episodes"] = {"unmapped": unmapped, "unreadable": unreadable,
-                                  "excluded": n_excluded, "probed": seen}
+                                  "probed": seen}
         core.log(f"tv scan(files, {what}): {n} gap(s) of {seen} episode(s) probed"
                  f"{f', {filled} already filled' if filled else ''}"
-                 f"{f', {n_excluded} French-origin (probed, not targeted)' if n_excluded else ''}"
                  f"{f', {unmapped} path not found' if unmapped else ''}"
                  f"{f', {unreadable} unreadable' if unreadable else ''}"
                  f" (pilot={sorted(pilot) or 'all'})")

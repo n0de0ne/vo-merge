@@ -397,4 +397,3 @@ button.btn.danger:disabled { opacity: .5; }
   color: #ffcf8f; background: rgba(255,176,62,.13); border-color: rgba(255,176,62,.4);
 }
 .aistat.needs_human i, .aistat.failed i { color: #e0b380; }
-.seg.off, .dot.off { background: #3a4250; }

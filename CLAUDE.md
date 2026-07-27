@@ -49,8 +49,8 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
 merged / review / sync_fail / error / ignored.
 
 1. **scan** — decide the gap by **probing the files** (see "Gap detection" below); Radarr/Sonarr
-   supply only metadata. `exclude_french_origin` (default **off**) stops French-origin titles
-   being *targeted*; they are probed and counted either way.
+   supply only metadata. **Every file is targeted** — the profile decides what a title should
+   carry, and where it was made has no bearing on that.
 2. **search/score** — Prowlarr search; `score_release` asks one language-agnostic question:
    *does this release carry something this file is missing?* (see "Release language scoring"),
    **strongly prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers
@@ -290,32 +290,26 @@ pass at a time) with `GET /api/library/repair` reporting progress. The Library t
 view breaks the count down by error and only offers the panel when something is genuinely
 audio-less.
 
-### Inventory is not the same as targeting (`probes.excluded`)
+### Every file is inventory, and every file is targeted
 
-`exclude_french_origin` means "don't hunt an English dub for a French film". **It now defaults
-to off**: it made sense when the app was "add English to a French-dub library" (a French ORIGINAL
-has no French dub to fix), but it contradicts the profile model, where a movie's target end state
-is fre+eng audio + subs regardless of where it was made — so a French film missing English is a
-real gap like any other. It used to `return`
-/ `continue` **before the file was ever probed**, so those titles were absent from the `probes`
-table — which is the library inventory. They vanished from the Library tab, from the per-library
-file counts and from the coverage denominator: Films reported 2,041 files against 2,429 on disk.
-A whole French-origin *series* disappeared the same way in `tv.scan`.
+`exclude_french_origin` used to skip French-origin titles entirely. It has been **removed**, and
+the two bugs it caused are worth remembering because both are easy to reintroduce:
 
-The scan does two jobs and they need separating: decide the gap (where the exclusion belongs) and
-build the inventory (where it does not). Both scans now probe the file first, stamp
-`probes.excluded`, and only then skip creating a pipeline record. So the file is counted and
-listable, but never chased, and never scored as a failure for a gap nobody intends to fill:
+- It `return`ed **before the file was ever probed**, so those titles were absent from the `probes`
+  table — which is the library inventory. They vanished from the Library tab, the per-library file
+  counts and the coverage denominator: Films reported 2,041 files against 2,429 on disk. A whole
+  French-origin *series* disappeared the same way in `tv.scan`.
+- The premise contradicted the profile model. `lang_profiles` says what a title should CARRY;
+  where it was made has no bearing on that. A French film with French audio and no English is
+  missing English exactly like any other film — and in practice those are titles that benefit
+  most, since a French-original release rarely ships an English track.
 
-- `/api/coverage` returns `excluded` and `targeted`; **percentages are over `targeted`**.
-- `/api/library?state=excluded` is the Library tab's **"Not targeted"** filter.
-- The flag is re-stamped every scan, so flipping `exclude_french_origin` takes effect next pass.
-
-`pipeline.SCAN_SKIPS` (surfaced on `GET /api/rescan` as `skips`) records every reason an
-*arr-known file did NOT become an inventory row — `no_file` / `unmapped` / `unreadable` /
-`excluded` — so a file count that doesn't match the library can be explained instead of guessed
-at. `unmapped` in particular means `media.to_media` couldn't find the path under `/media`, which
-is a mount/prefix problem, not a missing file.
+So there is no "not targeted" state: a probed file is complete, incomplete, or unreadable.
+`pipeline.SCAN_SKIPS` (surfaced on `GET /api/rescan` as `skips`) records the reasons an *arr-known
+file still didn't become an inventory row — `no_file` / `unmapped` / `unreadable` — so a file count
+that doesn't match the library can be explained instead of guessed at. `unmapped` in particular
+means `media.to_media` couldn't find the path under `/media`, which is a mount/prefix problem
+rather than a missing file.
 
 ### A scan adds what's new; the prune drops what's gone
 
