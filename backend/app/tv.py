@@ -12,7 +12,8 @@ from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _pick_subs, _donor_opts, hold_reason, reopen_status)
+                       _pick_subs, _donor_opts, hold_reason, reopen_status,
+                       CLOSEABLE)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -245,17 +246,17 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                     unreadable += 1        # can't read it -> we know nothing; don't guess
                     continue
                 kind = media.kind_of(local, orig_name, cfg, series_type=stype)
-                miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
+                miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg, orig_name)
                 need = "+".join([x for x in (("audio" if miss_a else ""),
                                              ("subs" if miss_s else "")) if x])
                 alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
                 cur = core.get_episode(ep_id)
                 if not need:
-                    if cur and cur["status"] in ("pending", "no_release", "searching"):
+                    if cur and cur["status"] in CLOSEABLE:
                         core.set_ep_status(ep_id, "merged", added_langs="", progress="", error=None,
                                            audio_langs=alangs, sub_langs=slangs, needs="",
                                            need_audio="", need_subs="", orig_lang=orig_name,
-                                           merge_kind="already")
+                                           merge_kind="already", ai_status=None, ai_verdict=None)
                         filled += 1
                     elif cur:
                         core.set_ep_status(ep_id, cur["status"], audio_langs=alangs,
@@ -724,7 +725,7 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     # Audio-only was the old test, so a MULTI with no subtitle tracks would replace a library
     # file that had French subs and drop them. gap_langs is not reused: it suppresses a
     # subtitle-only shortfall when subs_only_gap is off, exactly the case this must not ignore.
-    _wa, _ws = media.profile(kind0, cfg)
+    _wa, _ws = media.profile(kind0, cfg, ep.get("orig_lang"))
     _ra, _rs = media.langs(ei)
     _ba, _bs = media.langs(fi)
     if (not [c for c in _wa if c not in _ra] and not [c for c in _ws if c not in _rs]
@@ -737,7 +738,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
             a2, s2, e2 = media.audit(fr, refresh=True)
-            m2a, m2s = ([], []) if e2 else media.gap_langs(a2, s2, kind0, cfg)
+            m2a, m2s = ([], []) if e2 else media.gap_langs(a2, s2, kind0, cfg,
+                                                           ep.get("orig_lang"))
             core.set_ep_status(ep["id"], "merged", merged_file=fr, added_langs="", error=None,
                                merge_kind="replaced",
                                audio_langs=",".join(sorted(a2)), sub_langs=",".join(sorted(s2)),
@@ -763,19 +765,19 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     # only the profile's target languages the base lacks (anime keeps its JPN VO), one per lang
     kind = media.kind_of(fr, ep.get("orig_lang"), cfg,
                          series_type=ep.get("series_type") or "standard")
-    want_a, _ = media.profile(kind, cfg)
+    want_a, _ = media.profile(kind, cfg, ep.get("orig_lang"))
     picked = media.wanted_audio(di, bi, want_a)
     ids = [a["id"] for a in picked]
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
     have |= {a["lang"] for a in picked}
-    subs = _pick_subs(di, bi, cfg, kind)
+    subs = _pick_subs(di, bi, cfg, kind, ep.get("orig_lang"))
     if not ids and not subs:
         # Donor contributes nothing — decide from the FILE, not from "is English present":
         # still short of a target language means this release was the wrong one, whereas a file
         # that meets its profile is simply already done. Demanding English specifically used to
         # reject a donor carrying exactly the language the record needed.
-        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg)
+        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg, ep.get("orig_lang"))
         if still_a or still_s:
             core.set_ep_status(ep["id"], "error", progress="",
                                error="merge: release carries none of the missing languages "

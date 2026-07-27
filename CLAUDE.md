@@ -114,12 +114,29 @@ the gap decision itself.
   |---|---|---|
   | `movie` | fre, eng | fre, eng |
   | `series` | fre, eng | fre, eng |
-  | `anime` | fre, eng, **jpn** | fre, eng |
+  | `anime` | fre, eng, **orig** | fre, eng |
 
   So a FR anime that already carries its Japanese VO is still missing English → a gap (the
   earlier "English *or* the original language counts as filled" rule silently skipped exactly
   those, which is the case the app exists for). The missing codes are stored per record in
   `need_audio`/`need_subs`, shown in the UI, and are what the merge grafts.
+- **`orig` is a target, not a language** (`media._resolve_targets`). The anime profile's third
+  audio slot shipped as a literal `jpn`, because anime is Japanese — so the slot's *meaning*
+  ("keep the ORIGINAL audio") and its value were indistinguishable. They are not: **Arcane is
+  filed as anime and made in French**, so a literal `jpn` is a gap no release on earth can fill.
+  Its 18 episodes searched forever and ended up `ignored` while their FR+EN audio *and* subs were
+  already complete. `orig` resolves per title from Radarr/Sonarr's `originalLanguage` — Japanese
+  anime still targets `jpn`, a French one targets French (which it has), a Korean one `kor`. An
+  **unknown** original language (Radarr reports `"?"`) drops the slot rather than inventing a
+  target; `norm_lang`'s 3-char fallback would otherwise have made `"?"` itself a language.
+  `core.migrate_config()` rewrites a persisted `jpn` to `orig` once, at startup — behaviour for
+  Japanese anime is unchanged, so there is nothing to decide. A deliberately-typed third language
+  (e.g. `ger`) is left alone and still targeted.
+- **A settled record whose file a scan now finds COMPLETE is closed out** (`pipeline.CLOSEABLE`),
+  including `ignored`. That is not a contradiction of "`ignored` survives a rescan": that rule is
+  about not re-*searching* a deliberate give-up, and a file meeting its profile has no work left.
+  Leaving it flagged — usually with the AI's give-up verdict still attached — just misreports a
+  finished title. This is what clears the Arcane episodes.
 - **`media.kind_of`** picks the profile: Sonarr's own `seriesType == "anime"` wins, then a
   top-level library folder in `anime_dirs`, then a Japanese original language — which is what an
   anime *film* looks like to Radarr, since Radarr has no anime flag.

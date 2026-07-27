@@ -260,6 +260,14 @@ ACTIVE_STATES = ("downloading",)
 REOPEN_STATES = ("merged",)
 RETRY_STATES = ("no_release",)
 
+# ...and the mirror of that: a settled record whose file a scan now finds COMPLETE is closed out
+# rather than left sitting as a problem. `ignored` belongs here even though it never gets
+# re-opened — the two are different questions. "Don't re-search this" is a decision about work to
+# do; a file that meets its profile has no work left, so leaving it flagged (often with the AI's
+# give-up verdict still attached) just misreports a finished title. This is what clears the Arcane
+# episodes that were ignored for missing a Japanese track a French show will never have.
+CLOSEABLE = ("pending", "no_release", "searching", "ignored")
+
 
 def reopen_status(prev, updated, cfg):
     """What status a record with a REMAINING gap should carry. Shared by both scans."""
@@ -424,17 +432,18 @@ def ingest_movie(m, cfg, refresh=False):
         # the only honest option; the count is logged so a systemic problem is visible.
         return "unreadable"
     kind = media.kind_of(fr_path, lang, cfg)
-    miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg)
+    miss_a, miss_s = media.gap_langs(auds, subs, kind, cfg, lang)
     need = "+".join([x for x in (("audio" if miss_a else ""), ("subs" if miss_s else "")) if x])
     alangs, slangs = ",".join(sorted(auds)), ",".join(sorted(subs))
     existing = core.get_movie(m["tmdbId"])
     if not need:
         # No gap. Never insert these (a whole library of them would flood the pipeline);
         # if we already track it, the gap is filled — record that instead of re-searching.
-        if existing and existing["status"] in ("pending", "no_release", "searching"):
+        if existing and existing["status"] in CLOSEABLE:
             core.set_status(m["tmdbId"], "merged", added_langs="", progress="", error=None,
                             audio_langs=alangs, sub_langs=slangs, needs="",
-                            need_audio="", need_subs="")
+                            need_audio="", need_subs="", merge_kind="already",
+                            ai_status=None, ai_verdict=None)
             return "filled"
         if existing:
             core.set_status(m["tmdbId"], existing["status"], audio_langs=alangs,
@@ -999,7 +1008,7 @@ def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, 
         if err:
             return "unreadable"
         k = media.kind_of(path, orig, cfg, series_type=series_type)
-        miss_a, miss_s = media.gap_langs(auds, subs, k, cfg)
+        miss_a, miss_s = media.gap_langs(auds, subs, k, cfg, orig)
         if not miss_a and not miss_s:
             return "complete"
         return (auds, subs, miss_a, miss_s)
@@ -1121,14 +1130,14 @@ def merge_movie(tmdb_id, cfg=None):
         return _merge_movie_impl(tmdb_id, cfg)
 
 
-def _pick_subs(donor_info, base_info, cfg, kind="movie"):
+def _pick_subs(donor_info, base_info, cfg, kind="movie", orig=None):
     """Donor subtitle tracks to graft alongside the audio, per the kind's target profile.
     English subs are missing from most French library files, and the donor we already downloaded
     for its audio usually carries them — so taking them costs one extra mkvmerge argument rather
     than another download."""
     if not cfg.get("want_subs", True):
         return []
-    _, want = media.profile(kind, cfg)
+    _, want = media.profile(kind, cfg, orig)
     return media.wanted_subs(donor_info, base_info, want, cfg.get("max_sub_tracks", 2))
 
 
@@ -1187,7 +1196,7 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     # gap_langs is deliberately not reused here — it suppresses a subtitle-only shortfall when
     # subs_only_gap is off, which is exactly the case this must not ignore. (Sidecar .srt files
     # survive: the replacement keeps the library file's name, so they still match its stem.)
-    want_a0, want_s0 = media.profile(kind0, cfg)
+    want_a0, want_s0 = media.profile(kind0, cfg, mv.get("original_lang"))
     rel_a, rel_s = media.langs(ei)
     base_a, base_s = media.langs(fi)
     self_sufficient = (not [c for c in want_a0 if c not in rel_a]
@@ -1218,13 +1227,13 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     # Take only the profile's target languages the base lacks (plus the VO fallback), one track
     # per language — grabbing every new language would bloat the file with dubs nobody asked for.
     kind = media.kind_of(fr, mv.get("original_lang"), cfg)
-    want_a, _ = media.profile(kind, cfg)
+    want_a, _ = media.profile(kind, cfg, mv.get("original_lang"))
     picked = media.wanted_audio(di, bi, want_a, extra=orig_codes)
     ids = [a["id"] for a in picked]
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
     have |= {a["lang"] for a in picked}
-    subs = _pick_subs(di, bi, cfg, kind)
+    subs = _pick_subs(di, bi, cfg, kind, mv.get("original_lang"))
     if not ids and not subs:
         # The donor contributes nothing. Two very different reasons, so decide from the FILE
         # rather than assuming: either the library file already meets its language profile —
@@ -1232,7 +1241,8 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         # of the languages still missing, in which case blocklist it and try another. The old
         # check demanded English specifically, which rejected a donor that carried exactly the
         # language the record was short of (French, or a VO).
-        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg)
+        still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg,
+                                          mv.get("original_lang"))
         if still_a or still_s:
             reject_and_retry(tmdb_id, "release carries none of the missing languages "
                                       f"(still needs {'+'.join(still_a + still_s)})", cfg, delta)
@@ -1437,7 +1447,8 @@ def finish_movie(tmdb_id, cfg=None):
         # (and a merge that fell short looks complete) until the next library scan.
         auds2, subs2, err2 = media.audit(dest, refresh=True)
         miss_a2, miss_s2 = ([], []) if err2 else media.gap_langs(
-            auds2, subs2, media.kind_of(dest, mv.get("original_lang"), cfg), cfg)
+            auds2, subs2, media.kind_of(dest, mv.get("original_lang"), cfg), cfg,
+            mv.get("original_lang"))
         core.set_status(tmdb_id, "merged", merged_file=dest,
                         audio_langs=",".join(sorted(auds2)), sub_langs=",".join(sorted(subs2)),
                         need_audio=",".join(miss_a2), need_subs=",".join(miss_s2),

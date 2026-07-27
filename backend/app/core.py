@@ -75,11 +75,13 @@ DEFAULTS = {
                                            # the tagged ones (the tag is what we're replacing)
     # The END STATE each kind of title should reach. A file is a gap when it is missing any of
     # these; the missing codes are recorded per record (need_audio / need_subs) and are what the
-    # merge grafts off the donor. Anime keeps its Japanese VO on top of FR+EN.
+    # merge grafts off the donor. Anime keeps its ORIGINAL audio on top of FR+EN — `orig` is a
+    # token resolved per title from Radarr/Sonarr's originalLanguage, not a literal `jpn`, because
+    # not every show filed as anime is Japanese (Arcane is French).
     "lang_profiles": {
-        "movie":  {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
-        "series": {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
-        "anime":  {"audio": ["fre", "eng", "jpn"], "subs": ["fre", "eng"]},
+        "movie":  {"audio": ["fre", "eng"],         "subs": ["fre", "eng"]},
+        "series": {"audio": ["fre", "eng"],         "subs": ["fre", "eng"]},
+        "anime":  {"audio": ["fre", "eng", "orig"], "subs": ["fre", "eng"]},
     },
     "anime_dirs": ["Anime"],               # top-level library folders that mean "anime"; a
                                            # Japanese-original title also gets the anime profile
@@ -172,6 +174,29 @@ def load_config():
     _SECRETS.clear()
     _SECRETS.update(str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8)
     return cfg
+
+
+def migrate_config():
+    """One-shot upgrades of persisted config values whose MEANING changed.
+
+    `lang_profiles.anime.audio` shipped with a literal `jpn` — the slot always meant "keep the
+    ORIGINAL audio", and anime being Japanese made the two indistinguishable. They are not:
+    Arcane is filed as anime and made in French, so a literal jpn target is a gap no release can
+    ever fill. Every episode searches forever and ends up ignored while its FR+EN audio and subs
+    are already complete. Rewriting it to the `orig` token leaves Japanese anime behaving exactly
+    as before and fixes every other origin."""
+    if not os.path.exists(CONFIG_FILE):
+        return                                  # nothing persisted; DEFAULTS already say `orig`
+    cfg = load_config()
+    prof = (cfg.get("lang_profiles") or {}).get("anime") or {}
+    aud = list(prof.get("audio") or [])
+    if "jpn" not in aud or "orig" in aud:
+        return
+    prof = dict(prof)
+    prof["audio"] = ["orig" if a == "jpn" else a for a in aud]
+    profiles = dict(cfg["lang_profiles"]); profiles["anime"] = prof
+    save_config({"lang_profiles": profiles})
+    log("config: anime audio target jpn -> orig (the original language, resolved per title)")
 
 
 def save_config(updates: dict):

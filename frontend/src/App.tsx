@@ -1716,7 +1716,11 @@ function Settings() {
           <input key={`${kind}-ai`} type="text" value={prof(kind, "audio")}
             onChange={e => setProf(kind, "audio", e.target.value)} />,
           <span key={`${kind}-as`} className="muted">
-            {kind === "anime" ? "keeps the Japanese VO alongside FR+EN" : "e.g. fre, eng"}</span>,
+            {kind === "anime"
+              ? <><b>orig</b> = the title's own original language, resolved per title — keeps the
+                Japanese VO on a Japanese show without demanding a Japanese track from one made
+                in French (Arcane)</>
+              : "e.g. fre, eng"}</span>,
           <label key={`${kind}-s`}>&nbsp;&nbsp;&nbsp;&nbsp;— subtitles</label>,
           <input key={`${kind}-si`} type="text" value={prof(kind, "subs")}
             onChange={e => setProf(kind, "subs", e.target.value)} />,

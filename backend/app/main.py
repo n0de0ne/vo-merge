@@ -17,6 +17,7 @@ def _startup():
     core.init_db()
     core.init_tv()
     core.init_probe_cache()
+    core.migrate_config()
     scheduler.start()
 
 
@@ -229,15 +230,24 @@ def _inventory(cfg, cols="path, auds, subs, err"):
     prof = {}
     with core.db() as c:
         rows = c.execute(f"SELECT {cols} FROM probes").fetchall()
+        # The anime profile's original-audio slot resolves per title, and the probes table has no
+        # idea what a title's original language is — so borrow it from whichever record covers
+        # this path. A file with no record (it never had a gap) leaves the slot unresolved, which
+        # drops it: better than demanding a language we can't name.
+        origs = {r["p"]: r["o"] for r in c.execute(
+            "SELECT french_path p, original_lang o FROM movies WHERE french_path IS NOT NULL "
+            "UNION ALL SELECT french_path p, orig_lang o FROM episodes "
+            "WHERE french_path IS NOT NULL")}
     for r in rows:
         path = r["path"] or ""
         top = path[len(mount) + 1:].split(os.sep, 1)[0] if path.startswith(mount + "/") else "?"
         if top.lower() in mirrors:
             continue
         kind = "anime" if top.lower() in anime else ("series" if top.lower() in series else "movie")
-        if kind not in prof:
-            prof[kind] = media.profile(kind, cfg)
-        want_a, want_s = prof[kind]
+        key = (kind, origs.get(path))
+        if key not in prof:
+            prof[key] = media.profile(kind, cfg, key[1])
+        want_a, want_s = prof[key]
         if r["err"]:
             yield r, top, kind, want_a, want_s, None, None, None, None
             continue

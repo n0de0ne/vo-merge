@@ -524,16 +524,49 @@ def _split(v):
     return {x for x in (v or "").split(",") if x}
 
 
-_PROFILES = {"movie":  {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
-             "series": {"audio": ["fre", "eng"],        "subs": ["fre", "eng"]},
-             "anime":  {"audio": ["fre", "eng", "jpn"], "subs": ["fre", "eng"]}}
+_PROFILES = {"movie":  {"audio": ["fre", "eng"],         "subs": ["fre", "eng"]},
+             "series": {"audio": ["fre", "eng"],         "subs": ["fre", "eng"]},
+             "anime":  {"audio": ["fre", "eng", "orig"], "subs": ["fre", "eng"]}}
+
+# `jpn` was in the anime profile because anime is Japanese — the slot means "keep the ORIGINAL
+# audio", not "this title must carry Japanese". Arcane is filed as anime and made in French, so a
+# literal jpn target is a gap no release on earth can fill: every episode searches forever and
+# ends up ignored, while its FR+EN audio and subs are already complete. `orig` resolves per title
+# from Radarr/Sonarr's originalLanguage, so a Japanese anime still targets jpn and a French one
+# targets French — which it already has.
+_VO_TOKENS = {"orig", "original", "vo", "same"}
+# a resolved original language must be a code the alias table actually knows — Radarr reports "?"
+# when it doesn't know, and norm_lang's 3-char fallback would happily turn that into a target
+_REAL_CODES = frozenset(_ALIAS.values()) - {"und"}
 
 
-def profile(kind, cfg):
-    """The target language set for a kind of title ("movie" | "series" | "anime")."""
+def _resolve_targets(codes, orig):
+    """Profile entries -> canonical codes, resolving the `orig` token and dropping duplicates.
+    An unknown original language (Radarr reports "?") drops the token rather than inventing a
+    target: demanding a language we can't name would be an unfillable gap."""
+    out = []
+    for x in codes:
+        if str(x).strip().lower() in _VO_TOKENS:
+            c = norm_lang(orig)
+            if c not in _REAL_CODES:
+                continue
+        else:
+            c = norm_lang(x)
+            if c == "und":
+                continue
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def profile(kind, cfg, orig=None):
+    """The target language set for a kind of title ("movie" | "series" | "anime").
+
+    `orig` is the title's original language (Radarr/Sonarr `originalLanguage`), used to resolve
+    an `orig` entry in the profile."""
     p = (cfg.get("lang_profiles") or {}).get(kind) or _PROFILES.get(kind) or _PROFILES["movie"]
-    return ([norm_lang(x) for x in (p.get("audio") or [])],
-            [norm_lang(x) for x in (p.get("subs") or [])])
+    return (_resolve_targets(p.get("audio") or [], orig),
+            _resolve_targets(p.get("subs") or [], orig))
 
 
 def kind_of(path, original_lang, cfg, series_type=None):
@@ -553,14 +586,14 @@ def kind_of(path, original_lang, cfg, series_type=None):
     return "series" if series_type else "movie"
 
 
-def gap_langs(auds, subs, kind, cfg):
+def gap_langs(auds, subs, kind, cfg, orig=None):
     """(missing audio codes, missing subtitle codes) against the kind's target profile.
 
     `und` is not a language, so it never satisfies a target — see the module docstring. A
     subtitle shortfall on its own is only reported when `subs_only_gap` is on; otherwise subs
     ride along with an audio graft and a file that merely lacks subtitles doesn't trigger a
-    whole download by itself."""
-    want_a, want_s = profile(kind, cfg)
+    whole download by itself. `orig` resolves the profile's `orig` (original-audio) slot."""
+    want_a, want_s = profile(kind, cfg, orig)
     miss_a = [c for c in want_a if c not in auds]
     miss_s = []
     if cfg.get("want_subs", True):
@@ -570,9 +603,9 @@ def gap_langs(auds, subs, kind, cfg):
     return miss_a, miss_s
 
 
-def gap_kind(auds, subs, kind, cfg):
+def gap_kind(auds, subs, kind, cfg, orig=None):
     """Coarse label for `gap_langs`: "audio", "subs", "audio+subs", or "" when nothing."""
-    a, s = gap_langs(auds, subs, kind, cfg)
+    a, s = gap_langs(auds, subs, kind, cfg, orig)
     return "+".join([x for x in (("audio" if a else ""), ("subs" if s else "")) if x])
 
 
