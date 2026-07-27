@@ -382,3 +382,18 @@ header.top { display: flex; align-items: center; gap: 10px; }
 button.btn.danger { background: #8c2f2a; border: 1px solid #b1453f; color: #ffe4e2; }
 button.btn.danger:hover:not(:disabled) { background: #a1372f; }
 button.btn.danger:disabled { opacity: .5; }
+
+/* ---- on-call AI health: did it actually report a verdict, or just go quiet? ---- */
+.panel.warnbar-soft { border-color: #6b4a2c; background: #201a12; }
+.aistats { display: flex; flex-wrap: wrap; gap: 6px; }
+.aistat {
+  font-size: 12px; padding: 2px 9px; border-radius: 999px; font-variant-numeric: tabular-nums;
+  color: var(--text); background: var(--panel2); border: 1px solid var(--border);
+}
+.aistat i { font-style: normal; color: var(--muted); margin-left: 4px; font-size: 11px; }
+.aistat.resolved { color: #5ee9a0; border-color: #1d5c3a; background: #14432a; }
+.aistat.resolved i { color: #8fd9b4; }
+.aistat.needs_human, .aistat.failed {
+  color: #ffcf8f; background: rgba(255,176,62,.13); border-color: rgba(255,176,62,.4);
+}
+.aistat.needs_human i, .aistat.failed i { color: #e0b380; }

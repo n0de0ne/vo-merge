@@ -810,11 +810,25 @@ def movie_to_ai(tmdb_id: int):
         f"review-m{tmdb_id}", summary,
         {"record": record,
          "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+         "read_this_first": f"GET /movie/{tmdb_id}/context — the record, a probe of BOTH files "
+                            "(fps/duration/audio tracks) and the matching log lines. Comparing "
+                            "the two probes is the diagnosis for most sync and 'nothing to add' "
+                            "failures.",
          "actions": [
+             "GET  /movie/{id}/context — probes of both files + the relevant log lines",
              "GET  /movie/{id}/candidates — list releases (incl. already-tried)",
              "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
+             "POST /movie/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a KNOWN "
+             "offset and/or rate stretch with no detection (drift = donor_fps/base_fps; "
+             "1.0427083 is film->PAL). Use when /context shows the two files' fps differ.",
              "POST /movie/{id}/another — blocklist current release, grab next best",
              "POST /movie/{id}/research — search again (keeps blocklist)",
+             "POST /search_releases {\"query\":\"...\"} — run an ARBITRARY Prowlarr query and "
+             "grab from the results. The built-in search composes its own query from the library "
+             "title, so a title it never matches can never be found however often it re-searches; "
+             "try the original/romaji/alternate title with no year.",
+             "POST /movie/{id}/unfixable {\"reason\":\"...\"} — terminal give-up WITH a recorded "
+             "reason (preferred over /ignore, which reads as an unexamined skip)",
              "POST /movie/{id}/ignore — give up on this title",
          ],
          "report_back": (
@@ -852,13 +866,21 @@ def episode_to_ai(ep_id: str):
              "list, and a `numbering` block (library S/E vs the release's S/E and absolute "
              "number). vo-merge translates aired<->absolute itself from Sonarr, so "
              "`translated: true` means search and donor mapping already use the aired numbering."),
+         "read_this_first": f"GET /episode/{ep_id}/context — the record, a probe of both files, "
+                            "the matching log lines, EVERY donor file with the (season, episode) "
+                            "parsed from it, and the series' episode list. Comparing those two "
+                            "lists IS the diagnosis for a numbering mismatch.",
          "actions": [
+             "GET  /episode/{id}/context — probes, log lines, donor files vs the episode list",
              "GET  /episode/{id}/candidates — list releases (incl. already-tried)",
              "POST /episode/{id}/retry — blocklist current release, drop donor, re-search",
              "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map one donor file to this "
              "episode and queue the merge (when automatic numbering translation can't apply)",
              "POST /episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — apply a known "
              "offset / rate stretch with no detection",
+             "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query (original/"
+             "romaji/alternate title, no year) for the no_release backlog",
+             "POST /episode/{id}/unfixable {\"reason\":\"...\"} — terminal give-up WITH a reason",
              "POST /episode/{id}/ignore — give up on this episode",
          ],
          "report_back": (
@@ -1204,12 +1226,24 @@ def dashboard():
                            "queue_pos": min(pos) if pos else None})
         active.sort(key=lambda x: (order.get(x["status"], 9), x["title"]))
 
+        # "Needs attention" means NEEDS YOU — not "something failed". The on-call AI is given
+        # every failure within 3 min, so a panel listing all of them is mostly a list of things
+        # already being worked. Show only what has come back from the AI unresolved
+        # (failed / needs_human, which includes the 60-min no-callback flip) plus `review`, which
+        # by definition is a human decision. Anything still with the AI is counted, not listed.
+        # With ai_tickets off nothing would ever reach those states, so fall back to everything.
+        NEEDS_YOU = ("ai_status IN ('failed','needs_human') OR status='review'"
+                     if cfg.get("ai_tickets", True) else "1=1")
+        working = sum(c.execute(
+            f"SELECT COUNT(*) n FROM {t} WHERE status IN ({qn}) AND ai_status='pending'",
+            ATTN).fetchone()["n"] for t in ("movies", "episodes"))
+
         attention = [{"kind": "movie", "key": f"m{r['tmdb_id']}", "title": r["title"],
                       "status": r["status"], "error": r["error"], "count": 1,
                       "sync_delta": r["sync_delta"], "poster": r["poster"], "ts": r["updated"],
                       "ai_status": r["ai_status"], "ai_verdict": r["ai_verdict"]}
                      for r in c.execute(f"SELECT * FROM movies WHERE status IN ({qn}) "
-                                        "ORDER BY updated DESC LIMIT 8", ATTN)]
+                                        f"AND ({NEEDS_YOU}) ORDER BY updated DESC LIMIT 8", ATTN)]
         # Episodes fail in packs: one bad season pack puts 30 identical rows in a row, and with a
         # flat LIMIT 8 those 30 crowd every other problem off the panel. Group a series' episodes
         # that share a status+error into ONE row spanning their episode range, then take 8 groups.
@@ -1221,7 +1255,7 @@ def dashboard():
         # which ones were visible. Grouping a few thousand rows in Python is nothing; the cap is
         # only a runaway backstop.
         for r in c.execute(f"SELECT * FROM episodes WHERE status IN ({qn}) "
-                           "ORDER BY updated DESC LIMIT 5000", ATTN):
+                           f"AND ({NEEDS_YOU}) ORDER BY updated DESC LIMIT 5000", ATTN):
             g = groups.setdefault((r["series_title"], r["status"], r["error"], r["ai_status"]),
                                   {"eps": [], "row": r})
             g["eps"].append((r["season"], r["episode"]))
@@ -1242,8 +1276,16 @@ def dashboard():
         # Counting all three made a library re-read look like thousands of merges in a day, and
         # filled "recently merged" with titles vo-merge never touched. Legacy rows have no
         # merge_kind, so fall back to "did we record adding anything?".
-        DID_WORK = ("(merge_kind IN ('grafted','replaced') OR (merge_kind IS NULL AND "
-                    "(COALESCE(added_langs,'') != '' OR COALESCE(added_subs,'') != '')))")
+        # Require EVIDENCE that the file changed, not just a label saying so:
+        #   - `replaced`: the download became the library file. Real work, and it legitimately
+        #     records no added languages, so it can only be recognised by its merge_kind.
+        #   - anything that recorded an added audio or subtitle language: that IS the evidence,
+        #     and it covers legacy rows written before merge_kind existed.
+        # A 'grafted' row with nothing recorded as added is a contradiction — it adds no
+        # information about what the app did, so it stays out. `already` (the scan closing out a
+        # file that was correct on its own) is excluded by both clauses, which is the point.
+        DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
+                    "OR COALESCE(added_subs,'') != '')")
         recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],
                    "subs": r["added_subs"], "how": r["merge_kind"] or "grafted",
                    "poster": r["poster"], "ts": r["merged_at"] or r["updated"]}
@@ -1269,6 +1311,26 @@ def dashboard():
             for r in c.execute(f"SELECT merge_kind, COUNT(*) n FROM {t} WHERE status='merged' "
                                "GROUP BY merge_kind"):
                 mk[r["merge_kind"] if r["merge_kind"] in mk else "grafted"] += r["n"]
+
+        # Is the on-call AI actually doing anything? The dispatcher runs on the host, outside
+        # this app, so the only evidence we have is whether it calls back. `resolved` is the
+        # only outcome it produced itself; `needs_human` is mostly the 60-min no-callback flip,
+        # so a wall of needs_human with last_callback=None means the dispatcher never ran at all
+        # — which looks identical to "the AI examined everything and gave up" unless it is
+        # reported separately.
+        ai = {"pending": 0, "resolved": 0, "failed": 0, "needs_human": 0, "never_sent": 0}
+        last_cb = None
+        for t in ("movies", "episodes"):
+            for r in c.execute(f"SELECT ai_status, COUNT(*) n, MAX(ai_at) last FROM {t} "
+                               f"WHERE status IN ({qn}) GROUP BY ai_status", ATTN):
+                k = r["ai_status"] or "never_sent"
+                if k in ai:
+                    ai[k] += r["n"]
+                if r["ai_status"] in ("resolved", "failed") and r["last"]:
+                    last_cb = max(last_cb or 0, r["last"])   # a real verdict, not the stale flip
+        ai["last_callback"] = last_cb
+        ai["enabled"] = bool(cfg.get("ai_tickets", True))
+        ai["stale_min"] = cfg.get("ai_stale_min", 60)
 
     try:
         inflight = pipeline.inflight_downloads(cfg)
@@ -1297,6 +1359,7 @@ def dashboard():
             "scope_series": bool(cfg.get("scope_series")),
             "movies": mcounts, "episodes": ecounts,
             "active": active, "attention": attention, "recent": recent,
+            "ai_working": working, "ai": ai,
             "merged_24h": merged_24h, "merged_7d": merged_7d, "merged_kinds": mk,
             "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
             "merge_cap": pipeline.MERGE_GATE.limit(cfg),

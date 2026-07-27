@@ -204,11 +204,14 @@ did. Conflating them made a library re-read look like thousands of merges in a d
 | `replaced` | the download's video was ≥ the library's, so it *became* the file (`_place_multi`, TV direct remux) | `""` |
 | `already` | the file already met its profile — the scan just closed the record out | `""` |
 
-The dashboard's recent list and its 24 h / 7 d counters filter on grafted+replaced. Legacy rows
-predate the column, so the SQL falls back to "did we record adding anything?"
-(`added_langs`/`added_subs` non-empty) rather than needing a migration. The Recently merged
-header shows the whole breakdown, and rows badge audio and subtitle languages separately — a
-subtitle-only graft has an empty `added_langs` and used to render as a bare title.
+**Recently merged lists only rows with EVIDENCE the file changed** — `merge_kind='replaced'`
+(which legitimately records no added languages, so it can only be recognised by its kind) or a
+non-empty `added_langs`/`added_subs` (which also covers legacy rows written before the column
+existed, with no migration). `already` fails both tests, which is the point; so does a `grafted`
+row that recorded nothing added, since it says nothing about what the app did. The same predicate
+drives the 24 h / 7 d counters. The header shows the whole breakdown, and rows badge audio and
+subtitle languages separately — a subtitle-only graft has an empty `added_langs` and used to
+render as a bare title.
 
 ## Language coverage & the Library tab (`/api/coverage`, `/api/library`)
 
@@ -536,6 +539,18 @@ its outcome is written back so failures surface for a human:
    of the **Review tab** (movies + TV episodes). If the dispatcher never calls back within
    `ai_stale_min` (default 60) while still in a problem state, `ai_health_check` flips it to
    `needs_human` — catching a silently crashed AI.
+
+**"Needs attention" means NEEDS YOU, not "something failed."** Every failure reaches the AI within
+3 minutes, so a panel listing all of them is mostly a list of things already being worked on. It
+shows only `ai_status IN (failed, needs_human)` plus `review` (a human decision by definition);
+anything still with the AI is counted ("N with the AI"), not listed. With `ai_tickets` off nothing
+could ever reach those states, so the filter falls back to showing everything.
+
+**The On-call AI panel says whether the dispatcher is alive.** It runs on the host, outside this
+app, so the only evidence is whether it calls back. `resolved`/`failed` are verdicts it produced
+itself; `needs_human` is *mostly the no-callback flip*. A wall of `needs_human` with
+`last_callback: null` means the dispatcher never ran — which, unless reported separately, looks
+exactly like "it examined everything and gave up". The panel says which it is.
 
 New DB columns: `ai_status`, `ai_verdict`, `ai_at` on both `movies` and `episodes` (via
 `_ensure_cols`). Gated by the existing `ai_tickets` flag.

@@ -94,10 +94,19 @@ export interface DashRecent {
   subs?: string | null;    // subtitle languages grafted in
   how?: string;            // "grafted" (tracks added) | "replaced" (download became the file)
 }
+// How the on-call AI dispatcher is actually doing. `resolved`/`failed` are verdicts it produced
+// itself; `needs_human` is mostly the no-callback flip, so a wall of it with last_callback null
+// means the dispatcher never ran — which otherwise looks identical to "it examined and gave up".
+export interface AiHealth {
+  enabled: boolean; stale_min: number; last_callback: number | null;
+  pending: number; resolved: number; failed: number; needs_human: number; never_sent: number;
+}
 export interface Dash {
   enabled: boolean; grab_mode: string; scope_series: boolean;
   movies: Record<string, number>; episodes: Record<string, number>;
   active: DashActive[]; attention: DashAttention[]; recent: DashRecent[];
+  ai_working?: number;    // failures still with the AI (counted, not listed in attention)
+  ai?: AiHealth;
   merged_24h: number; merged_7d: number;
   // the 'merged' population by outcome: grafted / replaced = work we did, already = the file
   // was correct on its own and the scan simply closed the record out

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage, RepairPlan, RepairState } from "./api";
+  LibItem, LibPage, RepairPlan, RepairState, AiHealth } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -756,6 +756,47 @@ function Tile({ label, value, sub, tone, onClick }:
   );
 }
 
+// Is the on-call AI actually fixing anything? The dispatcher runs on the host, outside this app,
+// so the only evidence is whether it calls back. `resolved`/`failed` are verdicts it produced;
+// `needs_human` is mostly the no-callback flip. A wall of needs_human with no callback ever means
+// the dispatcher isn't running — which, without saying so, looks exactly like "it looked at
+// everything and gave up".
+function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
+  if (!ai || !ai.enabled) return null;
+  const seen = ai.pending + ai.resolved + ai.failed + ai.needs_human;
+  if (seen + ai.never_sent === 0) return null;
+  const verdicts = ai.resolved + ai.failed;      // outcomes it actually reported
+  const rate = verdicts > 0 ? Math.round((ai.resolved / verdicts) * 100) : null;
+  const silent = verdicts === 0 && (ai.needs_human > 0 || ai.pending > 0);
+  return (
+    <div className={`panel ${silent ? "warnbar-soft" : ""}`}>
+      <div className="row" style={{ marginBottom: 6 }}>
+        <b>🤖 On-call AI</b>
+        <span className="muted">{ai.last_callback
+          ? `last verdict ${fmtAgo(ai.last_callback, now)}`
+          : "no verdict ever received"}</span>
+      </div>
+      <div className="aistats">
+        {([["resolved", ai.resolved, "it fixed these"],
+           ["failed", ai.failed, "it examined these and could not fix them"],
+           ["needs_human", ai.needs_human, `flagged for you (includes the ${ai.stale_min}m no-callback flip)`],
+           ["pending", ai.pending, "sent, still waiting for a verdict"],
+           ["never_sent", ai.never_sent, "failed before AI review was on, or never ticketed"],
+          ] as [string, number, string][]).filter(([, n]) => n > 0).map(([k, n, tip]) => (
+          <span className={`aistat ${k}`} key={k} title={tip}>
+            {n.toLocaleString()} <i>{k.replace("_", " ")}</i></span>))}
+      </div>
+      {silent
+        ? <div className="sub bad" style={{ marginTop: 6 }}>
+            Never called back. The dispatcher (the host cron running the Claude Code CLI on
+            /config/ai-tickets) isn't reporting — so "needs you" here means it went quiet, not
+            that it examined these and gave up.</div>
+        : rate != null && <div className="sub muted" style={{ marginTop: 6 }}>
+            {rate}% of the {verdicts.toLocaleString()} it reported on were resolved.</div>}
+    </div>
+  );
+}
+
 function Overview({ goto }: { goto: (tab: string) => void }) {
   const [d, setD] = useState<Dash | null>(null);
   const [dls, setDls] = useState<Record<string, DL>>({});
@@ -835,10 +876,21 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
 
         <div>
           <div className="panel">
+            {/* Only what the on-call AI could not resolve, plus `review` (a human decision by
+                definition). Everything else that failed is still with the AI and is counted,
+                not listed — otherwise this is a list of things already being worked on. */}
             <div className="row" style={{ marginBottom: 8 }}><b>Needs attention</b>
+              {(d.ai_working ?? 0) > 0 &&
+                <span className="muted" title="failed records the AI is still working on — they appear here only if it can't fix them">
+                  {d.ai_working} with the AI</span>}
               {attention > 0 && <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
                 onClick={() => goto("review")}>Open review →</button>}</div>
-            {d.attention.length === 0 && <div className="muted">All clear 🎉</div>}
+            {d.attention.length === 0 && <div className="muted">
+              {(d.ai_working ?? 0) > 0
+                ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
+                : attention > 0
+                  ? `${attention} failure(s), none flagged for you yet.`
+                  : "All clear 🎉"}</div>}
             {d.attention.map(a => (
               // Title on ONE truncated line with the pills pinned beside it, then the message
               // below at full width. The old shape put the pills in a right-hand COLUMN, which
@@ -856,6 +908,8 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
               </div>
             ))}
           </div>
+
+          <AiHealthPanel ai={d.ai} now={d.now} />
 
           <div className="panel">
             <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b>
