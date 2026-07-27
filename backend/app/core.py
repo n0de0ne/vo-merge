@@ -76,10 +76,14 @@ DEFAULTS = {
                                            # is no Sonarr record to ask.
     "want_subs": True,                     # graft the donor's subtitles, not just its audio
     "max_sub_tracks": 2,                   # per language, keep at most this many (packs ship 6+)
-    "subs_only_gap": False,                # a file that has English AUDIO but no English SUBS:
-                                           # off (default) = subs ride along with an audio graft
-                                           # only, so nothing is downloaded purely for subtitles.
-                                           # On = chase those too (many more downloads).
+    "subs_only_gap": True,                 # chase a file that has every target AUDIO language but
+                                           # is missing a target SUBTITLE. Bazarr is the cheaper
+                                           # tool for this (a 50 KB .srt from a subtitle
+                                           # provider), but it only searches subtitle providers —
+                                           # when the sub exists solely inside a RELEASE, an
+                                           # indexer is the only place to get it. score_release
+                                           # then prefers the SMALLEST release rather than a
+                                           # matching resolution, since only the text is kept.
     "sync_tolerance_s": 2.0,
     "max_sync_retries": 4,                 # try this many different releases before giving up
     "sync_review": True,                   # low-confidence/inconclusive sync -> 'review' (human) instead of auto-reject

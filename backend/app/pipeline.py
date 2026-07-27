@@ -454,7 +454,7 @@ def _scan_tagged(cfg):
 
 
 # ---------------------------------------------------------------- SEARCH + SCORE
-def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=()):
+def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need_subs=()):
     """Score a Prowlarr result for this title, or None to reject it.
 
     `need` = the audio languages this file is still missing (its `need_audio`), and it drives
@@ -466,22 +466,45 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=()):
       bonus. So a MULTI still outranks a single-language dub, and a dub of a language we need
       outranks an unmarked release.
 
-    With no `need` recorded nothing is rejected on language grounds — the conservative default."""
+    With no `need` recorded nothing is rejected on language grounds — the conservative default.
+
+    **A SUBTITLE-only gap inverts two of these.** When the audio is already complete and only a
+    subtitle track is missing, we are harvesting a few KB of text, so:
+
+    - the language judgement must consider `need_subs` too. Otherwise `need` is empty, every
+      release that names a language reads as "a dub we already have", and a plainly useful
+      `Movie.2019.ENGLISH.1080p` gets REJECTED.
+    - video quality is irrelevant and matching the library's resolution is actively wrong: a
+      2160p remux is 60 GB and its English subtitle track is byte-identical to the 900 MB
+      WEB-DL's. So the resolution bonus is dropped and SMALL releases are preferred, which is
+      what makes chasing subtitles affordable at all. (`_place_multi` can't misfire on the
+      result — it only replaces the library file when the release's video is at least as good,
+      and a deliberately tiny release never is.)"""
     t = r.get("title", ""); tl = t.lower()
+    subs_only = bool(need_subs) and not need
+    lang_need = set(need) | set(need_subs) if subs_only else need
     idok = (imdb and r.get("imdbId") == imdb) or (tmdb and r.get("tmdbId") == tmdb)
     titleok = idok or (_toks(otitle) and
               len(_toks(otitle) & _toks(t)) / max(len(_toks(otitle)), 1) >= 0.6 and
               any(str(year + d) in t for d in (-1, 0, 1)))
     if not titleok:
         return None
-    if media.useless_release(t, need, otitle):
+    if media.useless_release(t, lang_need, otitle):
         return None                      # advertises only dubs we already have -> adds nothing
     sc = min(int(r.get("seeders") or 0), 100)
-    if want_res and want_res.lower() in tl: sc += 60
+    if subs_only:
+        # smaller is strictly better: we keep the text track and throw the rest away
+        gb = (int(r.get("size") or 0)) / 1e9
+        sc += max(0, 70 - int(gb * 7))
+    elif want_res and want_res.lower() in tl:
+        sc += 60
     if want_src and re.search(want_src[:3], tl): sc += 30
     if idok: sc += 80
-    if re.search(r'\bMULTI\b', t, re.I): sc += 200   # several langs, natively synced -> prefer
-    sc += 60 * media.lang_hits(t, need, otitle)      # names a language this file is missing
+    # MULTI is worth a lot for an AUDIO graft (several dubs, natively synced). For a subtitle it
+    # is only weak evidence the release carries more than one sub track — and at +200 it swamped
+    # the size preference, so a 38 GB MULTI beat a 2 GB release for a few KB of text.
+    if re.search(r'\bMULTI\b', t, re.I): sc += 40 if subs_only else 200
+    sc += 60 * media.lang_hits(t, lang_need, otitle)  # names a language this file is missing
     return sc
 
 
@@ -499,6 +522,7 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
     need = {x for x in (mv.get("need_audio") or "").split(",") if x}
+    need_s = {x for x in (mv.get("need_subs") or "").split(",") if x}
     try:
         results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
@@ -508,7 +532,7 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
     out = []
     for r in results:
         sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src,
-                           need=need)
+                           need=need, need_subs=need_s)
         if sc is None:
             continue
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")

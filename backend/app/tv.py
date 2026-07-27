@@ -319,12 +319,29 @@ def _abs_match(title, absn):
     return bool(re.search(rf'(?:\s-\s|\bep\.?\s*|\be)0*{int(absn)}\b', title, re.I))
 
 
-def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=()):
+# A subtitle-only gap inverts two scoring rules: the language judgement must consider the
+# SUBTITLE need (with need_audio empty, every language-marked release reads as "a dub we already
+# have" and gets rejected), and video quality stops mattering — we keep a few KB of text and
+# discard the rest, so a small release is strictly better than a matching-resolution one. See
+# pipeline.score_release for the full reasoning.
+def _subs_only(need, need_subs):
+    return bool(need_subs) and not need
+
+
+def _size_bonus(r):
+    gb = (int(r.get("size") or 0)) / 1e9
+    return max(0, 70 - int(gb * 7))
+
+
+def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=(),
+            need_subs=()):
     """Return best (score, seeders, title, link) for a usable release, or None.
     `absn` = this episode's absolute number, so an anime release that numbers absolutely
     ('Title - 51') still matches a search for its aired S04E15.
     `need` = languages still missing; a French-dub-only release is only worth grabbing when
     French is one of them (see pipeline.score_release)."""
+    subs_only = _subs_only(need, need_subs)
+    lang_need = set(need) | set(need_subs) if subs_only else need
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
         results = pro.search(query, cfg["en_indexer_ids"])
@@ -334,7 +351,7 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, need, query):
+        if media.useless_release(t, lang_need, query):
             continue                     # advertises only dubs this episode already has
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -352,9 +369,10 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
             elif not _abs_match(t, absn):
                 continue
         sc = min(int(r.get("seeders") or 0), 100)
-        if RES.search(t): sc += 20
+        if subs_only:      sc += _size_bonus(r)      # harvesting text: smaller is better
+        elif RES.search(t): sc += 20
         if re.search(r'\bMULTI\b', t, re.I): sc += 20
-        sc += 60 * media.lang_hits(t, need, query)   # names a language this episode is missing
+        sc += 60 * media.lang_hits(t, lang_need, query)  # names a language this episode is missing
         link = _pick_link(r)
         if best is None or sc > best[0]:
             best = (sc, r.get("seeders") or 0, t, link)
@@ -373,6 +391,9 @@ def season_candidates(series_id, season, cfg=None):
     # accept a pack for any season this group actually spans (and drop the Sxx from the query
     # when it spans more than one — a bare title surfaces the per-season and complete packs).
     need = {x for e in eps for x in (e.get("need_audio") or "").split(",") if x}
+    need_s = {x for e in eps for x in (e.get("need_subs") or "").split(",") if x}
+    subs_only = _subs_only(need, need_s)
+    lang_need = set(need) | need_s if subs_only else need
     rseasons = sorted({_release_se(e, cfg)[0] for e in eps}) or [season]
     query = f"{title} S{rseasons[0]:02d}" if len(rseasons) == 1 else title
     import json as _json
@@ -388,7 +409,7 @@ def season_candidates(series_id, season, cfg=None):
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, need, title):
+        if media.useless_release(t, lang_need, title):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -399,9 +420,12 @@ def season_candidates(series_id, season, cfg=None):
             continue
         sc = min(int(r.get("seeders") or 0), 100)
         if is_pack: sc += 50
-        if RES.search(t): sc += 20
-        if re.search(r"\bMULTI\b", t, re.I): sc += 200
-        sc += 120 * media.lang_hits(t, need, title)   # names a language this file is missing
+        if subs_only:      sc += _size_bonus(r)      # harvesting text: smaller is better
+        elif RES.search(t): sc += 20
+        # +200 for MULTI would swamp the size preference on a subs-only chase (see
+        # pipeline.score_release) — a 38 GB pack beating a 2 GB one for a few KB of text.
+        if re.search(r"\bMULTI\b", t, re.I): sc += 40 if subs_only else 200
+        sc += 120 * media.lang_hits(t, lang_need, title)  # names a language this file is missing
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
@@ -476,6 +500,9 @@ def episode_candidates(ep_id, cfg=None):
     season, ep = _release_se(e, cfg)          # search by the numbering releases actually use
     absn = _abs_num(e, cfg)
     need = {x for x in (e.get("need_audio") or "").split(",") if x}
+    need_s = {x for x in (e.get("need_subs") or "").split(",") if x}
+    subs_only = _subs_only(need, need_s)
+    lang_need = set(need) | need_s if subs_only else need
     import json as _json
     tried = set(_json.loads(e.get("tried") or "[]"))
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
@@ -487,7 +514,7 @@ def episode_candidates(ep_id, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, need, title):
+        if media.useless_release(t, lang_need, title):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -500,9 +527,12 @@ def episode_candidates(ep_id, cfg=None):
             continue
         sc = min(int(r.get("seeders") or 0), 100)
         if is_pack: sc += 30
-        if RES.search(t): sc += 20
-        if re.search(r"\bMULTI\b", t, re.I): sc += 200
-        sc += 120 * media.lang_hits(t, need, title)   # names a language this file is missing
+        if subs_only:      sc += _size_bonus(r)      # harvesting text: smaller is better
+        elif RES.search(t): sc += 20
+        # +200 for MULTI would swamp the size preference on a subs-only chase (see
+        # pipeline.score_release) — a 38 GB pack beating a 2 GB one for a few KB of text.
+        if re.search(r"\bMULTI\b", t, re.I): sc += 40 if subs_only else 200
+        sc += 120 * media.lang_hits(t, lang_need, title)  # names a language this file is missing
         link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
         out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
                     "title": t, "indexer": r.get("indexer"), "pack": is_pack,
@@ -599,7 +629,9 @@ def stage_search(cfg=None):
         if len(eps) >= cfg["tv_pack_threshold"]:
             q = f"{title} S{season:02d}"
             best = _search(q, cfg, want_pack=True, season=season,
-                           need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x})
+                           need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
+                           need_subs={x for e in eps
+                                      for x in (e.get("need_subs") or "").split(",") if x})
             if best:
                 sc, seed, rtitle, link = best
                 h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
@@ -624,7 +656,8 @@ def stage_search(cfg=None):
             rs, rn = rel[e["id"]]
             q = f"{title} S{rs:02d}E{rn:02d}"
             best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                           need={x for x in (e.get("need_audio") or "").split(",") if x})
+                           need={x for x in (e.get("need_audio") or "").split(",") if x},
+                           need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
             if not best or best[0] < cfg["min_seeders"]:
                 core.set_ep_status(e["id"], "no_release",
                                    candidate_title=(best[2] if best else None))

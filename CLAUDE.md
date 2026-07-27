@@ -173,8 +173,19 @@ usually ships them — so taking them costs one extra mkvmerge argument, not ano
 - `media.sub_rank()` picks *which* track when a pack ships six: full translation > forced/signs >
   SDH, and text beats image (PGS/VobSub). Grafted subs are **never default-flagged** — a default
   subtitle starts burned-in for every viewer.
-- `subs_only_gap` (default **off**): a file with English audio but no English subs is not worth a
-  whole download on its own. Turn it on to chase those too.
+- **`subs_only_gap` (default on): chasing a subtitle-only gap.** Bazarr is the cheaper tool —
+  a 50 KB `.srt` beats a multi-GB release — but it searches subtitle *providers*, and when the
+  subtitle exists only inside a *release*, an indexer is the only place to get it. Two scoring
+  rules invert when the audio is already complete and only a subtitle is missing:
+  - **the language judgement must include `need_subs`.** Otherwise `need_audio` is empty, so
+    `useless_release` reads every language-marked release as "a dub we already have" and REJECTS
+    a plainly useful `Movie.2019.ENGLISH.1080p`.
+  - **video quality stops mattering, and size starts.** A 2160p remux is 60 GB and its English
+    subtitle track is byte-identical to the 900 MB WEB-DL's, so the resolution bonus is dropped
+    and small releases are preferred. MULTI drops from +200 to +40 for the same reason: at +200
+    it swamped the size preference and a 38 GB pack beat a 2 GB one for a few KB of text.
+  `_place_multi` can't misfire on the result — it only replaces the library file when the
+  release's video is at least as good, and a deliberately tiny release never is.
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
 
