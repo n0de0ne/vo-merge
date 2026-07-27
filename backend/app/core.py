@@ -54,7 +54,12 @@ DEFAULTS = {
     "qb_tv_category": "audio-merge-tv",
     "qb_tv_download_dir": "/data/.Téléchargements/completed/audio-merge-tv",
     "tv_pack_threshold": 6,                # >= this many gap eps in a season -> grab a season pack
-    "exclude_french_origin": True,
+    # Skip French-origin titles entirely — never hunt a dub for them. Made sense when this app
+    # was "add English to a French-dub library": a French ORIGINAL has no French dub to fix.
+    # It contradicts the profile model, though, where a movie's target end state is fre+eng
+    # audio + subs regardless of where it was made — so a French film missing English really is
+    # a gap. Default off; the titles are probed and counted either way (probes.excluded).
+    "exclude_french_origin": False,
     # ---- how the gap is decided ------------------------------------------------------------
     # "files": probe every library file with mkvmerge and believe the container (accurate, and
     #          the only thing that can't go stale). "tag": the old behaviour — trust Radarr's

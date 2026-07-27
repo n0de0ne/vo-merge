@@ -49,7 +49,8 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
 merged / review / sync_fail / error / ignored.
 
 1. **scan** — decide the gap by **probing the files** (see "Gap detection" below); Radarr/Sonarr
-   supply only metadata. Skip French-origin if `exclude_french_origin`.
+   supply only metadata. `exclude_french_origin` (default **off**) stops French-origin titles
+   being *targeted*; they are probed and counted either way.
 2. **search/score** — Prowlarr search; `score_release` asks one language-agnostic question:
    *does this release carry something this file is missing?* (see "Release language scoring"),
    **strongly prefers MULTI** (+200), boosts seeders/quality/id-match. `candidates()` powers
@@ -291,7 +292,11 @@ audio-less.
 
 ### Inventory is not the same as targeting (`probes.excluded`)
 
-`exclude_french_origin` means "don't hunt an English dub for a French film". It used to `return`
+`exclude_french_origin` means "don't hunt an English dub for a French film". **It now defaults
+to off**: it made sense when the app was "add English to a French-dub library" (a French ORIGINAL
+has no French dub to fix), but it contradicts the profile model, where a movie's target end state
+is fre+eng audio + subs regardless of where it was made — so a French film missing English is a
+real gap like any other. It used to `return`
 / `continue` **before the file was ever probed**, so those titles were absent from the `probes`
 table — which is the library inventory. They vanished from the Library tab, from the per-library
 file counts and from the coverage denominator: Films reported 2,041 files against 2,429 on disk.

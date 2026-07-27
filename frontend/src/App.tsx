@@ -1604,7 +1604,11 @@ function Settings() {
         <input type="text" value={Array.isArray(val("multi_indexer_ids")) ? val("multi_indexer_ids").join(", ") : (val("multi_indexer_ids") ?? "")}
           onChange={e => set("multi_indexer_ids", e.target.value)} /><span className="muted">extra (e.g. FR trackers) for MULTI</span>
         <label>Films</label>{Check("scope_films")}<span />
-        <label>Exclude French-origin</label>{Check("exclude_french_origin")}<span />
+        <label>Skip French-origin</label>{Check("exclude_french_origin")}
+        <span className="muted">never hunt English for a film whose original language is French.
+          Off by default: the profile targets fre+eng for every film, so a French original
+          missing English is a real gap. Either way the files are probed and counted — when on,
+          they show under the Library tab's “Not targeted”.</span>
       </div>
 
       <div className="section-title">Series (Sonarr)</div>
