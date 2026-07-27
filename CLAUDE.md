@@ -456,6 +456,24 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
 
 ## Merge rules (important, non-obvious)
 
+- **Replacing outright is only for a self-sufficient release.** `_place_multi` (films) and the
+  TV direct-remux branch skip the mux and let the download BECOME the library file — which also
+  throws the library file away. The test was `gap_langs(...)[0]`, i.e. **audio only**, so a MULTI
+  with no subtitle tracks would replace a file that had French subs and silently drop them. It
+  now requires the release to meet the whole profile (audio AND subs) *and* to carry everything
+  the library file already had. `gap_langs` is deliberately not reused: it suppresses a
+  subtitle-only shortfall when `subs_only_gap` is off, exactly the case this must not ignore.
+  Sidecar `.srt` files survive either way — the replacement keeps the library file's name, so
+  they still match its stem.
+- **`merged` is not a promise that the file is complete.** A merge adds what the donor had; the
+  file can still be short of something else. Keeping the terminal status left those records
+  "done" while incomplete, and since `stage_search` only ever looks at `pending` they were never
+  reconsidered — the "merged but still missing English" rows. A scan that finds a gap on a record
+  in `REOPEN_STATES` (`merged`) resets it to `pending` and logs why. `ignored` is NOT in that set:
+  it is a deliberate give-up (a human, or the AI via `/unfixable`) and must survive a rescan.
+- **`finish_movie` re-reads the file it just wrote.** Otherwise the record keeps the languages
+  recorded at SCAN time, so a merge that added English still displayed the pre-merge track list —
+  and one that fell short looked complete — until the next library scan.
 - **Keep the better video, graft the other's audio.** `_video_quality` = (height, bitrate).
   A lower-res MULTI must NOT replace a higher-res library file — it only donates audio.
   `_place_multi` (use the download directly) fires ONLY when the release's video ≥ the library

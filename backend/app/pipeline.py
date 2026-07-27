@@ -241,6 +241,12 @@ def _free_donor(qb, h, cfg, tag=""):
 # 'ready') so new releases keep flowing while the merge queue drains. Counting ready/merging
 # here is what let two finished packs squat the cap with the merger idle.
 ACTIVE_STATES = ("downloading",)
+
+# Terminal states that mean "nothing more will happen to this record". If a scan finds the file
+# still doesn't meet its profile, the record is re-opened to `pending` — `stage_search` only
+# looks at `pending`, so anything else is a dead end. `ignored` is NOT here: it is a deliberate
+# give-up (by a human or the AI via /unfixable) and must survive a rescan.
+REOPEN_STATES = ("merged",)
 # ...but the donor FILES must survive until the merge consumes them, so the orphan sweep keeps
 # its hands off ready/merging (and review/sync_fail, kept for manual resync).
 KEEP_DONOR_STATES = ("downloading", "ready", "merging", "review", "sync_fail")
@@ -420,7 +426,17 @@ def ingest_movie(m, cfg, refresh=False):
         "quality": (((mf.get("quality") or {}).get("quality") or {}).get("name")),
         "poster": poster,
     })
-    core.set_status(m["tmdbId"], (existing or {}).get("status") or "pending",
+    # This file HAS a gap. Keeping a terminal status would leave it "done" while incomplete —
+    # and `stage_search` only ever looks at `pending`, so it would never be searched again. That
+    # is how a record ends up marked merged while still missing English: the merge added what
+    # the donor had, the file was short of something else, and nothing ever reconsidered it.
+    # `ignored` is left alone: that is a deliberate decision, not an oversight.
+    prev = (existing or {}).get("status")
+    status = "pending" if prev in REOPEN_STATES else (prev or "pending")
+    if status != prev:
+        core.log(f"scan: {m.get('title')} is marked {prev} but still needs "
+                 f"{'+'.join(miss_a + miss_s)} -> re-opening")
+    core.set_status(m["tmdbId"], status,
                     audio_langs=alangs, sub_langs=slangs, needs=need,
                     need_audio=",".join(miss_a), need_subs=",".join(miss_s))
     return "gap"
@@ -1044,7 +1060,20 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     # This used to be a literal `"fre" in rel_langs and "eng" in rel_langs`, which is the right
     # question for exactly one library shape and blind to every other profile.
     kind0 = media.kind_of(fr, mv.get("original_lang"), cfg)
-    if not media.gap_langs(*media.langs(ei), kind0, cfg)[0]:
+    # Using the download AS the library file skips the mux entirely — but it also throws the
+    # library file away, so it is only safe when the release carries everything the file would
+    # otherwise have had. The test used to be `gap_langs(...)[0]`, i.e. AUDIO ONLY: a MULTI with
+    # no subtitle tracks would replace a file that had French subs and silently drop them.
+    # gap_langs is deliberately not reused here — it suppresses a subtitle-only shortfall when
+    # subs_only_gap is off, which is exactly the case this must not ignore. (Sidecar .srt files
+    # survive: the replacement keeps the library file's name, so they still match its stem.)
+    want_a0, want_s0 = media.profile(kind0, cfg)
+    rel_a, rel_s = media.langs(ei)
+    base_a, base_s = media.langs(fi)
+    self_sufficient = (not [c for c in want_a0 if c not in rel_a]
+                       and not [c for c in want_s0 if c not in rel_s]
+                       and base_a <= rel_a and base_s <= rel_s)
+    if self_sufficient:
         if _video_quality(en, ei["dur"]) >= _video_quality(fr, fi["dur"]):
             core.set_status(tmdb_id, "merging")
             _place_multi(en, mv, cfg, tmdb_id); return
@@ -1283,7 +1312,20 @@ def finish_movie(tmdb_id, cfg=None):
         # the library file changed on disk: drop both cached probes so the next scan re-reads
         # the new track list instead of reporting the pre-merge languages
         core.forget_probe(donor); core.forget_probe(dest)
-        core.set_status(tmdb_id, "merged", merged_file=dest)
+        # Re-read the file we just wrote. Without this the record keeps the languages recorded
+        # at SCAN time, so a merge that added English still displays the pre-merge track list
+        # (and a merge that fell short looks complete) until the next library scan.
+        auds2, subs2, err2 = media.audit(dest, refresh=True)
+        miss_a2, miss_s2 = ([], []) if err2 else media.gap_langs(
+            auds2, subs2, media.kind_of(dest, mv.get("original_lang"), cfg), cfg)
+        core.set_status(tmdb_id, "merged", merged_file=dest,
+                        audio_langs=",".join(sorted(auds2)), sub_langs=",".join(sorted(subs2)),
+                        need_audio=",".join(miss_a2), need_subs=",".join(miss_s2),
+                        needs="+".join([x for x in (("audio" if miss_a2 else ""),
+                                                    ("subs" if miss_s2 else "")) if x]))
+        if miss_a2 or miss_s2:
+            core.log(f"merge {tmdb_id}: file still needs {'+'.join(miss_a2 + miss_s2)} — "
+                     f"the next scan will re-open it")
         if mv.get("radarr_id"):
             Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
         # Mirror FIRST so the -EN symlink exists, then refresh + ANALYZE both folders on every

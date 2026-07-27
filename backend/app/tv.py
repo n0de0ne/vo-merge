@@ -12,7 +12,7 @@ from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _pick_subs, _donor_opts, hold_reason)
+                       _pick_subs, _donor_opts, hold_reason, REOPEN_STATES)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -271,7 +271,14 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
             })
             if alangs is not None:
                 cur = core.get_episode(ep_id)
-                core.set_ep_status(ep_id, (cur or {}).get("status") or "pending",
+                # See pipeline.ingest_movie: a terminal status on a file that still has a gap
+                # is a dead end, because stage_search only looks at `pending`.
+                prev = (cur or {}).get("status")
+                st_ = "pending" if prev in REOPEN_STATES else (prev or "pending")
+                if st_ != prev:
+                    core.log(f"tv scan: {ep_id} is marked {prev} but still needs "
+                             f"{'+'.join(miss_a + miss_s)} -> re-opening")
+                core.set_ep_status(ep_id, st_,
                                    audio_langs=alangs, sub_langs=slangs, needs=need,
                                    need_audio=",".join(miss_a), need_subs=",".join(miss_s),
                                    orig_lang=orig_name)
@@ -714,7 +721,14 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     # eng+fre pair, so it generalises to whatever languages the profile targets.
     kind0 = media.kind_of(fr, ep.get("orig_lang"), cfg,
                           series_type=ep.get("series_type") or "standard")
-    if not media.gap_langs(*media.langs(ei), kind0, cfg)[0] \
+    # Audio-only was the old test, so a MULTI with no subtitle tracks would replace a library
+    # file that had French subs and drop them. gap_langs is not reused: it suppresses a
+    # subtitle-only shortfall when subs_only_gap is off, exactly the case this must not ignore.
+    _wa, _ws = media.profile(kind0, cfg)
+    _ra, _rs = media.langs(ei)
+    _ba, _bs = media.langs(fi)
+    if (not [c for c in _wa if c not in _ra] and not [c for c in _ws if c not in _rs]
+            and _ba <= _ra and _bs <= _rs) \
        and _video_quality(en_file, ei["dur"]) >= _video_quality(fr, fi["dur"]):
         out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -722,8 +736,12 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
+            a2, s2, e2 = media.audit(fr, refresh=True)
+            m2a, m2s = ([], []) if e2 else media.gap_langs(a2, s2, kind0, cfg)
             core.set_ep_status(ep["id"], "merged", merged_file=fr, added_langs="", error=None,
-                               merge_kind="replaced")
+                               merge_kind="replaced",
+                               audio_langs=",".join(sorted(a2)), sub_langs=",".join(sorted(s2)),
+                               need_audio=",".join(m2a), need_subs=",".join(m2s))
             core.log(f"tv merge {ep['id']}: MULTI used directly")
             try: _S(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
             except Exception: pass
