@@ -185,6 +185,13 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     return {"ok": True, "started": True, "scope": scope, "probes": core.probe_stats()}
 
 
+# The one probe error that describes the FILE rather than our tools: mkvmerge read the container
+# and found no audio, and ffprobe independently agreed. Nothing else may authorise a deletion —
+# "unsupported container" and "audio mkvmerge can't read" mean the file is probably fine and we
+# simply can't mux it, and "unreadable" means we know nothing at all.
+BROKEN_ERR = "no audio track"
+
+
 def _inventory(cfg, cols="path, auds, subs, err"):
     """Every probed library file, classified against the profile its library targets.
 
@@ -272,6 +279,7 @@ def library(state: str = "incomplete", lib: str = "", q: str = "",
     mount = (cfg.get("media_mount") or "/media").rstrip("/")
     ql, libl = q.strip().lower(), lib.strip().lower()
     counts = {"complete": 0, "incomplete": 0, "unreadable": 0}
+    errs = {}          # unreadable broken down by WHY — they are rarely all the same problem
     libs, hits = {}, []
     for (r, top, kind, want_a, want_s, have_a, have_s, miss_a,
          miss_s) in _inventory(cfg, "path, auds, subs, err, dur, probed"):
@@ -284,6 +292,8 @@ def library(state: str = "incomplete", lib: str = "", q: str = "",
         row_state = ("unreadable" if have_a is None else
                      "incomplete" if (miss_a or miss_s) else "complete")
         counts[row_state] += 1
+        if row_state == "unreadable":
+            errs[r["err"] or "unreadable"] = errs.get(r["err"] or "unreadable", 0) + 1
         if state not in ("all", row_state):
             continue
         rel = path[len(mount) + 1:] if path.startswith(mount + "/") else path
@@ -305,7 +315,184 @@ def library(state: str = "incomplete", lib: str = "", q: str = "",
     off = max(0, offset)
     return {"items": hits[off:off + max(1, min(limit, 1000))], "total": total,
             "offset": off, "counts": counts,
+            "error_kinds": dict(sorted(errs.items(), key=lambda kv: -kv[1])),
+            "repairable": errs.get(BROKEN_ERR, 0),   # the only error a repair may act on
             "libraries": [{"name": k, "total": v} for k, v in sorted(libs.items())]}
+
+
+def _owner_index(cfg, paths):
+    """Map each /media path to the *arr record that owns it.
+
+    Radarr answers in one call (`movieFile` is embedded in the movie). Sonarr has no
+    library-wide file endpoint, so only the series whose folder actually contains one of `paths`
+    is queried — a repair of 30 files costs a handful of calls, not one per series."""
+    out, want = {}, set(paths)
+    try:
+        for m in Radarr(cfg["radarr_url"], cfg["radarr_key"]).movies() or []:
+            mf = m.get("movieFile") or {}
+            p = media.to_media(mf.get("path"), cfg) if mf.get("path") else None
+            if p in want:
+                out[p] = {"arr": "radarr", "kind": "movie", "id": m["id"],
+                          "file_id": mf["id"], "title": m.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Radarr lookup failed: {e}")
+    rest = [p for p in want if p not in out]
+    if not rest:
+        return out
+    try:
+        s = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        folders = []
+        for se in s.series() or []:
+            sp = media.to_media(se.get("path"), cfg)
+            if sp:
+                folders.append((sp.rstrip("/") + "/", se))
+        cache = {}
+        for p in rest:
+            se = next((x for pre, x in folders if p.startswith(pre)), None)
+            if not se:
+                continue
+            sid = se["id"]
+            if sid not in cache:
+                efs = {}
+                for ef in s.episode_files(sid) or []:
+                    mp = media.to_media(ef.get("path"), cfg)
+                    if mp:
+                        efs[mp] = ef["id"]
+                eps = {}
+                for e in s.episodes(sid) or []:
+                    if e.get("episodeFileId"):
+                        eps.setdefault(e["episodeFileId"], []).append(e["id"])
+                cache[sid] = (efs, eps)
+            efs, eps = cache[sid]
+            fid = efs.get(p)
+            if fid:
+                out[p] = {"arr": "sonarr", "kind": "episode", "id": sid, "file_id": fid,
+                          "episode_ids": eps.get(fid, []), "title": se.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Sonarr lookup failed: {e}")
+    return out
+
+
+class RepairIn(BaseModel):
+    paths: list[str] | None = None   # None = every file currently probed as audio-less
+    dry_run: bool = True
+    limit: int = 500
+
+
+@api.post("/library/repair")
+def library_repair(body: RepairIn):
+    """Delete library files that genuinely carry no audio, and have Radarr/Sonarr fetch a
+    replacement. A file with no audio track can never be fixed by grafting — there is nothing to
+    sync against and nothing to keep — so the only repair is a new copy.
+
+    This deletes the operator's media, so it is deliberately narrow:
+
+    - **Only `no audio track`.** That error now means mkvmerge read the container AND ffprobe
+      independently found zero audio streams. The other probe errors describe our tools, not the
+      file, and are never acted on.
+    - **Every candidate is re-probed with the cache bypassed** before anything is touched, so a
+      stale row can't authorise a deletion.
+    - **A file the *arrs don't know about is skipped**, because deleting it would just lose it —
+      nothing would search for a replacement.
+    - **Deletion goes through the *arr**, which removes the file from disk *and* marks the
+      movie/episode missing. Unlinking it ourselves would leave the *arr believing it still has
+      the file, and it would never search.
+    - **`dry_run` is the default** and changes nothing.
+
+    A real run re-probes every candidate, so it takes minutes: it runs in a thread under
+    SCAN_LOCK (one heavy file pass at a time) and `GET /api/library/repair` reports progress."""
+    import threading
+    cfg = core.load_config()
+    if body.paths is None:
+        with core.db() as c:
+            paths = [r["path"] for r in
+                     c.execute("SELECT path FROM probes WHERE err=? ORDER BY path", (BROKEN_ERR,))]
+    else:
+        paths = [p for p in body.paths if p]
+    paths = paths[:max(1, min(body.limit, 2000))]
+
+    if body.dry_run:
+        # Cheap: report what a real run would attempt, from the probes already on record. The
+        # real run re-verifies each one anyway, so this list is a preview, not a promise.
+        owners = _owner_index(cfg, paths) if paths else {}
+        return {"dry_run": True, "total": len(paths),
+                "candidates": [{"path": p, "title": (owners.get(p) or {}).get("title") or "",
+                                "kind": (owners.get(p) or {}).get("kind") or "",
+                                "known": p in owners} for p in paths],
+                "unknown": sum(1 for p in paths if p not in owners)}
+
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan or repair is already running"}
+
+    def _run():
+        st = pipeline.REPAIR_STATE
+        st.update(running=True, started=time.time(), finished=0, phase="verifying",
+                  checked=0, total=len(paths), deleted=0, searched=0,
+                  skipped=[], done=[], error=None)
+        try:
+            radarr = Radarr(cfg["radarr_url"], cfg["radarr_key"])
+            sonarr = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+            confirmed = []
+            for p in paths:
+                st["checked"] += 1
+                if not os.path.exists(p):
+                    st["skipped"].append({"path": p, "reason": "already gone"})
+                    continue
+                _, _, err = media.audit(p, refresh=True)    # never trust the cache for a delete
+                if err != BROKEN_ERR:
+                    st["skipped"].append({"path": p,
+                                          "reason": f"re-probe says: {err or 'the file is fine'}"})
+                    continue
+                confirmed.append(p)
+            st["phase"] = "matching to Radarr/Sonarr"
+            owners = _owner_index(cfg, confirmed) if confirmed else {}
+            st["phase"] = "deleting"
+            for p in confirmed:
+                o = owners.get(p)
+                if not o:
+                    st["skipped"].append({"path": p, "reason":
+                        "not in Radarr/Sonarr — deleting it would just lose the title"})
+                    continue
+                try:
+                    if o["arr"] == "radarr":
+                        radarr.delete_movie_file(o["file_id"])
+                        radarr.search([o["id"]])
+                    else:
+                        sonarr.delete_episode_file(o["file_id"])
+                        if o["episode_ids"]:
+                            sonarr.search(o["episode_ids"])
+                        else:                  # no episode row points at it — re-scan instead
+                            sonarr.rescan(o["id"])
+                    core.forget_probe(p)
+                    st["deleted"] += 1
+                    st["searched"] += 1
+                    st["done"].append({"path": p, "title": o["title"], "kind": o["kind"]})
+                    core.log(f"repair: deleted audio-less {o['kind']} "
+                             f"{o['title'] or os.path.basename(p)} and asked "
+                             f"{o['arr'].title()} to search again")
+                except Exception as e:
+                    st["skipped"].append({"path": p, "reason": f"delete failed: {e}"})
+            core.prune_missing_records()
+            st["phase"] = "done"
+            core.log(f"repair: {st['deleted']} file(s) deleted and re-searched, "
+                     f"{len(st['skipped'])} skipped")
+        except Exception as e:
+            st["error"] = str(e)
+            st["phase"] = "error"
+            core.log(f"repair error: {e}")
+        finally:
+            st.update(running=False, finished=time.time())
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "total": len(paths)}
+
+
+@api.get("/library/repair")
+def library_repair_state():
+    """Progress of a running (or the last) repair pass — it re-probes every candidate, so it
+    takes minutes."""
+    return pipeline.REPAIR_STATE
 
 
 @api.get("/rescan")

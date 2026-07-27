@@ -362,3 +362,23 @@ header.top { display: flex; align-items: center; gap: 10px; }
   .libhead { display: none; }
   .librow { grid-template-columns: minmax(0, 1fr); gap: 2px; }
 }
+
+/* ---- audio-less files: the one probe error that means the FILE is broken ----
+   Deleting media is the most destructive thing this app does, so the panel reads as a warning
+   and the action is styled as one — never as just another secondary button. */
+.errkinds { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+.errkinds .ek {
+  font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+  color: var(--muted); background: var(--panel2); border: 1px solid var(--border);
+}
+.errkinds .ek b { color: var(--text); margin-left: 3px; }
+.errkinds .ek.broken {
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border-color: rgba(255, 176, 62, .4);
+}
+.panel.repair { border-color: #6b4a2c; background: #201a12; }
+.panel.repair .row > .muted { font-size: 12px; }
+.repair-plan { margin-top: 10px; font-size: 13px; }
+.repair-plan .small { font-size: 11.5px; }
+button.btn.danger { background: #8c2f2a; border: 1px solid #b1453f; color: #ffe4e2; }
+button.btn.danger:hover:not(:disabled) { background: #a1372f; }
+button.btn.danger:disabled { opacity: .5; }

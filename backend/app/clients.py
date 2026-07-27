@@ -44,6 +44,16 @@ class Radarr:
         return self._req("POST", "/api/v3/command",
                          json={"name": "RescanMovie", "movieId": movie_id})
 
+    def delete_movie_file(self, file_id):
+        """Delete the file from disk AND from Radarr's DB. Unlinking it ourselves would leave
+        Radarr believing the movie is still present, so it would never search for a replacement —
+        which is the whole point of removing a broken file."""
+        return self._req("DELETE", f"/api/v3/moviefile/{file_id}")
+
+    def search(self, movie_ids):
+        return self._req("POST", "/api/v3/command",
+                         json={"name": "MoviesSearch", "movieIds": list(movie_ids)})
+
     def ping(self):
         return self._req("GET", "/api/v3/system/status")
 
@@ -77,6 +87,14 @@ class Sonarr:
     def rescan(self, series_id):
         return self._req("POST", "/api/v3/command",
                          json={"name": "RescanSeries", "seriesId": series_id})
+
+    def delete_episode_file(self, file_id):
+        """Delete from disk AND from Sonarr's DB — see Radarr.delete_movie_file."""
+        return self._req("DELETE", f"/api/v3/episodefile/{file_id}")
+
+    def search(self, episode_ids):
+        return self._req("POST", "/api/v3/command",
+                         json={"name": "EpisodeSearch", "episodeIds": list(episode_ids)})
 
     def ping(self):
         return self._req("GET", "/api/v3/system/status")

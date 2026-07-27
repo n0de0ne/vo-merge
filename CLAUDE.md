@@ -236,6 +236,46 @@ mirrors are skipped in one place — they're symlinks to the same files and woul
 Coverage only reflects what has been **probed**, so it is empty until a scan or a re-read has run,
 and it grows as the library is read.
 
+### "Unreadable" is four different things (`media.audit`)
+
+Every probe failure used to collapse into one of two labels, and `no audio track` was the catch-all
+— which is dangerous, because that is the one diagnosis that reads as "this file is broken". An
+mkvmerge track list is empty for **four** unrelated reasons, and only one of them is about the file:
+
+| `probes.err` | what it means | act on it? |
+|---|---|---|
+| `no audio track` | mkvmerge read the container, ffprobe agrees: **zero audio streams** | yes — broken |
+| `audio mkvmerge can't read (N stream(s) per ffprobe)` | a codec we can't mux, in a container we can read | no — the file plays |
+| `unsupported container [(N audio stream(s) per ffprobe)]` | `container.recognized/supported` is false — mkvmerge can't parse the format at all, so its empty track list says nothing | no |
+| `unreadable` | neither tool could open it | no |
+
+`media.probe()` therefore returns `ok` (mkvmerge's own recognized+supported), and
+`media.ffprobe_audio()` asks a second tool. mkvmerge is the authority on what we can **mux**; it
+is not the authority on what the file **contains**. Verified on real files: a video-only MKV →
+`no audio track`; an FLV named `.mkv` **that has audio** → `unsupported container (1 audio stream)`;
+19 bytes of text named `.mkv` → `unreadable`.
+
+### Replacing audio-less files (`POST /api/library/repair`)
+
+A file with no audio at all can never be fixed by grafting — there is nothing to sync against and
+nothing to keep — so the only repair is a fresh copy. This deletes the operator's media, so it is
+narrow by construction:
+
+- **Only `no audio track`.** The other three errors above are statements about our tools.
+- **Every candidate is re-probed with the cache bypassed** before anything is touched; a stale
+  probe row can never authorise a deletion.
+- **A file the *arrs don't know about is skipped** — deleting it would just lose the title, since
+  nothing would search for a replacement.
+- **Deletion goes through the *arr** (`Radarr.delete_movie_file` / `Sonarr.delete_episode_file`,
+  then `MoviesSearch`/`EpisodeSearch`). Unlinking the file ourselves would leave the *arr believing
+  it still has it, and it would never search — the whole point of removing it.
+- **`dry_run` is the default** and changes nothing; the UI always plans before it offers the run.
+
+A real run re-probes every candidate, so it runs in a thread under `SCAN_LOCK` (one heavy file
+pass at a time) with `GET /api/library/repair` reporting progress. The Library tab's Unreadable
+view breaks the count down by error and only offers the panel when something is genuinely
+audio-less.
+
 ### A scan adds what's new; the prune drops what's gone
 
 Nothing used to remove a probe or a record, so a title deleted from the library kept being counted

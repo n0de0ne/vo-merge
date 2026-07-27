@@ -45,7 +45,21 @@ export interface LibItem {
 export interface LibPage {
   items: LibItem[]; total: number; offset: number;
   counts: { complete: number; incomplete: number; unreadable: number };
+  // unreadable broken down by WHY — "no audio track" is a broken file, the rest are our tools
+  error_kinds: Record<string, number>;
+  repairable: number;    // files carrying no audio at all: deletable + re-searchable
   libraries: { name: string; total: number }[];
+}
+export interface RepairPlan {
+  dry_run: true; total: number; unknown: number;
+  candidates: { path: string; title: string; kind: string; known: boolean }[];
+}
+export interface RepairState {
+  running: boolean; started: number; finished: number; phase: string;
+  checked: number; total: number; deleted: number; searched: number;
+  skipped: { path: string; reason: string }[];
+  done: { path: string; title: string; kind: string }[];
+  error: string | null;
 }
 export interface CoverageLib {
   name: string; kind: string; total: number; unreadable: number;
@@ -153,6 +167,14 @@ export const api = {
       state: o.state ?? "incomplete", lib: o.lib ?? "", q: o.q ?? "",
       limit: String(o.limit ?? 200), offset: String(o.offset ?? 0),
     })),
+  // delete files that carry no audio at all and let Radarr/Sonarr fetch a replacement
+  repairPlan: (paths?: string[]) =>
+    j<RepairPlan>("/api/library/repair",
+      { method: "POST", body: JSON.stringify({ dry_run: true, paths: paths ?? null }) }),
+  repairRun: (paths?: string[]) =>
+    j<{ ok: boolean; started: boolean; total?: number; note?: string }>("/api/library/repair",
+      { method: "POST", body: JSON.stringify({ dry_run: false, paths: paths ?? null }) }),
+  repairState: () => j<RepairState>("/api/library/repair"),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),

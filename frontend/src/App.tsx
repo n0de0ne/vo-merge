@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage } from "./api";
+  LibItem, LibPage, RepairPlan, RepairState } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -442,7 +442,7 @@ function LibRow({ i }: { i: LibItem }) {
       </div>
       <div className="libtracks">
         {i.state === "unreadable"
-          ? <span className="bad" title={i.err || ""}>unreadable — {i.err || "probe failed"}</span>
+          ? <span className="bad" title={i.err || ""}>⚠ {i.err || "probe failed"}</span>
           : <>
               <span title="audio languages read from the file">🔊 {i.audio.map(lang).join(", ") || <span className="muted">none tagged</span>}</span>
               <span title="subtitle languages read from the file">💬 {i.subs.map(lang).join(", ") || <span className="muted">none</span>}</span>
@@ -453,6 +453,85 @@ function LibRow({ i }: { i: LibItem }) {
           ? <span className="ok-txt">✓ meets target</span>
           : miss.length > 0 ? <span className="needs">missing {miss.join(" · ")}</span> : null}
       </div>
+    </div>
+  );
+}
+
+// A file with no audio at all can never be repaired by grafting — there is nothing to sync
+// against and nothing to keep — so the only fix is a fresh copy. Deleting through Radarr/Sonarr
+// (rather than unlinking) is what makes them mark it missing and search again.
+//
+// This deletes the operator's media, so the UI never offers a one-click destructive action: it
+// asks the backend what it WOULD do, shows that, and only then offers the run.
+function RepairPanel({ n, onDone }: { n: number; onDone: () => void }) {
+  const [plan, setPlan] = useState<RepairPlan | null>(null);
+  const [st, setSt] = useState<RepairState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  usePoll(() => { if (st?.running) api.repairState().then(setSt).catch(() => {}); },
+    3000, [st?.running]);
+
+  async function check() {
+    setBusy(true); setErr("");
+    try { setPlan(await api.repairPlan()); }
+    catch (e: any) { setErr(e.message || "check failed"); }
+    finally { setBusy(false); }
+  }
+  async function run() {
+    const known = plan!.total - plan!.unknown;
+    if (!confirm(`Delete ${known} file(s) with no audio track and ask Radarr/Sonarr to `
+      + `download a replacement?\n\nEach file is re-probed first and skipped if it turns out `
+      + `to be readable. This cannot be undone.`)) return;
+    setBusy(true); setErr("");
+    try {
+      const r = await api.repairRun();
+      if (!r.started) { setErr(r.note || "could not start"); return; }
+      setSt(await api.repairState());
+    } catch (e: any) { setErr(e.message || "repair failed"); }
+    finally { setBusy(false); }
+  }
+
+  const running = !!st?.running;
+  const finished = st && !running && st.finished > 0;
+  return (
+    <div className="panel repair">
+      <div className="row">
+        <b>🔇 {n.toLocaleString()} file(s) carry no audio at all</b>
+        <span className="muted">mkvmerge and ffprobe both read them and found zero audio streams,
+          so there is nothing to graft into — the only fix is a fresh copy.</span>
+        <div className="spacer" />
+        {!plan && <button className="btn sec" disabled={busy || running} onClick={check}>
+          {busy ? "Checking…" : "Check what can be replaced"}</button>}
+      </div>
+      {err && <div className="bad" style={{ marginTop: 6 }}>{err}</div>}
+      {plan && !running && !finished && <div className="repair-plan">
+        <div>
+          <b>{(plan.total - plan.unknown).toLocaleString()}</b> would be deleted and re-searched
+          via Radarr/Sonarr
+          {plan.unknown > 0 && <> · <b>{plan.unknown.toLocaleString()}</b> skipped — not in
+            Radarr/Sonarr, so deleting them would just lose the title</>}
+        </div>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn danger" disabled={busy || plan.total === plan.unknown}
+            onClick={run}>Delete {(plan.total - plan.unknown).toLocaleString()} and re-search</button>
+          <button className="btn sec" onClick={() => setPlan(null)}>Cancel</button>
+        </div>
+      </div>}
+      {running && <div className="muted" style={{ marginTop: 6 }}>
+        {st!.phase} · re-probed {st!.checked} of {st!.total} · deleted {st!.deleted}</div>}
+      {finished && <div className="repair-plan">
+        <div><b>{st!.deleted.toLocaleString()}</b> deleted and re-searched
+          {st!.skipped.length > 0 && <> · <b>{st!.skipped.length.toLocaleString()}</b> skipped</>}</div>
+        {st!.skipped.slice(0, 8).map(s => (
+          <div className="muted small" key={s.path}>{s.path.split("/").pop()} — {s.reason}</div>))}
+        {st!.skipped.length > 8 &&
+          <div className="muted small">+{st!.skipped.length - 8} more</div>}
+        {st!.error && <div className="bad">{st!.error}</div>}
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn sec" onClick={() => { setSt(null); setPlan(null); onDone(); }}>
+            Done</button>
+        </div>
+      </div>}
     </div>
   );
 }
@@ -507,6 +586,14 @@ function Library() {
             onChange={e => pick(setQ)(e.target.value)} style={{ minWidth: 220 }} />
         </div>
         {err && <div className="bad">{err}</div>}
+        {/* "unreadable" is not one problem. Only "no audio track" is a broken file; the others
+            say mkvmerge couldn't parse the container, which is about our tools, not the media. */}
+        {state === "unreadable" && d && Object.keys(d.error_kinds).length > 0 &&
+          <div className="errkinds">
+            {Object.entries(d.error_kinds).map(([k, n]) => (
+              <span key={k} className={k === "no audio track" ? "ek broken" : "ek"}>
+                {k} <b>{n.toLocaleString()}</b></span>))}
+          </div>}
         {d && d.total === 0 && !err &&
           <div className="muted" style={{ marginTop: 10 }}>
             {d.counts.complete + d.counts.incomplete + d.counts.unreadable === 0
@@ -528,6 +615,8 @@ function Library() {
           </div>
         </>}
       </div>
+      {state === "unreadable" && (d?.repairable ?? 0) > 0 &&
+        <RepairPanel n={d!.repairable} onDone={load} />}
       <CoveragePanel />
     </>
   );

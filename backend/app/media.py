@@ -120,14 +120,19 @@ def _track_lang(props, name):
 def probe(path):
     """Full track inventory for one media file, or None if it can't be read.
 
-    Returns {dur, fps, auds: [...], subs: [...]}. Audio/subtitle entries carry the mkvmerge
+    Returns {dur, fps, ok, auds: [...], subs: [...]}. Audio/subtitle entries carry the mkvmerge
     track `id` (what --audio-tracks/--subtitle-tracks take), the resolved `lang`, the codec,
-    and the flags that decide whether a subtitle track is a usable full translation."""
+    and the flags that decide whether a subtitle track is a usable full translation.
+
+    `ok` is mkvmerge's own "I recognise and support this container". It matters because an
+    unsupported container parses fine and yields an EMPTY track list — indistinguishable, without
+    this flag, from a file that genuinely has no audio."""
     try:
         j = json.loads(subprocess.run(["mkvmerge", "-J", path], capture_output=True,
                                       text=True, timeout=180).stdout)
     except Exception:
         return None
+    cont = j.get("container", {}) or {}
     base = os.path.basename(path)
     # A filename that advertises French subs is telling us the audio is NOT French.
     allow_fr = not _SUB_ONLY_FR.search(base)
@@ -153,9 +158,28 @@ def probe(path):
         if h:
             auds[0]["lang"] = h
             auds[0]["from_filename"] = True
-    dur = (j.get("container", {}).get("properties", {}) or {}).get("duration")
+    dur = (cont.get("properties", {}) or {}).get("duration")
     return {"dur": (dur / 1e9 if isinstance(dur, (int, float)) else None),
-            "fps": _fps(path), "auds": auds, "subs": subs}
+            "fps": _fps(path), "auds": auds, "subs": subs,
+            "ok": bool(cont.get("recognized")) and bool(cont.get("supported"))}
+
+
+def ffprobe_audio(path):
+    """How many audio streams ffmpeg sees, or None if ffprobe couldn't read the file either.
+
+    mkvmerge is the source of truth for what we can MUX, but it is not the source of truth for
+    what the file CONTAINS: a codec it can't handle inside a container it can read comes back as
+    an empty track list. That difference is the whole question when deciding whether a file is
+    broken, so ask a second tool before saying it has no audio."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                            "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return len([x for x in r.stdout.splitlines() if x.strip()])
 
 
 def _fps(path):
@@ -330,8 +354,20 @@ def audit(path, refresh=False):
         return set(), set(), "unreadable"
     a, s = langs(info)
     if not info["auds"]:
-        core.put_probe(path, dur=info["dur"], fps=info["fps"], err="no audio track")
-        return set(), set(), "no audio track"
+        # Four very different situations used to collapse into one "no audio track" — including
+        # a file mkvmerge simply can't parse, whose track list is empty for that reason alone.
+        # Only the last is a broken FILE; the others are statements about our tools. Anything
+        # destructive keys off "no audio track", so the distinction has to be made here.
+        n = ffprobe_audio(path)
+        if not info.get("ok"):                             # mkvmerge can't parse this container
+            err = ("unreadable" if n is None else
+                   f"unsupported container ({n} audio stream(s) per ffprobe)" if n else
+                   "unsupported container")
+        elif n is None:    err = "unreadable"              # ffprobe can't open it either
+        elif n > 0:        err = f"audio mkvmerge can't read ({n} stream(s) per ffprobe)"
+        else:              err = "no audio track"          # both tools agree: there is none
+        core.put_probe(path, dur=info["dur"], fps=info["fps"], err=err)
+        return set(), set(), err
     core.put_probe(path, dur=info["dur"], fps=info["fps"], auds=",".join(sorted(a)),
                    subs=",".join(sorted(s)), ntracks=len(info["auds"]))
     return a, s, None

@@ -76,6 +76,13 @@ SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finishe
               # files that vanished from the library since the last pass and were dropped
               "pruned": None, "pruned_records": None}
 
+# progress of the current/last "delete the audio-less files and re-search" pass. It re-probes
+# every candidate before touching it, so it is minutes-long and needs the same live reporting as
+# a scan. It takes SCAN_LOCK for the same reason a scan does: one heavy file pass at a time.
+REPAIR_STATE = {"running": False, "started": 0, "finished": 0, "phase": "",
+                "checked": 0, "total": 0, "deleted": 0, "searched": 0,
+                "skipped": [], "done": [], "error": None}
+
 # Language detection in release names now lives in media._DUB_MARKERS, which carries a marker
 # per language so scoring works for any profile — the old FR_DUB / EN_OK / EN_AUDIO trio only
 # knew "French dub" and "English/MULTI" and was blind to every other target.
