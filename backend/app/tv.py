@@ -13,8 +13,8 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
-                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat, run_mux,
-                       SearchUnavailable)
+                       CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
+                       run_mux, SearchUnavailable)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -627,7 +627,7 @@ def retry_episode(ep_id, cfg=None):
     # attempts is reset because an operator asking for a retry means "try again": a sync_fail
     # record has already spent its budget and would otherwise fail straight back to sync_fail.
     core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
-                       **DONOR_RESET, progress="")
+                       **DONOR_RESET, **AI_RESET, progress="")
     return True
 
 

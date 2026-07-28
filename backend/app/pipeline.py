@@ -292,6 +292,18 @@ def reopen_status(prev, updated, cfg):
 DONOR_RESET = dict(dl_hash=None, dl_id=None, en_file=None,
                    sync_offset_ms=0, sync_drift=None, sync_manual=0)
 
+# The AI's verdict describes the attempt that FAILED. Once a record is re-queued for a fresh one
+# it is void, and leaving it behind is what kept retried records sitting in the Review tab flagged
+# "needs you" — a row badged `pending`, already searching again, still captioned "AI did not
+# respond within 60m". The list is filtered on ai_status, so the stale flag alone is enough to
+# keep it there forever; "Retry N failed" then reports a tiny N against a list of a thousand.
+# The durable record of what the AI said is the log, not these columns.
+AI_RESET = dict(ai_status=None, ai_verdict=None, ai_at=None)
+
+# ...but a record whose status still IS a problem keeps its verdict, and so does `ignored`: that
+# is a deliberate give-up (usually the AI's own /unfixable), and the reason is the point of it.
+AI_KEEP_STATES = ("error", "review", "sync_fail", "ignored")
+
 
 def _beat(kind, ident, progress):
     """Write merge progress AND bump `updated`, so a running merge is visibly alive.
@@ -1071,7 +1083,7 @@ def retry_movie(tmdb_id, cfg=None):
         except Exception as ex:
             core.log(f"retry {tmdb_id}: donor drop failed: {ex}")
     core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
-                    **DONOR_RESET, progress="")
+                    **DONOR_RESET, **AI_RESET, progress="")
     return True
 
 

@@ -514,3 +514,31 @@ def test_once_false_still_refuses_to_clobber_an_undispatched_ticket(app_env):
     assert app_env.ticket("errors-review", "first", {"records": []}, key="k1", once=False) is True
     # still on disk -> a second page must not replace it
     assert app_env.ticket("errors-review", "second", {"records": []}, key="k2", once=False) is False
+
+
+def test_retrying_clears_the_previous_attempts_ai_verdict(app_env, monkeypatch):
+    """The Review tab filters on ai_status, and neither retry path cleared it — so a record that
+    had already been re-queued sat in the list forever wearing the verdict of the attempt that
+    failed. The symptom is a row badged `pending`, searching again, captioned "AI did not respond
+    within 60m", while "Retry N failed" reports a tiny N against a list of a thousand."""
+    from app import pipeline
+    app_env.upsert_movie({"tmdb_id": 30, "imdb_id": "tt30", "radarr_id": 30, "title": "T",
+                          "original_title": "T", "year": 2026, "original_lang": "english",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(30, "error", error="grab: torrent never appeared", dl_id="rel-A",
+                       attempts=4, ai_status="needs_human", ai_verdict="no donor exists",
+                       ai_at=1.0)
+    assert pipeline.retry_movie(30, dict(app_env.DEFAULTS, qb_url="http://127.0.0.1:1")) is True
+    mv = app_env.get_movie(30)
+    assert mv["status"] == "pending"
+    assert mv["ai_status"] is None and mv["ai_verdict"] is None and mv["ai_at"] is None
+    assert mv["attempts"] == 0                      # an operator retry means "try again"
+    assert "rel-A" in mv["tried"], "the release that failed must stay blocklisted"
+
+
+def test_a_deliberate_give_up_keeps_its_recorded_reason(app_env):
+    """`ignored` is the AI's /unfixable verdict — clearing that would turn a considered give-up
+    back into an unexplained skip, which is the whole thing /unfixable exists to avoid."""
+    from app import pipeline
+    assert "ignored" in pipeline.AI_KEEP_STATES
+    assert set(pipeline.AI_RESET) == {"ai_status", "ai_verdict", "ai_at"}

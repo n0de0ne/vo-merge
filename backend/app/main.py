@@ -1093,7 +1093,7 @@ def unignore(tmdb_id: int):
 @api.post("/movie/{tmdb_id}/research")
 def research(tmdb_id: int):
     # search again now (keeps the tried-blocklist so it won't re-pick known-bad releases)
-    core.set_status(tmdb_id, "pending", error=None, **pipeline.DONOR_RESET)
+    core.set_status(tmdb_id, "pending", error=None, **pipeline.DONOR_RESET, **pipeline.AI_RESET)
     try:
         pipeline.search_movie(tmdb_id)
     except pipeline.SearchUnavailable as e:
@@ -1118,7 +1118,7 @@ def another(tmdb_id: int):
     except Exception:
         pass
     core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
-                    **pipeline.DONOR_RESET)
+                    **pipeline.DONOR_RESET, **pipeline.AI_RESET)
     try:
         pipeline.search_movie(tmdb_id)
     except pipeline.SearchUnavailable as e:

@@ -1437,8 +1437,13 @@ function Review() {
       api.movies("review"), api.movies("sync_fail"), api.movies("error"), api.tvEpisodes(),
     ]);
     setMovies([...rv, ...sf, ...er]);
-    setEps(allEps.filter(e =>
-      ["error", "sync_fail"].includes(e.status) || aiUnfixed(e.ai_status)));
+    // Filter on the pipeline STATUS, with ai_status as a modifier on those rows — never as an
+    // independent trigger. The `|| aiUnfixed(...)` this replaces meant a record that had already
+    // been retried (now `pending`, searching again) stayed listed forever on the strength of the
+    // verdict from its previous attempt: the screenshot symptom of a row badged `pending` and
+    // captioned "AI did not respond within 60m". This is the same set the dashboard's attention
+    // panel uses, so the two can no longer disagree about what needs you.
+    setEps(allEps.filter(e => ["error", "sync_fail", "review"].includes(e.status)));
   }
   usePoll(refresh, 8000);
 
