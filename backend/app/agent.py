@@ -18,6 +18,7 @@ Two things live here, both aimed at that:
   same kind ("already awaiting dispatch"), so a file that has been there for days is the closest
   thing to direct evidence that nothing on the host is reading them.
 """
+import json
 import os
 import time
 
@@ -137,6 +138,43 @@ def episode_context(e):
 
 
 TICKET_DIR = os.path.join(core.CONFIG_DIR, "ai-tickets")
+
+
+def _ticket_files():
+    try:
+        return [os.path.join(TICKET_DIR, n) for n in os.listdir(TICKET_DIR)
+                if n.endswith(".json")]
+    except OSError:
+        return []                # no ticket has ever been filed; the dir is created lazily
+
+
+def undispatched():
+    """Records whose ticket is STILL SITTING in the directory, i.e. the dispatcher has not
+    reached them yet. Keys are "movie:<tmdb_id>" / "episode:<ep_id>".
+
+    This is what stops the `ai_stale_min` sweep from lying. The dispatcher handles a couple of
+    tickets per cron firing, so a backlog bigger than its throughput — one bad season pack is
+    400 episodes — guarantees that most records sit untouched for well over an hour. Ageing
+    those out to `needs_human` reports "the AI examined this and gave up" about a record no
+    agent has yet opened. The timeout should measure how long the DISPATCHER has had it, not
+    how long the ticket has existed."""
+    keys = set()
+    for path in _ticket_files():
+        name = os.path.basename(path)[:-5]
+        if name.startswith("review-m"):
+            keys.add(f"movie:{name[8:]}")
+            continue
+        if name.startswith("review-e"):
+            keys.add(f"episode:{name[8:]}")
+            continue
+        try:                     # errors-review.json covers a whole batch; read who is in it
+            t = json.load(open(path))
+        except Exception:
+            continue
+        for rec in (t.get("context") or {}).get("records") or []:
+            if rec.get("type") and rec.get("id") is not None:
+                keys.add(f"{rec['type']}:{rec['id']}")
+    return keys
 
 
 def status(cfg=None):

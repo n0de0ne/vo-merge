@@ -6,7 +6,7 @@ Search & merge logic is ported verbatim from the validated dry-run scripts.
 import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
-from . import core, sync, media
+from . import agent, core, sync, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex
 
 class _MergeGate:
@@ -824,11 +824,19 @@ def ai_health_check(cfg=None):
                          "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
                     key=key)
 
-    # staleness: a record we sent to the AI that never got a callback within ai_stale_min and is
-    # STILL in a problem state -> the dispatcher likely crashed/failed silently. Flag it for a human.
+    # Staleness: a record the dispatcher took and never reported on within ai_stale_min, still in
+    # a problem state -> it crashed or failed silently. Flag it for a human.
+    #
+    # "Took" is the operative word. A record whose ticket is STILL SITTING in /config/ai-tickets
+    # is one the dispatcher hasn't opened yet — it handles a couple per cron firing, so a backlog
+    # bigger than its throughput (one bad season pack is 400 episodes) leaves most records
+    # untouched for hours. Ageing those out claims "the AI examined this and gave up" about
+    # something no agent has looked at, and it is why a stalled dispatcher and a slow one used to
+    # be indistinguishable. The timeout measures how long the dispatcher has HELD the ticket.
     stale_cut = now - cfg.get("ai_stale_min", 60) * 60
     verdict = f"AI did not respond within {cfg.get('ai_stale_min', 60)}m — needs manual review"
     try:
+        queued = agent.undispatched()
         with core.db() as c:
             stale_m = [dict(r) for r in c.execute(
                 "SELECT tmdb_id, status FROM movies WHERE ai_status='pending' AND ai_at < ? "
@@ -836,12 +844,16 @@ def ai_health_check(cfg=None):
             stale_e = [dict(r) for r in c.execute(
                 "SELECT id, status FROM episodes WHERE ai_status='pending' AND ai_at < ? "
                 "AND status IN ('error','sync_fail')", (stale_cut,))]
+        stale_m = [m for m in stale_m if f"movie:{m['tmdb_id']}" not in queued]
+        stale_e = [e for e in stale_e if f"episode:{e['id']}" not in queued]
         for m in stale_m:
             core.set_status(m["tmdb_id"], m["status"], ai_status="needs_human", ai_verdict=verdict)
         for e in stale_e:
             core.set_ep_status(e["id"], e["status"], ai_status="needs_human", ai_verdict=verdict)
         if stale_m or stale_e:
             core.log(f"ai staleness: {len(stale_m) + len(stale_e)} record(s) had no AI callback -> needs_human")
+        if queued:
+            core.log(f"ai staleness: {len(queued)} record(s) still awaiting dispatch -> left pending")
     except Exception as ex:
         core.log(f"ai staleness check failed: {ex}")
 

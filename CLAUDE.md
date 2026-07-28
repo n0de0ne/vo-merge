@@ -751,6 +751,14 @@ Two things make that visible instead of mysterious:
   container that nothing on the host is reading them. It is evidence, not proof (a dispatcher
   could run and leave the files), so the On-call AI panel pairs it with `last_callback`, which is.
 
+**The `ai_stale_min` timeout measures how long the dispatcher has HELD a ticket**, not how long
+the ticket has existed (`agent.undispatched()`, consulted by the staleness sweep). The host script
+handles a couple of tickets per cron firing, so a backlog bigger than its throughput — one bad
+season pack is 400 episodes — leaves most records untouched for hours. Ageing those out claimed
+"the AI examined this and gave up" about records no agent had opened, and made a *slow* dispatcher
+indistinguishable from a *dead* one. A record whose own `review-m{id}`/`review-e{id}` ticket is
+still on disk — or which is listed in a still-present `errors-review.json` — is left `pending`.
+
 When both say nothing is happening, the panel says so plainly and points at the user script rather
 than leaving "N need you" to be read as a considered give-up.
 
