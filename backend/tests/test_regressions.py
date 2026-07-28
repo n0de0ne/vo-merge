@@ -490,3 +490,27 @@ def test_enqueue_merge_reports_when_nothing_will_drain_the_queue(app_env):
     app_env.save_config({"enabled": True, "paused": False})
     queued, note = pipeline.enqueue_merge("movie", 23)
     assert queued is True and note == ""
+
+
+def test_a_record_that_fails_again_actually_gets_a_new_ticket(app_env):
+    """Pruning ai_seen_records.json let a recovered-then-re-failed record become "new" again —
+    but core.ticket keys the batch on a hash of the record ids, so the identical set produced the
+    identical key and the (kind,key) guard silently refused to write the ticket. The record was
+    already stamped ai_status='pending', and with nothing on disk `undispatched()` couldn't see
+    it either, so the staleness sweep reported "the AI did not respond within 60m" about a page
+    that was never sent — the exact failure this whole mechanism exists to make visible."""
+    key = "abc123"
+    assert app_env.ticket("errors-review", "first", {"records": []}, key=key) is True
+    os.remove(os.path.join(app_env.CONFIG_DIR, "ai-tickets", "errors-review.json"))
+
+    # same record-set failing again: the once-only guard would refuse this
+    assert app_env.ticket("errors-review", "again", {"records": []}, key=key) is False
+    assert app_env.ticket("errors-review", "again", {"records": []}, key=key, once=False) is True
+
+
+def test_once_false_still_refuses_to_clobber_an_undispatched_ticket(app_env):
+    """The other guard must survive: a ticket the dispatcher has not picked up yet is work in
+    flight, and overwriting it would lose whatever it listed."""
+    assert app_env.ticket("errors-review", "first", {"records": []}, key="k1", once=False) is True
+    # still on disk -> a second page must not replace it
+    assert app_env.ticket("errors-review", "second", {"records": []}, key="k2", once=False) is False

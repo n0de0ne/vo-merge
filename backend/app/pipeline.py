@@ -883,13 +883,12 @@ def ai_health_check(cfg=None):
     # ai_tickets_filed.json is capped at 3000. Newly-paged keys are in `live` by construction, so
     # intersecting keeps them.
     stale = seen - live
-    if stale or news:
-        seen &= live
-        json.dump(sorted(seen), open(seen_path, "w"))
-        if stale:
-            core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
+    filed = True
+    if news:
         key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
-        core.ticket("errors-review",
+        # once=False: the per-record dedup above already decided these are NEW pages, and the
+        # (kind,key) guard would refuse the identical record-set a second time — see core.ticket.
+        filed = core.ticket("errors-review",
                     f"{len(news)} NEW record(s) in error/review/sync_fail",
                     {"records": news[:60], "total_new": len(news),
                      "api": agent._api_hint(),
@@ -928,7 +927,18 @@ def ai_health_check(cfg=None):
                          "act on a result with POST /movie|episode/{id}/grab {\"link\":...}.",
                          "POST /movie|episode/{id}/another | /research | /retry | /ignore",
                          "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
-                    key=key)
+                    key=key, once=False)
+    if stale or (news and filed):
+        # Only remember records whose ticket actually reached the directory. Marking them seen
+        # when the write was refused (a previous errors-review.json still awaiting dispatch)
+        # meant they were never paged again once it was consumed.
+        seen &= live
+        with open(seen_path, "w") as f:
+            json.dump(sorted(seen), f)
+        if stale:
+            core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
+    elif news and not filed:
+        core.log(f"ai: {len(news)} record(s) not paged yet (a ticket is still awaiting dispatch)")
 
     # Staleness: a record the dispatcher took and never reported on within ai_stale_min, still in
     # a problem state -> it crashed or failed silently. Flag it for a human.

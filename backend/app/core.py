@@ -338,14 +338,22 @@ def log(msg: str):
     print(line, flush=True)
 
 
-def ticket(kind, summary, context=None, key=None, force=False):
+def ticket(kind, summary, context=None, key=None, force=False, once=True):
     """File an issue ticket for the host's AI dispatcher (an Unraid user script cron
     that runs the Claude Code CLI on each ticket). Tickets land in /config/ai-tickets/
     which the host reads as appdata/vo-merge/ai-tickets/. A (kind,key) pair is filed
     only once (persisted in ai_tickets_filed.json) so a standing condition doesn't
     re-page after being handled. force=True (operator-initiated, e.g. the Review tab's
     Send-to-AI button) skips the once-only guard and overwrites a pending same-kind
-    ticket. Returns True if a ticket was filed."""
+    ticket. Returns True if a ticket was filed.
+
+    `once=False` skips ONLY the (kind,key) guard, keeping the "already awaiting dispatch"
+    one. `ai_health_check` needs that: it keys its batch on a hash of the record ids, so the
+    same record failing again months later produces the same key and was silently refused a
+    ticket — while the record had already been stamped ai_status='pending'. With no ticket on
+    disk, `undispatched()` couldn't see it either, so the staleness sweep then reported "the AI
+    did not respond within 60m" about a page that was never sent. That path does its own
+    per-record dedup (ai_seen_records.json), which is what makes this guard redundant there."""
     try:
         seen_path = os.path.join(CONFIG_DIR, "ai_tickets_filed.json")
         try:
@@ -354,7 +362,7 @@ def ticket(kind, summary, context=None, key=None, force=False):
         except Exception:
             seen = set()
         k = f"{kind}:{key or ''}"
-        if k in seen and not force:
+        if once and k in seen and not force:
             return False
         d = os.path.join(CONFIG_DIR, "ai-tickets")
         os.makedirs(d, exist_ok=True)
