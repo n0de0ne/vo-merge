@@ -14,7 +14,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
                        CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
-                       run_mux, SearchUnavailable)
+                       run_mux, SearchUnavailable, _sync_fail_reason)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -759,6 +759,32 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
 
 
 # ------------------------------------------------------------------ FINISH (map + merge)
+def _reject_and_retry_ep(ep, reason, cfg, delta=None, final="sync_fail"):
+    """This episode's donor didn't sync: blocklist that release and go back for another, or land
+    in `final` once max_sync_retries is spent.
+
+    TV had no such path at all — a sync failure went straight to `sync_fail` on the FIRST attempt
+    with `attempts` never incremented, so the retry budget the movie path spends was dead code
+    here and every framerate mismatch was terminal on one try.
+
+    The donor torrent is deliberately NOT deleted: it is usually a season pack that other episodes
+    are still merging from. `free_donor_if_done` releases it once nobody needs it."""
+    import json as _json
+    tried = _json.loads(ep.get("tried") or "[]")
+    if ep.get("dl_id") and ep["dl_id"] not in tried:
+        tried.append(ep["dl_id"])
+    attempts = (ep.get("attempts") or 0) + 1
+    if attempts >= cfg.get("max_sync_retries", 4):
+        core.set_ep_status(ep["id"], final, tried=_json.dumps(tried), attempts=attempts,
+                           sync_delta=delta, progress="",
+                           error=f"{reason}; no compatible release after {attempts} tries")
+        core.log(f"tv merge {ep['id']}: {final} after {attempts} tries ({reason})")
+        return
+    core.set_ep_status(ep["id"], "pending", tried=_json.dumps(tried), attempts=attempts,
+                       **DONOR_RESET, error=None, progress="")
+    core.log(f"tv merge {ep['id']}: {reason} -> blocklisted, re-searching (attempt {attempts})")
+
+
 def _merge_episode(ep, en_file, cfg, hint=None):
     """Share the movie merge gate (max_parallel_merges) so merges can't peg CPU/GPU.
     `hint` = (offset, drift) from a pack-mate, to skip full sync detection when it matches.
@@ -884,10 +910,12 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
-            why = ("framerates differ but no reliable drift could be measured"
-                   if (m is not None and fps_diff and not drift)
-                   else "couldn't sync (incompatible release/cut)")
-            core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta, progress="", error=why); return
+            # Spend the automatic budget on ANOTHER release before settling — see
+            # pipeline.reject_and_retry. This used to be terminal on the first attempt.
+            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+            _reject_and_retry_ep(ep, why, cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")

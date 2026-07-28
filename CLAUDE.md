@@ -648,9 +648,19 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
 - **Framerate mismatch → drift, not reject.** Don't reject on differing fps; let
   `sync.detect()` measure a **linear drift** and apply `mkvmerge --sync TID:offset,num/den`.
   Only bail if auto-sync is off, or if fps differ but no reliable drift could be measured.
-- **Sync confidence gates outcome.** `sync.detect()` returns `(offset_ms|None, conf, method,
-  drift)`. None / low-confidence / inconsistent → `review` (if `sync_review`) or retry another
-  release. `merge_movie` sets status to **`merging` BEFORE** detection and streams a per-window
+- **Sync confidence gates outcome, but a human is the LAST resort.** `sync.detect()` returns
+  `(offset_ms|None, conf, method, drift)`. None / low-confidence / inconsistent →
+  `reject_and_retry`, which blocklists that release and fetches a DIFFERENT one, up to
+  `max_sync_retries`; only once that budget is spent does it land in `review` (if `sync_review`)
+  or `sync_fail`. `sync_review` used to short-circuit on the FIRST failure, so the four-release
+  budget was never spent and every mismatch became a manual "pick another release" that nothing
+  in the pipeline would ever do for you — the one instruction an unattended system cannot follow.
+  TV had no retry path at all and was terminal on one try. `review` KEEPS the donor, because the
+  point of that state is that someone can still align this exact pair with `/set_sync`.
+  The message itself is now actionable: it states both framerates and the exact stretch to apply
+  (`_sync_fail_reason`, snapped to the textbook transfer ratio since ffprobe rounds 23.976), so
+  the on-call AI can go straight to `/set_sync {"drift": …}` rather than being told to pick a
+  release by hand. `merge_movie` sets status to **`merging` BEFORE** detection and streams a per-window
   `progress` field (UI polls every 8s).
 - Output replaces the library (French) file in place; forced `.mkv`; named after the library file.
 

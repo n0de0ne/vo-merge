@@ -542,3 +542,54 @@ def test_a_deliberate_give_up_keeps_its_recorded_reason(app_env):
     from app import pipeline
     assert "ignored" in pipeline.AI_KEEP_STATES
     assert set(pipeline.AI_RESET) == {"ai_status", "ai_verdict", "ai_at"}
+
+
+def test_a_sync_failure_tries_other_releases_before_asking_a_human(app_env):
+    """`sync_review: True` (the default) sent EVERY sync failure straight to `review` on the
+    first attempt, so max_sync_retries — the budget that exists to try four DIFFERENT releases —
+    was never spent. The operator was told to "pick another release" by a pipeline that would
+    happily have done it. Review is what happens when that budget is gone, not instead of it."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, qb_url="http://127.0.0.1:1", max_sync_retries=4, sync_review=True)
+    app_env.upsert_movie({"tmdb_id": 40, "imdb_id": "tt40", "radarr_id": 40, "title": "T",
+                          "original_title": "T", "year": 2018, "original_lang": "danish",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    seen = []
+    for i in range(1, 5):
+        app_env.set_status(40, "merging", dl_id=f"rel-{i}", dl_hash=f"h{i}")
+        pipeline.reject_and_retry(40, "couldn't sync", cfg, 14.9, final="review")
+        seen.append(app_env.get_movie(40)["status"])
+    assert seen[:3] == ["pending"] * 3, "the first three failures must fetch another release"
+    assert seen[3] == "review", "only the exhausted budget reaches a human"
+    mv = app_env.get_movie(40)
+    assert mv["attempts"] == 4
+    assert json.loads(mv["tried"]) == [f"rel-{i}" for i in range(1, 5)]
+    assert mv["dl_hash"] == "h4", "review keeps the donor — /set_sync needs the file"
+
+
+def test_the_framerate_message_carries_the_ratio_to_apply(app_env):
+    """The old text named a manual action and withheld the one fact that makes the automatic one
+    possible. The stretch is just donor_fps/base_fps, so the message now states it — snapped to
+    the textbook transfer ratio, since ffprobe reports 23.976 rather than 24000/1001."""
+    from app import pipeline
+    msg = pipeline._sync_fail_reason(1200, True, None, base_fps=23.976, donor_fps=25.0)
+    assert "1.0427083" in msg, msg          # film -> PAL, not the 1.0427094 raw division
+    assert "/set_sync" in msg
+    # a ratio that is NOT a standard transfer must not be snapped to one
+    odd = pipeline._sync_fail_reason(1200, True, None, base_fps=23.976, donor_fps=30.0)
+    assert "1.2512513" in odd, odd
+
+
+def test_tv_sync_failure_is_no_longer_terminal_on_the_first_try(app_env):
+    """TV went straight to sync_fail with `attempts` never incremented, so the retry budget was
+    dead code there and one framerate mismatch ended the episode permanently."""
+    from app import tv
+    cfg = dict(app_env.DEFAULTS, max_sync_retries=4, sync_review=True)
+    app_env.upsert_episode({"id": "7:1:1", "series_id": 7, "series_title": "S", "tvdb_id": 1,
+                            "season": 1, "episode": 1, "french_path": "/y.mkv",
+                            "quality": "1080p"})
+    app_env.set_ep_status("7:1:1", "merging", dl_id="rel-1", dl_hash="pack")
+    tv._reject_and_retry_ep(app_env.get_episode("7:1:1"), "couldn't sync", cfg, final="review")
+    e = app_env.get_episode("7:1:1")
+    assert e["status"] == "pending" and e["attempts"] == 1
+    assert "rel-1" in e["tried"]

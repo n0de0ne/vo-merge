@@ -1035,9 +1035,37 @@ def sweep_stalled(cfg=None):
             drop_stalled(mv, t, cfg)
 
 
-def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
+def _sync_fail_reason(m, fps_diff, drift, base_fps, donor_fps):
+    """Why a sync attempt was rejected, phrased so the NEXT actor can act on it.
+
+    "framerates differ but no reliable drift could be measured — review or pick another release"
+    named a manual action and withheld the one fact that makes the automatic one possible: the two
+    framerates. The stretch mkvmerge needs is just donor_fps/base_fps, so putting the numbers and
+    the computed ratio in the message means the on-call AI can go straight to
+    `/set_sync {"drift": …}` instead of guessing — or reading them back out of a probe."""
+    if m is not None and fps_diff and not drift:
+        if base_fps and donor_fps:
+            k = donor_fps / base_fps
+            # ffprobe reports 23.976 rounded, not 24000/1001, so the raw division lands a hair off
+            # the real transfer ratio. Snap to the textbook value when it is obviously the one
+            # meant — that is the number to hand someone, and mkvmerge applies it exactly.
+            near = min(sync.RATE_RATIOS, key=lambda r: abs(r - k))
+            if abs(near - k) < 1e-3 and abs(near - 1.0) > 1e-9:
+                k = near
+            return (f"framerates differ ({donor_fps} donor vs {base_fps} library) and the rate "
+                    f"test could not confirm a stretch; the arithmetic ratio is {k:.7f} "
+                    f"(POST /set_sync {{\"drift\": {k:.7f}}} to apply it)")
+        return "framerates differ but no reliable drift could be measured"
+    return "low-confidence sync"
+
+
+def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
     """A grabbed release didn't sync. Blocklist it, delete its download, and re-search for
-    another release — or give up (sync_fail) after max_sync_retries."""
+    another release — or land in `final` once max_sync_retries is spent.
+
+    `final="review"` asks a human instead of giving up, and KEEPS the donor: the whole point of
+    that state is that someone (or the on-call AI, via /sync_probe then /set_sync) can still
+    align this exact pair, and that needs the file to still be there."""
     import json as _json
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
@@ -1045,16 +1073,19 @@ def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
     if mv.get("dl_id") and mv["dl_id"] not in tried:
         tried.append(mv["dl_id"])
     attempts = (mv.get("attempts") or 0) + 1
-    try:
-        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
-        if mv.get("dl_hash"):
-            qb.delete([mv["dl_hash"]], delete_files=True)
-    except Exception:
-        pass
-    if attempts >= cfg.get("max_sync_retries", 4):
-        core.set_status(tmdb_id, "sync_fail", tried=_json.dumps(tried), attempts=attempts,
+    spent = attempts >= cfg.get("max_sync_retries", 4)
+    keep_donor = spent and final == "review"
+    if not keep_donor:
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            if mv.get("dl_hash"):
+                qb.delete([mv["dl_hash"]], delete_files=True)
+        except Exception:
+            pass
+    if spent:
+        core.set_status(tmdb_id, final, tried=_json.dumps(tried), attempts=attempts, progress="",
                         sync_delta=delta, error=f"{reason}; no compatible release after {attempts} tries")
-        core.log(f"merge {tmdb_id}: giving up after {attempts} tries ({reason})")
+        core.log(f"merge {tmdb_id}: {final} after {attempts} tries ({reason})")
     else:
         core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
                         **DONOR_RESET, error=None)
@@ -1445,15 +1476,16 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             # m is None  -> inconsistent/low-confidence sync.
             # fps_diff & no drift -> framerates differ but only a constant offset was found
             #   (e.g. audio fallback); a constant can't correct frame drift, so don't risk it.
-            why = ("framerates differ but no reliable drift could be measured"
-                   if (m is not None and fps_diff and not drift)
-                   else "low-confidence sync")
-            if cfg.get("sync_review", True):
-                core.set_status(tmdb_id, "review", sync_delta=delta, progress="",
-                                error=f"{why} — review or pick another release")
-                core.log(f"merge {tmdb_id}: {why} -> review")
-            else:
-                reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta)
+            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+            # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit here
+            # on the very first failure, so `max_sync_retries` — the budget that exists to try
+            # four DIFFERENT releases — was never spent, and every sync failure became a manual
+            # "pick another release" that nothing in the pipeline would ever do for you. A
+            # different release is by far the likeliest fix (one at the library's own framerate
+            # simply works), it is fully automatic, and it costs a download slot. Review is what
+            # happens when that budget is GONE, not instead of it.
+            reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
+                             final="review" if cfg.get("sync_review", True) else "sync_fail")
             return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
