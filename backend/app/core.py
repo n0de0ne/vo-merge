@@ -167,13 +167,23 @@ DEFAULTS = {
 _lock = threading.Lock()
 
 
+_CONFIG_BROKEN = {"at": 0.0}     # when the persisted config last failed to parse
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     if os.path.exists(CONFIG_FILE):
         try:
             cfg.update(json.load(open(CONFIG_FILE)))
-        except Exception:
-            pass
+            _CONFIG_BROKEN["at"] = 0.0
+        except Exception as e:
+            # Silently falling back to DEFAULTS is how a truncated config.json erased an install:
+            # every URL and key reads as empty, `enabled` flips to False, and the next save_config
+            # — which starts from this very dict — writes the defaults back over the real file.
+            # Say so loudly, and refuse to save over it (see save_config).
+            _CONFIG_BROKEN["at"] = _CONFIG_BROKEN["at"] or time.time()
+            log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
+                f"REFUSING to overwrite it. Fix or remove the file.")
     # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
     # every job calls this constantly, and a redact() running inside the clear-to-update window
     # saw an empty set — writing the secret it was meant to scrub verbatim into the log. Rebinding
@@ -202,16 +212,37 @@ def migrate_config():
     prof = dict(prof)
     prof["audio"] = ["orig" if a == "jpn" else a for a in aud]
     profiles = dict(cfg["lang_profiles"]); profiles["anime"] = prof
-    save_config({"lang_profiles": profiles})
+    try:
+        save_config({"lang_profiles": profiles})
+    except ConfigUnreadable as e:
+        log(f"config: skipping the jpn -> orig migration ({e})")
+        return       # a startup migration must never be the thing that stops the app coming up
     log("config: anime audio target jpn -> orig (the original language, resolved per title)")
+
+
+class ConfigUnreadable(Exception):
+    """The persisted config exists but can't be parsed, so saving would destroy it."""
 
 
 def save_config(updates: dict):
     with _lock:
         cfg = load_config()
+        if _CONFIG_BROKEN["at"]:
+            # load_config fell back to DEFAULTS, so `cfg` is defaults+this change. Writing that
+            # would replace every setting the operator ever entered with a default.
+            raise ConfigUnreadable(
+                f"{CONFIG_FILE} is present but unparseable; refusing to overwrite it")
         cfg.update({k: v for k, v in updates.items() if k in DEFAULTS})
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
+        # Write-then-rename: json.dump straight onto CONFIG_FILE truncates first, so a crash or a
+        # power cut mid-dump leaves a half-written file that parses as nothing. os.replace is
+        # atomic on POSIX, so a reader sees either the old file or the new one.
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_FILE)
     return load_config()
 
 
@@ -237,9 +268,35 @@ def redact(text):
     return out
 
 
+LOG_MAX_BYTES = 8 * 1024 * 1024        # rotate past this
+LOG_KEEP = 3                           # vo-merge.log.1 .. .3
+
+
+def _rotate_log():
+    """Roll vo-merge.log once it passes LOG_MAX_BYTES, keeping LOG_KEEP old files.
+
+    Nothing truncated this file before, so a busy install grew it without limit — and `tail_log`
+    read the WHOLE thing into memory on every call, on paths as hot as the UI's log poll and the
+    per-record AI context built every 3 minutes."""
+    try:
+        if os.path.getsize(LOG_FILE) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for i in range(LOG_KEEP - 1, 0, -1):
+            src, dst = f"{LOG_FILE}.{i}", f"{LOG_FILE}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(LOG_FILE, f"{LOG_FILE}.1")
+    except OSError:
+        pass                            # a failed rotation must never stop us logging
+
+
 def log(msg: str):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    _rotate_log()
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
     print(line, flush=True)
@@ -282,10 +339,32 @@ def ticket(kind, summary, context=None, key=None, force=False):
 
 
 def tail_log(n=300):
+    """Last `n` lines, read from the END of the file.
+
+    `f.readlines()[-n:]` materialised the entire log to return 300 lines, and the callers are hot:
+    the UI's log poll, and both AI context builders, which filter tail_log(800) per record while
+    the 3-minute sweep rebuilds contexts. With rotation capping the file at 8 MB that would be
+    survivable, but reading ~64 KB instead of 8 MB is free."""
     if not os.path.exists(LOG_FILE):
         return []
-    with open(LOG_FILE) as f:
-        return f.readlines()[-n:]
+    want = max(1, n)
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            block, data, lines = 8192, b"", 0
+            pos = end
+            while pos > 0 and lines <= want:
+                step = min(block, pos)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                data = chunk + data
+                lines = data.count(b"\n")
+            text = data.decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [ln + "\n" for ln in text.splitlines()[-want:]]
 
 
 @contextmanager
@@ -359,6 +438,26 @@ def init_db():
                                    "merge_kind": "TEXT"})
 
 
+def _ensure_indexes(c):
+    """Indexes for the queries the background jobs run constantly.
+
+    There were none beyond the primary keys, so every `WHERE status=? ORDER BY updated DESC` was a
+    full table scan — and those back stage_search, promote_completed (every minute), the stall
+    sweep, `_dl_hashes` (which scans once per state per call), the dashboard's 5000-row attention
+    query and ai_log. The episodes table holds one row per tracked episode, so a large TV library
+    makes that thousands of rows scanned several times a minute, with UI polls on top."""
+    for table in ("movies", "episodes"):
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status)")
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated ON {table}(updated)")
+        # partial: ai_log selects the handful of rows that have ever been escalated
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ai_at ON {table}(ai_at) "
+                  f"WHERE ai_at IS NOT NULL")
+    # the merge queue and the attention panel both sort a status subset by recency
+    c.execute("CREATE INDEX IF NOT EXISTS idx_movies_status_updated ON movies(status, updated)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_episodes_status_updated ON episodes(status, updated)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_episodes_series ON episodes(series_id, season)")
+
+
 def _ensure_cols(c, table, cols):
     have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
     for col, decl in cols.items():
@@ -396,6 +495,13 @@ def init_tv():
                                      # inputs the scan used, or the two pick different profiles
                                      "orig_lang": "TEXT",
                                      "merge_kind": "TEXT"})   # see movies table
+
+
+def init_indexes():
+    """Create the query indexes. Separate from init_db/init_tv because it spans both tables, so
+    it has to run after each has been created."""
+    with db() as c:
+        _ensure_indexes(c)
 
 
 def init_probe_cache():
@@ -508,23 +614,26 @@ def probe_stats():
 
 
 def upsert_episode(e: dict):
+    """Insert or refresh an episode's metadata columns. Never touches `status`.
+
+    SELECT-then-INSERT raced: a webhook ingest and the scheduled scan can reach a new title at the
+    same moment, and the loser's INSERT raised IntegrityError, aborting that whole scan pass. The
+    single ON CONFLICT statement is atomic — `put_probe` already did it this way."""
     cols = ["id", "series_id", "series_title", "tvdb_id", "season", "episode",
             "french_path", "quality", "poster", "series_type"]
     with db() as c:
-        ex = c.execute("SELECT status FROM episodes WHERE id=?", (e["id"],)).fetchone()
-        if ex:
-            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,poster=?,series_type=?,updated=?
-                         WHERE id=?""",
-                      (e["series_title"], e["tvdb_id"], e["french_path"], e["quality"],
-                       e.get("poster"), e.get("series_type", "standard"), time.time(), e["id"]))
-        else:
-            c.execute(f"INSERT INTO episodes ({','.join(cols)},updated) "
-                      f"VALUES ({','.join('?'*len(cols))},?)",
-                      tuple(e.get(k) for k in cols) + (time.time(),))
+        c.execute(f"""INSERT INTO episodes ({','.join(cols)},updated)
+                      VALUES ({','.join('?' * len(cols))},?)
+                      ON CONFLICT(id) DO UPDATE SET
+                        series_title=excluded.series_title, tvdb_id=excluded.tvdb_id,
+                        french_path=excluded.french_path, quality=excluded.quality,
+                        poster=excluded.poster, series_type=excluded.series_type,
+                        updated=excluded.updated""",
+                  tuple(e.get(k) for k in cols) + (time.time(),))
 
 
-def set_ep_status(ep_id, status, **fields):
-    _set_row("episodes", "id", ep_id, status, fields)
+def set_ep_status(ep_id, status, expect=None, **fields):
+    return _set_row("episodes", "id", ep_id, status, fields, expect)
 
 
 def get_episodes(status=None):
@@ -549,25 +658,23 @@ def ep_status_counts():
 
 
 def upsert_movie(m: dict):
+    """Insert or refresh a movie's metadata columns. Never touches `status`. See upsert_episode
+    for why this is one atomic statement rather than SELECT-then-INSERT."""
     cols = ["tmdb_id", "imdb_id", "radarr_id", "title", "original_title", "year",
             "original_lang", "french_path", "quality", "poster"]
     with db() as c:
-        existing = c.execute("SELECT tmdb_id FROM movies WHERE tmdb_id=?",
-                             (m["tmdb_id"],)).fetchone()
-        if existing:
-            c.execute("""UPDATE movies SET imdb_id=?,radarr_id=?,title=?,original_title=?,
-                         year=?,original_lang=?,french_path=?,quality=?,poster=?,updated=?
-                         WHERE tmdb_id=?""",
-                      (m["imdb_id"], m["radarr_id"], m["title"], m["original_title"],
-                       m["year"], m["original_lang"], m["french_path"], m["quality"],
-                       m.get("poster"), time.time(), m["tmdb_id"]))
-        else:
-            c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
-                          VALUES ({','.join('?'*len(cols))},?)""",
-                      tuple(m.get(k) for k in cols) + (time.time(),))
+        c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
+                      VALUES ({','.join('?' * len(cols))},?)
+                      ON CONFLICT(tmdb_id) DO UPDATE SET
+                        imdb_id=excluded.imdb_id, radarr_id=excluded.radarr_id,
+                        title=excluded.title, original_title=excluded.original_title,
+                        year=excluded.year, original_lang=excluded.original_lang,
+                        french_path=excluded.french_path, quality=excluded.quality,
+                        poster=excluded.poster, updated=excluded.updated""",
+                  tuple(m.get(k) for k in cols) + (time.time(),))
 
 
-def _set_row(table, key_col, key, status, fields):
+def _set_row(table, key_col, key, status, fields, expect=None):
     """The one writer for both tables. Two timestamps that look incidental decide what the whole
     Overview shows, and both used to be re-stamped by writes that changed nothing:
 
@@ -587,7 +694,14 @@ def _set_row(table, key_col, key, status, fields):
       alone, so an upgrade doesn't dump the whole back catalogue into "Recently merged" at once;
       those fall back to `updated`, which is now stable too.
 
-    Pass `updated=<ts>` explicitly to force a bump."""
+    Pass `updated=<ts>` explicitly to force a bump.
+
+    `expect` guards the write on the row still being in that status, and returns False when it
+    isn't. A scan reads a record, decides what status it should carry, then writes it back — and
+    in between, the merge worker can claim `ready -> merging`. Writing unconditionally put `ready`
+    back underneath a running merge, and the record was then claimed and merged a second time into
+    the same output path. Losing the write is harmless: the scan was only refreshing the language
+    columns, and the next pass redoes it."""
     if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
         fields["error"] = redact(fields["error"])
     now = fields.pop("updated", None)
@@ -604,12 +718,17 @@ def _set_row(table, key_col, key, status, fields):
     if status == "merged":
         sets += ",merged_at=CASE WHEN status=? THEN merged_at ELSE ? END"
         vals += ["merged", stamp]
+    where, args = f"{key_col}=?", [key]
+    if expect is not None:
+        where += " AND status=?"
+        args.append(expect)
     with db() as c:
-        c.execute(f"UPDATE {table} SET {sets} WHERE {key_col}=?", tuple(vals) + (key,))
+        cur = c.execute(f"UPDATE {table} SET {sets} WHERE {where}", tuple(vals) + tuple(args))
+        return cur.rowcount == 1
 
 
-def set_status(tmdb_id, status, **fields):
-    _set_row("movies", "tmdb_id", tmdb_id, status, fields)
+def set_status(tmdb_id, status, expect=None, **fields):
+    return _set_row("movies", "tmdb_id", tmdb_id, status, fields, expect)
 
 
 def claim_movie(tmdb_id, from_status, to_status, **fields):

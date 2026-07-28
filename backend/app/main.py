@@ -31,6 +31,7 @@ def _under(path, root):
 def _startup():
     core.init_db()
     core.init_tv()
+    core.init_indexes()
     core.init_probe_cache()
     core.migrate_config()
     scheduler.start()
@@ -179,7 +180,10 @@ def post_settings(body: SettingsIn):
     # secret with "********" or with the boolean that stood in for it.
     d = {k: v for k, v in body.data.items()
          if not (k in core._SECRET_KEYS and (v == "********" or isinstance(v, bool)))}
-    core.save_config(_validate_settings(d))
+    try:
+        core.save_config(_validate_settings(d))
+    except core.ConfigUnreadable as e:
+        raise HTTPException(409, str(e))
     scheduler.reschedule()
     return {"ok": True}
 
@@ -847,7 +851,10 @@ def set_pause(body: PauseIn):
     left to finish — killing mkvmerge mid-write would leave a corrupt library file — so the load
     drops as the current merge ends rather than instantly. Scans keep running, which is the
     point: pause is how you let a library re-read finish before anything grabs off it."""
-    core.save_config({"paused": bool(body.on)})
+    try:
+        core.save_config({"paused": bool(body.on)})
+    except core.ConfigUnreadable as e:
+        raise HTTPException(409, str(e))
     core.log("PAUSED by operator" if body.on else "resumed by operator")
     return {"ok": True, "paused": bool(body.on), "in_flight": pipeline._merging_now()}
 

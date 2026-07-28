@@ -509,12 +509,21 @@ def ingest_movie(m, cfg, refresh=False):
     # `ignored` is left alone: that is a deliberate decision, not an oversight.
     prev = (existing or {}).get("status")
     status = reopen_status(prev, (existing or {}).get("updated"), cfg)
+    extra = {}
     if status != prev and prev:
         core.log(f"scan: {m.get('title')} is marked {prev} but still needs "
                  f"{'+'.join(miss_a + miss_s)} -> re-opening")
-    core.set_status(m["tmdbId"], status,
+        # A re-opened record starts a fresh run at its gap, so give it a fresh budget. Carrying
+        # the spent `attempts` over meant a record re-opened at attempts=4 grabbed one release and
+        # then hit `attempts >= max_sync_retries` on its first stall — an effective budget of 1
+        # per 24-hour cooldown instead of the configured 4. recheck_settled and retry_movie both
+        # reset it deliberately; this path just never did.
+        extra["attempts"] = 0
+    # `expect=prev` so a record the merge worker claimed between the read above and this write is
+    # left alone rather than being dragged back to a queued state underneath a running merge.
+    core.set_status(m["tmdbId"], status, expect=prev,
                     audio_langs=alangs, sub_langs=slangs, needs=need,
-                    need_audio=",".join(miss_a), need_subs=",".join(miss_s))
+                    need_audio=",".join(miss_a), need_subs=",".join(miss_s), **extra)
     return "gap"
 
 
@@ -782,6 +791,14 @@ def drop_stalled(mv, t, cfg):
         return
     core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
                     **DONOR_RESET, error=None, progress="")
+    # Dropping the dead torrent is right even while paused — it frees a slot and costs nothing.
+    # Starting a NEW download is not: "paused" means no new searches, grabs or merges, and a
+    # search during a rescan grabs against gaps the half-finished scan is about to re-price.
+    # This 3-minute sweep drove straight through both brakes.
+    why = hold_reason(cfg)
+    if why:
+        core.log(f"stalled {tmdb_id}: dropped, re-search held off ({why})")
+        return
     search_movie(tmdb_id, cfg)
 
 
@@ -832,10 +849,11 @@ def ai_health_check(cfg=None):
         seen = set(json.load(open(seen_path)))
     except Exception:
         seen = set()
-    news = []
+    news, live = [], set()
     for st in ("error", "review", "sync_fail"):
         for m in core.get_movies(st):
             rk = f"movie:{m['tmdb_id']}:{st}"
+            live.add(rk)
             if rk in seen: continue
             seen.add(rk)
             core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
@@ -843,14 +861,25 @@ def ai_health_check(cfg=None):
                          "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
         for e in core.get_episodes(st):
             rk = f"episode:{e['id']}:{st}"
+            live.add(rk)
             if rk in seen: continue
             seen.add(rk)
             core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
             news.append({"type": "episode", "status": st, "id": e["id"],
                          "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
                          "error": (e.get("error") or "")[:200]})
-    if news:
+    # Forget records that are no longer in a problem state. The set only ever grew before, so a
+    # title the AI FIXED stayed "already seen" forever — when it failed again months later for an
+    # unrelated reason it was silently never escalated, breaking the contract that every failure
+    # reaches the AI within 3 minutes. It also grew without bound, while its sibling
+    # ai_tickets_filed.json is capped at 3000. Newly-paged keys are in `live` by construction, so
+    # intersecting keeps them.
+    stale = seen - live
+    if stale or news:
+        seen &= live
         json.dump(sorted(seen), open(seen_path, "w"))
+        if stale:
+            core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
         key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
         core.ticket("errors-review",
                     f"{len(news)} NEW record(s) in error/review/sync_fail",

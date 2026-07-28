@@ -277,13 +277,17 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                 # is a dead end, because stage_search only looks at `pending`.
                 prev = (cur or {}).get("status")
                 st_ = reopen_status(prev, (cur or {}).get("updated"), cfg)
+                extra = {}
                 if st_ != prev and prev:
                     core.log(f"tv scan: {ep_id} is marked {prev} but still needs "
                              f"{'+'.join(miss_a + miss_s)} -> re-opening")
-                core.set_ep_status(ep_id, st_,
+                    extra["attempts"] = 0      # fresh run at the gap, fresh budget (see pipeline)
+                # expect=prev: never drag a record the merge worker just claimed back to a queued
+                # state (see core._set_row).
+                core.set_ep_status(ep_id, st_, expect=prev,
                                    audio_langs=alangs, sub_langs=slangs, needs=need,
                                    need_audio=",".join(miss_a), need_subs=",".join(miss_s),
-                                   orig_lang=orig_name)
+                                   orig_lang=orig_name, **extra)
             n += 1
     what = "/".join(kinds) if kinds else ("series+anime" if only_series is None
                                           else f"series {only_series}")
