@@ -33,12 +33,26 @@ class Radarr:
     def movies(self):
         return self._req("GET", "/api/v3/movie")
 
+    def movie(self, movie_id):
+        """One movie by Radarr id — what a webhook needs, instead of pulling the whole library."""
+        return self._req("GET", f"/api/v3/movie/{movie_id}")
+
     def tags(self):
         return self._req("GET", "/api/v3/tag")
 
     def rescan(self, movie_id):
         return self._req("POST", "/api/v3/command",
                          json={"name": "RescanMovie", "movieId": movie_id})
+
+    def delete_movie_file(self, file_id):
+        """Delete the file from disk AND from Radarr's DB. Unlinking it ourselves would leave
+        Radarr believing the movie is still present, so it would never search for a replacement —
+        which is the whole point of removing a broken file."""
+        return self._req("DELETE", f"/api/v3/moviefile/{file_id}")
+
+    def search(self, movie_ids):
+        return self._req("POST", "/api/v3/command",
+                         json={"name": "MoviesSearch", "movieIds": list(movie_ids)})
 
     def ping(self):
         return self._req("GET", "/api/v3/system/status")
@@ -57,6 +71,10 @@ class Sonarr:
     def series(self):
         return self._req("GET", "/api/v3/series")
 
+    def series_one(self, series_id):
+        """One series by Sonarr id — what a webhook needs, instead of pulling the whole library."""
+        return self._req("GET", f"/api/v3/series/{series_id}")
+
     def tags(self):
         return self._req("GET", "/api/v3/tag")
 
@@ -69,6 +87,14 @@ class Sonarr:
     def rescan(self, series_id):
         return self._req("POST", "/api/v3/command",
                          json={"name": "RescanSeries", "seriesId": series_id})
+
+    def delete_episode_file(self, file_id):
+        """Delete from disk AND from Sonarr's DB — see Radarr.delete_movie_file."""
+        return self._req("DELETE", f"/api/v3/episodefile/{file_id}")
+
+    def search(self, episode_ids):
+        return self._req("POST", "/api/v3/command",
+                         json={"name": "EpisodeSearch", "episodeIds": list(episode_ids)})
 
     def ping(self):
         return self._req("GET", "/api/v3/system/status")
@@ -206,35 +232,53 @@ class Plex:
                          headers={"Accept": "application/json"}, timeout=15)
         return r.json().get("MediaContainer", {}).get("Metadata", [])
 
-    def _rating_key(self, title, year=None, season=None, episode=None):
-        """Resolve a movie or episode to its Plex ratingKey (None if not found)."""
+    def rating_keys(self, title, year=None, season=None, episode=None):
+        """EVERY ratingKey for this item, across ALL sections. A title mirrored into a -EN
+        library exists TWICE — once in Films/Series/Anime and once in Films-EN/Series-EN/
+        Anime-EN — as two separate items with two keys. Returning only the first (as this used
+        to) analysed whichever Plex happened to list first and left the other stale, so a
+        grafted track showed up in one library and not the other."""
+        keys = []
         if season is None:                                   # movie
             for m in self._search(title, "movie"):
                 if not year or abs(int(m.get("year") or 0) - int(year)) <= 1:
-                    return m.get("ratingKey")
-            return None
-        shows = self._search(title, "show")                  # episode: show -> season -> episode
-        if not shows:
-            return None
-        seasons = self._children(shows[0].get("ratingKey"))
-        sk = next((s.get("ratingKey") for s in seasons if str(s.get("index")) == str(season)), None)
-        if not sk:
-            return None
-        eps = self._children(sk)
-        return next((e.get("ratingKey") for e in eps if str(e.get("index")) == str(episode)), None)
+                    if m.get("ratingKey"):
+                        keys.append(m["ratingKey"])
+            return keys
+        for show in self._search(title, "show"):             # episode: show -> season -> episode
+            try:
+                seasons = self._children(show.get("ratingKey"))
+                sk = next((s.get("ratingKey") for s in seasons
+                           if str(s.get("index")) == str(season)), None)
+                if not sk:
+                    continue
+                rk = next((e.get("ratingKey") for e in self._children(sk)
+                           if str(e.get("index")) == str(episode)), None)
+                if rk:
+                    keys.append(rk)
+            except Exception:
+                continue                                     # one bad section mustn't hide the rest
+        return keys
 
-    def refresh_analyze(self, folder, title, year=None, season=None, episode=None):
-        """Partial-scan `folder` (registers new files/symlinks) AND `analyze` the specific item.
-        A plain scan does NOT re-read a file's audio streams when it's replaced IN PLACE (same
-        name) — only analyze does. Returns the ratingKey analysed (None if the item wasn't found)."""
-        try:
-            self.scan_path(folder)
-        except Exception:
-            pass
-        rk = self._rating_key(title, year, season, episode)
-        if rk:
-            self.analyze(rk)
-        return rk
+    def refresh_analyze(self, folders, title, year=None, season=None, episode=None):
+        """Partial-scan each folder (registers new files/symlinks) AND `analyze` every matching
+        item. A plain scan does NOT re-read a file's audio/subtitle streams when it is replaced
+        IN PLACE under the same name — only analyze does. Pass both the library folder and its
+        -EN mirror so each PMS re-reads both. Returns the ratingKeys analysed."""
+        for folder in ([folders] if isinstance(folders, str) else folders):
+            if not folder:
+                continue
+            try:
+                self.scan_path(folder)
+            except Exception:
+                pass
+        keys = self.rating_keys(title, year, season, episode)
+        for rk in keys:
+            try:
+                self.analyze(rk)
+            except Exception:
+                pass
+        return keys
 
     def ping(self):
         r = requests.get(f"{self.url}/identity",

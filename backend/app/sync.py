@@ -2,8 +2,23 @@
 primary, audio music/SFX cross-correlation as cross-check + fallback. Centralizes the
 logic used by both the movie and episode merges."""
 from . import core
-from .offdet_video import detect_offset_video_ms
+from .offdet_video import detect_offset_video_ms, ratio_scan
 from .offdet import detect_offset_ms
+
+NTSC = 24000.0 / 1001.0                 # 23.976
+# Standard transfer rate ratios, as donor->base factors. A PAL transfer plays 24/23.976fps
+# content at 25fps, so the PAL copy runs ~4.3% SHORT — grafting audio across the two needs a
+# time STRETCH, not a constant offset. These are the textbook values; `ratio_candidates` also
+# derives the exact ratio from the two files' measured framerates.
+RATE_RATIOS = (
+    1.0,                                # no rate change (control hypothesis)
+    25.0 / NTSC,                        # 1.042708  film(23.976) -> PAL(25)
+    NTSC / 25.0,                        # 0.959041  PAL -> film
+    25.0 / 24.0,                        # 1.041667  film(24) -> PAL
+    24.0 / 25.0,                        # 0.960000  PAL -> film(24)
+    24.0 / NTSC,                        # 1.001     NTSC pulldown
+    NTSC / 24.0,                        # 0.999
+)
 
 
 def fps_close(a, b, tol=0.03):
@@ -12,6 +27,70 @@ def fps_close(a, b, tol=0.03):
     if not a or not b:
         return True
     return abs(a - b) / max(a, b) <= tol
+
+
+def ratio_candidates(base_fps=None, donor_fps=None, base_dur=None, donor_dur=None):
+    """Rate ratios worth testing, most-likely first. `k` maps donor timestamps onto the base
+    timeline (base_t = k*donor_t + offset), so k = donor_fps / base_fps.
+    The measured framerates give the exact answer when they're trustworthy; the standard
+    transfer ratios cover rounded/missing/VFR metadata. The duration ratio is a third
+    independent guess — a PAL copy really is ~4% shorter."""
+    out = []
+    if base_fps and donor_fps:
+        out.append(donor_fps / base_fps)
+    if base_dur and donor_dur:
+        out.append(base_dur / donor_dur)
+    out.extend(RATE_RATIOS)
+    uniq = []
+    for k in out:
+        if 0.9 <= k <= 1.11 and not any(abs(k - u) < 1e-4 for u in uniq):
+            uniq.append(k)
+    return uniq
+
+
+def ratio_detect(base, donor, dur, cfg, base_fps=None, donor_fps=None,
+                 base_dur=None, donor_dur=None, tag="", on_progress=None):
+    """Rate-ratio hypothesis test — the PAL-speedup path.
+
+    Window-by-window matching CANNOT see a rate difference: it smears the cut pattern inside
+    each window and makes every window disagree (the classic symptom is per-window offsets
+    fanning out over tens of seconds). Instead of measuring drift from those broken windows,
+    we take the handful of ratios that physically occur in film/TV transfers, warp the donor's
+    timeline by each, and keep the one that actually correlates.
+
+    Returns (offset_ms, conf, method, k) or None. A win requires the best ratio to clear
+    `sync_ratio_min_conf` AND to beat the no-stretch hypothesis by `sync_ratio_margin` — so a
+    pair that merely needs a constant offset is never handed a bogus stretch."""
+    ratios = ratio_candidates(base_fps, donor_fps, base_dur, donor_dur)
+    if len(ratios) < 2:
+        return None
+    dur = dur or 0
+    span = max(600.0, min(cfg.get("sync_ratio_span", 2400), dur * 0.6)) if dur else 2400.0
+    start = max(60.0, (dur - span) / 2.0) if dur else 600.0
+    if on_progress:
+        on_progress(f"sync: testing {len(ratios)} rate ratios over {int(span/60)}min")
+    core.log(f"sync{tag}: rate-ratio scan, {len(ratios)} hypotheses @ {int(start)}s +{int(span)}s")
+    try:
+        res = ratio_scan(base, donor, ratios, start=int(start), dur=int(span),
+                         threads=cfg.get("sync_ffmpeg_threads", 4),
+                         hwaccel=cfg.get("sync_hwaccel", "vaapi"),
+                         device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+    except Exception as e:
+        core.log(f"sync{tag}: rate-ratio scan failed: {e}")
+        return None
+    if not res:
+        return None
+    k, off, conf = res[0]
+    flat = next((c for kk, _, c in res if abs(kk - 1.0) < 1e-9), 0.0)
+    core.log(f"sync{tag}: best ratio {k:.6f} -> {off:+.0f}ms (conf {conf:.2f}, no-stretch {flat:.2f})")
+    if conf < cfg.get("sync_ratio_min_conf", 0.35):
+        return None
+    if abs(k - 1.0) < 1e-9:                       # no stretch needed after all
+        return int(round(off)), conf, "video-ratio 1:1", None
+    if conf < flat * cfg.get("sync_ratio_margin", 1.3):
+        return None                               # not convincingly better than no stretch
+    core.log(f"sync{tag}: RATE RATIO {k:.6f} ({(k-1)*100:+.2f}%) accepted, base {off:+.0f}ms")
+    return int(round(off)), conf, f"video-ratio {k:.6f}", k
 
 
 def _windows(dur, n=3, length=480):
@@ -70,9 +149,25 @@ def _linfit(xs, ys):
 def verify_hint(base, donor, dur, hint, cfg, tag=""):
     """Confirm a pack-mate's already-known offset with ONE window (≈5x faster than full
     detect). Returns (offset, conf, method, drift) if it agrees, else None to force full
-    detect. Only for constant offsets (drift hints aren't quick-verifiable)."""
+    detect."""
     ho, hd = hint
     if hd:
+        # A drift/ratio hint IS quick-verifiable: re-test just that one ratio on a single
+        # window. Without this every episode of a PAL season pack redoes the whole scan.
+        s = max(60.0, ((dur or 1200) - min(1200, (dur or 1200) * 0.5)) / 2.0)
+        d = min(1200, (dur or 1200) * 0.5)
+        try:
+            res = ratio_scan(base, donor, [hd], start=int(s), dur=int(d),
+                             threads=cfg.get("sync_ffmpeg_threads", 4),
+                             hwaccel=cfg.get("sync_hwaccel", "vaapi"),
+                             device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+        except Exception:
+            return None
+        if res and res[0][2] >= cfg.get("sync_ratio_min_conf", 0.35):
+            k, off, c = res[0]
+            core.log(f"sync{tag}: pack ratio {k:.6f} confirmed, {off:+.0f}ms (conf {c:.2f})")
+            return int(round(off)), c, "pack-verify-ratio", k
+        core.log(f"sync{tag}: pack ratio {hd:.6f} NOT confirmed -> full detect")
         return None
     s = (dur or 1200) * 0.45                       # one central window
     try:
@@ -90,22 +185,35 @@ def verify_hint(base, donor, dur, hint, cfg, tag=""):
     return None
 
 
-def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, hint=None):
-    if hint is not None:                           # try the fast pack-mate path first
-        r = verify_hint(base, donor, dur, hint, cfg, tag)
-        if r:
-            return r
+def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, hint=None,
+           base_fps=None, donor_fps=None, base_dur=None, donor_dur=None):
     """Returns (offset_ms|None, confidence, method, drift_ratio|None).
 
     Measures the video offset at several points across the movie:
       - a MAJORITY agree on one value      -> constant offset (drift=None)
       - they fall on a straight LINE        -> linear drift (framerate mismatch); returns
                                                the base offset + an o1/o2 stretch ratio
+      - a known RATE RATIO matches          -> PAL-speedup & friends; returns offset + ratio
       - they're INCONSISTENT (different cut)-> reject (offset=None) so the caller tries
                                                another release / a MULTI instead of guessing
     """
     import statistics
+    if hint is not None:                           # try the fast pack-mate path first
+        r = verify_hint(base, donor, dur, hint, cfg, tag)
+        if r:
+            return r
     amin = cfg.get("auto_sync_min_conf", 0.2)
+    ratio_ok = cfg.get("sync_ratio_test", True)
+    tried_ratios = False
+    # Known rate mismatch (e.g. FR 25fps PAL vs EN 23.976): go straight to the ratio test.
+    # Running the window scan first would just burn five ffmpeg passes to produce the
+    # fan-shaped offsets that can't be fitted anyway.
+    if ratio_ok and base_fps and donor_fps and not fps_close(base_fps, donor_fps):
+        tried_ratios = True
+        r = ratio_detect(base, donor, dur, cfg, base_fps, donor_fps, base_dur, donor_dur,
+                         tag, on_progress)
+        if r:
+            return r
     wins = _windows(dur, n=max(5, cfg.get("sync_windows", 5)), length=cfg.get("sync_window_dur", 480))
     n = len(wins)
     vres = []                                          # (center_time_s, offset_ms, conf)
@@ -116,6 +224,7 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
         try:
             m, c = detect_offset_video_ms(
                 base, donor, start=int(s), dur=int(d),
+                max_lag_s=cfg.get("sync_max_lag_s", 120),
                 threads=cfg.get("sync_ffmpeg_threads", 4),
                 hwaccel=cfg.get("sync_hwaccel", "vaapi"),
                 device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
@@ -145,12 +254,30 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
                 k = 1.0 + b / 1000.0                    # audio runs b ms fast per s -> stretch
                 core.log(f"sync{tag}: LINEAR DRIFT {b*dur:+.0f}ms over movie, base {a:+.0f}ms, ratio {k:.6f} (R²={r2:.2f})")
                 return int(round(a)), r2, "video-drift", k
-        core.log(f"sync{tag}: inconsistent offsets {[int(o) for o in offs]} -> reject (different cut?)")
+        # Windows disagreed. Before calling it a different cut, check whether they're fanning
+        # out because of a RATE difference — offsets spread over tens of seconds across the
+        # runtime is the PAL signature, not a re-edit.
+        if ratio_ok and not tried_ratios:
+            tried_ratios = True
+            r = ratio_detect(base, donor, dur, cfg, base_fps, donor_fps, base_dur, donor_dur,
+                             tag, on_progress)
+            if r:
+                return r
+        core.log(f"sync{tag}: inconsistent offsets {[int(o) for o in offs]} "
+                 f"(searched +/-{cfg.get('sync_max_lag_s', 120)}s) -> reject")
         return None, max((c for _, _, c in vres), default=0.0), None, None
+    # too few windows resolved — a rate mismatch smears every window, so try the ratios
+    if ratio_ok and not tried_ratios:
+        tried_ratios = True
+        r = ratio_detect(base, donor, dur, cfg, base_fps, donor_fps, base_dur, donor_dur,
+                         tag, on_progress)
+        if r:
+            return r
     # audio fallback at a central window
     s, d = wins[len(wins) // 2]
     try:
-        am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d))
+        am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d),
+                                  max_lag_s=cfg.get("sync_max_lag_s", 120))
     except Exception:
         am, ac = None, 0.0
     if am is not None and ac >= max(amin, 0.35):

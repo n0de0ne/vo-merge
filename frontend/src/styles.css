@@ -45,8 +45,33 @@ td .sub { color: var(--muted); font-size: 12px; }
 .pill.sync_fail { background: #4a3318; color: #ffc06b; }
 .pill.downloading, .pill.merging { background: #15324f; color: #6fb6ff; }
 .pill.no_release, .pill.ignored { background: #2a313b; color: #9aa6b4; }
-.pill.pending, .pill.searching, .pill.grabbed, .pill.ready { background: #3a3622; color: #e6d27a; }
-.form-grid { display: grid; grid-template-columns: 200px 1fr auto; gap: 10px 14px; align-items: center; }
+.pill.pending, .pill.searching, .pill.grabbed { background: #3a3622; color: #e6d27a; }
+/* download finished, waiting its turn in the merge queue */
+.pill.ready { background: #123a3a; color: #5fe3d8; }
+.sub.queued { color: #5fe3d8; }
+/* a rate/PAL stretch was applied to the grafted audio */
+.drift { display: inline-block; font-size: 11px; color: #c9a6ff; background: #2a2440;
+  border-radius: 6px; padding: 2px 7px; margin-top: 4px; white-space: nowrap; }
+.pill.review { background: #3a2a4a; color: #c9a6ff; }
+/* AI-review status (secondary pill, orthogonal to pipeline status) */
+.pill.ai_pending { background: #16324a; color: #6fb6ff; }
+.pill.ai_resolved { background: #14432a; color: #5ee9a0; }
+.pill.ai_failed, .pill.ai_needs_human { background: #4a1d33; color: #ff9ecb; }
+/* live-refresh indicator */
+.livedot { color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.livedot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #5ee9a0; animation: livepulse 2s ease-in-out infinite; }
+@keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+/* review rows the AI couldn't fix — the human's queue, pulled visually forward */
+tr.needshuman > td { background: rgba(74, 29, 51, .35); }
+tr.needshuman > td:first-child { box-shadow: inset 3px 0 0 #ff5ea0; }
+/* stacked pills at a dashboard row's end */
+.col-end { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+/* same trap as .dash-cols: an `auto` help-text column grows to its longest sentence and pushes
+   the inputs off. Bound it so the help wraps instead. */
+.form-grid { display: grid; grid-template-columns: 200px minmax(180px, 1fr) minmax(0, 1.6fr);
+             gap: 10px 14px; align-items: center; }
+.form-grid > * { min-width: 0; }
+.form-grid .muted { line-height: 1.35; }
 .form-grid label { color: var(--muted); }
 .form-grid input[type=text], .form-grid input[type=password], .form-grid input[type=number], .form-grid select {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
@@ -176,14 +201,21 @@ input.sync { width: 110px; }
 .tile.good .t-num { color: #5ee9a0; }
 .tile.warn .t-num { color: #ffc06b; }
 .tile.bad .t-num { color: #ff8585; }
-.dash-cols { display: grid; grid-template-columns: 3fr 2fr; gap: 14px; align-items: start; }
-@media (max-width: 980px) { .dash-cols { grid-template-columns: 1fr; } }
+/* An `fr` track's minimum is auto, NOT zero — so a long unbreakable release name in the left
+   panel (with white-space:nowrap, its min-content is the whole string) pushes that track past
+   3fr and starves the right one, which collapsed to ~100px and wrapped one letter per line.
+   minmax(0, …) lets the left column shrink so its rows ellipsis instead, and the right column
+   gets a real floor. */
+.dash-cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
+             gap: 14px; align-items: start; }
+.dash-cols > * { min-width: 0; }
+@media (max-width: 980px) { .dash-cols { grid-template-columns: minmax(0, 1fr); } }
 .dashrow { display: flex; gap: 10px; align-items: center; padding: 7px 2px; border-bottom: 1px solid #232c38; min-width: 0; }
 .dashrow:last-child { border-bottom: 0; }
 .dashrow .poster { width: 34px; height: 51px; flex: 0 0 34px; }
 .dashrow-main { flex: 1; min-width: 0; }
 .dashrow-main .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dashrow-title { font-weight: 550; line-height: 1.3; overflow-wrap: anywhere; }
+.dashrow-title { font-weight: 550; line-height: 1.3; overflow-wrap: break-word; }
 .dashrow .pill { flex: 0 0 auto; }
 .lang-badge {
   display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 5px;
@@ -192,3 +224,176 @@ input.sync { width: 110px; }
 }
 pre.logs.mini { max-height: 220px; font-size: 11.5px; }
 .panel.warnbar { border-color: #6b4a2c; background: #241c12; color: #ffc06b; display: flex; align-items: center; }
+
+/* languages read off the file itself (mkvmerge), plus what's still missing */
+.tracks { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; }
+.tracks .needs {
+  font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 999px;
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border: 1px solid rgba(255, 176, 62, .35);
+}
+
+/* global pause brake in the header */
+header.top { display: flex; align-items: center; gap: 10px; }
+.badge.paused { color: #ffcf8f; background: rgba(255,176,62,.14); border-color: rgba(255,176,62,.4); }
+
+/* copyable webhook URLs in Settings */
+.hookurl {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 9px; margin: 5px 0; color: var(--text); user-select: all; word-break: break-all;
+}
+
+/* Attention rows: an error may be a whole sentence. One clipped line hides the useful half,
+   so allow two and ellipsis after that (the full text is still the title= tooltip). */
+.dashrow-main .sub.clamp2 {
+  white-space: normal; display: -webkit-box; -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35;
+}
+.dashrow-title .cnt {
+  margin-left: 8px; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 700;
+  letter-spacing: .03em; color: var(--muted); background: var(--panel2);
+  border: 1px solid var(--border); vertical-align: middle;
+}
+
+/* Attention rows. Built so nothing depends on the panel being wide: the title takes one line
+   and ellipsis-truncates, the pills sit next to it and never wrap into their own column, and
+   the message spans the full width below, clamped to two lines with the rest in the tooltip. */
+.attn { padding: 8px 2px; border-bottom: 1px solid #232c38; min-width: 0; }
+.attn:last-child { border-bottom: 0; }
+.attn-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.attn-title {
+  flex: 1 1 auto; min-width: 0; font-weight: 550;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attn-head > .pill, .attn-head > .cnt { flex: 0 0 auto; }
+.attn .sub { margin-top: 2px; }
+.attn-head .cnt {
+  padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 700;
+  color: var(--muted); background: var(--panel2); border: 1px solid var(--border);
+}
+
+/* ---- language coverage: how much of the library meets its target ---- */
+.covlib { padding: 10px 0; border-bottom: 1px solid #232c38; }
+.covlib:last-child { border-bottom: 0; }
+.covhead { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.covhead .muted { font-size: 12px; }
+.covpct { font-size: 20px; font-weight: 650; color: #5ee9a0; }
+.covbar {
+  display: flex; height: 12px; border-radius: 7px; overflow: hidden;
+  background: var(--panel2); margin: 7px 0 6px; border: 1px solid var(--border);
+}
+.covbar .seg { display: block; height: 100%; }
+.seg.ok, .dot.ok       { background: #2ea36a; }
+.seg.warn, .dot.warn   { background: #c8922f; }
+.seg.bad, .dot.bad     { background: #b1453f; }
+.seg.bad2, .dot.bad2   { background: #7a2f52; }
+.seg.unk, .dot.unk     { background: #465063; }
+.covlegend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; color: var(--muted); }
+.covlegend .dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px;
+  vertical-align: middle;
+}
+.covlangs { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; }
+.covlangrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font-size: 12px; }
+.covlangkind { color: var(--muted); width: 68px; flex: 0 0 68px; }
+.covlang { display: inline-flex; align-items: center; gap: 7px; }
+.covlangname { color: var(--text); min-width: 58px; }
+.covmini {
+  display: inline-block; width: 84px; height: 6px; border-radius: 4px;
+  background: var(--panel2); border: 1px solid var(--border); overflow: hidden;
+}
+.covmini > span { display: block; height: 100%; }
+.covmini .ok { background: #2ea36a; } .covmini .warn { background: #c8922f; }
+.covmini .bad { background: #b1453f; }
+.covlangpct { color: var(--muted); min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Recently merged: what was actually added, audio and subtitles kept distinct */
+.addrow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.lang-badge.subs { background: #123a44; color: #6fd8e9; border-color: #1b5566; }
+.lang-badge.repl { background: #2a2740; color: #b3a6f0; border-color: #3d3860; }
+
+/* ---- Library browser: which files meet their target, and which don't ----
+   A row must survive a long show name AND a long file name, so the title column is the only
+   flexible one (min-width:0 or its content sets the floor and the grid can't shrink) and the
+   two data columns are sized to their content. Below 900px it stacks instead of squeezing. */
+.libfilters { gap: 8px 10px; margin-bottom: 8px; }
+.segbtns { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.segbtns button {
+  background: transparent; border: 0; border-right: 1px solid var(--border);
+  color: var(--muted); padding: 6px 11px; font-size: 12.5px; cursor: pointer;
+}
+.segbtns button:last-child { border-right: 0; }
+.segbtns button:hover { background: var(--panel2); }
+.segbtns button.active { background: var(--panel2); color: var(--text); font-weight: 600; }
+.segbtns .segn {
+  margin-left: 6px; font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+  padding: 1px 6px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border);
+}
+.libhead, .librow {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 320px) minmax(0, 240px);
+  gap: 10px; align-items: baseline;
+}
+.libhead {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  padding: 6px 2px; border-bottom: 1px solid var(--border);
+}
+.liblist { max-height: 62vh; overflow-y: auto; }
+.librow { padding: 7px 2px; border-bottom: 1px solid #232c38; }
+.librow:last-child { border-bottom: 0; }
+.librow.complete { box-shadow: inset 3px 0 0 #2ea36a; }
+.librow.incomplete { box-shadow: inset 3px 0 0 #c8922f; }
+.librow.unreadable { box-shadow: inset 3px 0 0 #465063; }
+.libmain { min-width: 0; padding-left: 9px; }
+.libtitle { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.libfile {
+  font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.libtracks { display: flex; flex-wrap: wrap; gap: 3px 12px; font-size: 12px; min-width: 0; }
+.libmiss { font-size: 12px; min-width: 0; }
+.libmiss .needs {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+  padding: 1px 7px; border-radius: 999px; display: inline-block;
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border: 1px solid rgba(255, 176, 62, .35);
+}
+.ok-txt { color: #5ee9a0; font-size: 12px; }
+@media (max-width: 900px) {
+  .libhead { display: none; }
+  .librow { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
+
+/* ---- audio-less files: the one probe error that means the FILE is broken ----
+   Deleting media is the most destructive thing this app does, so the panel reads as a warning
+   and the action is styled as one — never as just another secondary button. */
+.errkinds { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+.errkinds .ek {
+  font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+  color: var(--muted); background: var(--panel2); border: 1px solid var(--border);
+}
+.errkinds .ek b { color: var(--text); margin-left: 3px; }
+.errkinds .ek.broken {
+  color: #ffcf8f; background: rgba(255, 176, 62, .13); border-color: rgba(255, 176, 62, .4);
+}
+.panel.repair { border-color: #6b4a2c; background: #201a12; }
+.panel.repair .row > .muted { font-size: 12px; }
+.repair-plan { margin-top: 10px; font-size: 13px; }
+.repair-plan .small { font-size: 11.5px; }
+button.btn.danger { background: #8c2f2a; border: 1px solid #b1453f; color: #ffe4e2; }
+button.btn.danger:hover:not(:disabled) { background: #a1372f; }
+button.btn.danger:disabled { opacity: .5; }
+
+/* ---- on-call AI health: did it actually report a verdict, or just go quiet? ---- */
+.panel.warnbar-soft { border-color: #6b4a2c; background: #201a12; }
+.aistats { display: flex; flex-wrap: wrap; gap: 6px; }
+.aistat {
+  font-size: 12px; padding: 2px 9px; border-radius: 999px; font-variant-numeric: tabular-nums;
+  color: var(--text); background: var(--panel2); border: 1px solid var(--border);
+}
+.aistat i { font-style: normal; color: var(--muted); margin-left: 4px; font-size: 11px; }
+.aistat.resolved { color: #5ee9a0; border-color: #1d5c3a; background: #14432a; }
+.aistat.resolved i { color: #8fd9b4; }
+.aistat.needs_human, .aistat.failed {
+  color: #ffcf8f; background: rgba(255,176,62,.13); border-color: rgba(255,176,62,.4);
+}
+.aistat.needs_human i, .aistat.failed i { color: #e0b380; }

@@ -28,7 +28,7 @@ def _pcm(path, ai, start, dur, sr):
 
 
 def detect_offset_ms(ref_file, ref_ai, shift_file, shift_ai,
-                     sr=8000, start=300, dur=240, max_lag_s=20):
+                     sr=8000, start=300, dur=240, max_lag_s=120):
     a = _pcm(ref_file, ref_ai, start, dur, sr)
     b = _pcm(shift_file, shift_ai, start, dur, sr)
     n = min(len(a), len(b))
@@ -38,7 +38,7 @@ def detect_offset_ms(ref_file, ref_ai, shift_file, shift_ai,
     a -= a.mean(); b -= b.mean()
     nfft = 1 << int(np.ceil(np.log2(2 * n)))
     cc = np.fft.irfft(np.fft.rfft(a, nfft) * np.conj(np.fft.rfft(b, nfft)), nfft)
-    ml = int(max_lag_s * sr)
+    ml = max(1, min(int(max_lag_s * sr), len(a) - 1))   # never search past the window length
     cc = np.concatenate((cc[-ml:], cc[:ml + 1]))
     lag = int(np.argmax(cc)) - ml
     conf = float(cc.max() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))

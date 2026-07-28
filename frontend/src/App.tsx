@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash } from "./api";
+import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
+  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -17,6 +18,45 @@ const fmtSpeed = (b: number) => (!b || b <= 0 ? "" : b / 1e6 >= 1 ? (b / 1e6).to
 const fmtEta = (s: number) => (!s || s <= 0 || s >= 8640000 ? "" : "ETA " + fmtTime(s));
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
+
+// Poll `fn` every `ms`, but ONLY while the tab is visible. Browsers throttle background-tab
+// timers, so a tab left open would silently go stale (the "won't update without a reload"
+// complaint). We pause while hidden and fire an immediate refresh the moment the tab is
+// focused again. `deps` re-arms the loop (e.g. when a filter changes).
+function usePoll(fn: () => void, ms: number, deps: any[] = []) {
+  const saved = useRef(fn);
+  saved.current = fn;
+  useEffect(() => {
+    let alive = true;
+    const run = () => { if (alive && !document.hidden) saved.current(); };
+    run();
+    const id = setInterval(run, ms);
+    const onVis = () => { if (!document.hidden) run(); };   // instant refresh on return
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    return () => {
+      alive = false; clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+    };
+    /* eslint-disable-next-line */
+  }, [ms, ...deps]);
+}
+
+// tiny "this view auto-refreshes" indicator
+function LiveDot() {
+  return <span className="livedot" title="Auto-refreshing while this tab is visible">live</span>;
+}
+
+// small secondary pill for the AI-review status of an item (orthogonal to the pipeline status)
+const AI_LABEL: Record<string, string> = {
+  pending: "🤖 AI working", resolved: "🤖 AI resolved",
+  failed: "🤖 AI couldn't fix", needs_human: "🤖 needs you",
+};
+function AiPill({ s }: { s?: string | null }) {
+  if (!s) return null;
+  return <span className={`pill ai_${s}`}>{AI_LABEL[s] ?? s}</span>;
+}
 
 // human label for a qB torrent state (distinguishes queued from genuinely stalled)
 const DL_LABEL: Record<string, string> = {
@@ -209,10 +249,448 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
 }
 
 const STATES = ["pending","searching","no_release","grabbed","downloading",
-  "ready","merging","merged","sync_fail","error","ignored"];
+  "ready","merging","merged","review","sync_fail","error","ignored"];
+
+// `ready` means "download finished, waiting its turn to merge" — say that, don't say "ready"
+const STATE_LABEL: Record<string, string> = { ready: "queued" };
 
 function Pill({ s }: { s: string }) {
-  return <span className={`pill ${s}`}>{s.replace("_", " ")}</span>;
+  return <span className={`pill ${s}`}>{STATE_LABEL[s] ?? s.replace("_", " ")}</span>;
+}
+
+// ordinal for the merge-queue position: 1 -> "next up", 2 -> "2nd in line", …
+const queueLabel = (pos?: number | null) => {
+  if (!pos) return "queued for merge";
+  if (pos === 1) return "next up to merge";
+  const s = ["th", "st", "nd", "rd"][(pos % 100 - 20) % 10] || ["th", "st", "nd", "rd"][pos % 100] || "th";
+  return `queued for merge · ${pos}${s} in line`;
+};
+
+function QueuedLine({ pos }: { pos?: number | null }) {
+  return <div className="sub queued">⏳ {queueLabel(pos)}</div>;
+}
+
+// a rate stretch was applied (PAL 25fps vs 23.976 etc) — worth showing, it's not a plain offset
+function DriftBadge({ d }: { d?: number | null }) {
+  if (!d || Math.abs(d - 1) < 1e-6) return null;
+  const pct = (d - 1) * 100;
+  return <span className="drift" title={`audio time-stretched ${pct.toFixed(2)}% to match the video's rate`}>
+    ⏩ rate ×{d.toFixed(4)} ({pct > 0 ? "+" : ""}{pct.toFixed(2)}%)</span>;
+}
+
+// What the library file actually contains, read off the file itself (not from Radarr/Sonarr
+// metadata), plus what it's still missing. `needs` is "", "audio", "subs" or "audio+subs".
+function Tracks({ a, s, na, ns }:
+  { a?: string | null; s?: string | null; na?: string | null; ns?: string | null }) {
+  if (!a && !s && !na && !ns) return null;
+  return (
+    <div className="sub tracks" title="languages read from the file itself">
+      🔊 {a || <span className="muted">none tagged</span>}
+      {s ? <> · 💬 {s}</> : <> · <span className="muted">no subs</span></>}
+      {na && <span className="needs">+ {na} audio</span>}
+      {ns && <span className="needs">+ {ns} subs</span>}
+    </div>
+  );
+}
+
+// Treat everything below target, whatever settled state it is parked in. "merged" only ever
+// meant "a merge ran" — the file can still be short of what the donor didn't carry — and
+// "no release" only meant nothing existed WHEN WE LOOKED. stage_search reads only `pending`, so
+// neither is reconsidered on its own. The release already tried stays blocklisted, so a
+// re-opened record searches for a different one. `ignored` is never touched.
+function RecheckButton({ scope }: { scope: "films" | "tv" | "anime" | "series" }) {
+  const [st, setSt] = useState<RecheckState | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.recheckState().then(setSt).catch(() => {}), st?.running ? 3000 : 60000,
+    [st?.running]);
+  async function go() {
+    setBusy(true);
+    try { await api.recheck(scope); await api.recheckState().then(setSt); }
+    finally { setBusy(false); }
+  }
+  const mine = st?.scope === scope;
+  const running = !!st?.running;
+  const done = mine && st && !running && st.finished > 0;
+  return (
+    <>
+      <button className="btn sec" disabled={busy || running} onClick={go}
+        title={"Re-read every file parked in a finished state — merged, or no-release — and "
+             + "re-open the ones that still don't meet their target. \"Merged\" only means a "
+             + "merge ran, and \"no release\" only means nothing existed when we last looked. "
+             + "The release already tried stays blocklisted; ignored titles are left alone."}>
+        {running && mine ? "Re-checking…" : "Re-check finished"}
+      </button>
+      {running && mine && <span className="muted">
+        re-probed {st!.checked} of {st!.total} · re-opened {st!.reopened}</span>}
+      {done && !st.error && <span className="muted">
+        last: {st.reopened} re-opened of {st.total} · {st.complete} genuinely complete
+        {st.gone > 0 && <> · {st.gone} file(s) gone</>}
+        {st.unreadable > 0 && <span className="bad"> · {st.unreadable} unreadable</span>}</span>}
+      {mine && st?.error && <span className="bad">re-check failed: {st.error}</span>}
+    </>
+  );
+}
+
+// Two ways to read the library, and the difference only shows up after an interruption:
+//
+//   progressive — keeps the probe cache, so mkvmerge runs ONLY for files with no valid probe:
+//                 never read, changed on disk, or never reached because a previous pass was cut
+//                 short (a container restart mid-scan). Resumable by construction — each file is
+//                 committed as it is read — so re-running picks up where the last one stopped.
+//   full        — drops the cache for that scope first and reads everything again. What you want
+//                 when you don't trust the cached answer, not when you're filling gaps.
+//
+// Both walk the whole scope and both prune what has vanished.
+function RescanButton({ scope, label, primary, full }:
+  { scope: "all" | "films" | "anime" | "series"; label: string; primary?: boolean;
+    full?: boolean }) {
+  const [st, setSt] = useState<RescanState | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000, [st?.running]);
+
+  async function go() {
+    setBusy(true);
+    try { await api.rescan(scope, !!full); await api.rescanState().then(setSt); }
+    finally { setBusy(false); }
+  }
+  // one scan runs at a time (SCAN_LOCK), so a pass started from another tab disables this one
+  const mine = st?.scope === scope;
+  const running = !!st?.running;
+  // ...and the two buttons for one scope share that state, so only report on the mode that ran
+  const done = mine && st && !running && st.finished > 0 && !!st.full === !!full;
+  const found = scope === "films" ? st?.films
+    : scope === "all" ? (st?.films ?? 0) + (st?.episodes ?? 0) : st?.episodes;
+  const dropped = (st?.pruned ?? 0) + (st?.pruned_records ?? 0);
+  const text = full ? `Re-read ${label}` : `Scan new ${label}`;
+  return (
+    <>
+      <button className={primary ? "btn" : "btn sec"} disabled={busy || running} onClick={go}
+        title={full
+          ? `Read every ${label} file again with mkvmerge, even ones that look unchanged, and `
+            + "re-decide what each is missing. Use when you don't trust the cached answer. "
+            + "Takes a few minutes on a big library."
+          : `Read only the ${label} files that have no result yet — new imports, files changed on `
+            + "disk, and anything an interrupted scan never reached. Picks up where the last pass "
+            + "stopped, so it is cheap to run any time."}>
+        {running && mine ? (full ? "Re-reading…" : "Scanning…") : text}
+      </button>
+      {running && mine && <span className="muted">
+        {st!.phase}… {(st!.read ?? 0) > 0 && <>· read {st!.read!.toLocaleString()}</>}
+        {(st!.reused ?? 0) > 0 && <> · reused {st!.reused!.toLocaleString()}</>}</span>}
+      {running && !mine && <span className="muted">busy: {st!.scope} scan running</span>}
+      {done && !st.error &&
+        <span className="muted">last: read {(st.read ?? 0).toLocaleString()} file(s)
+          {(st.reused ?? 0) > 0 && <> · {st.reused!.toLocaleString()} already cached</>}
+          {" "}· {found ?? "?"} gap(s)
+          {dropped > 0 && <> · {dropped} deleted entr{dropped === 1 ? "y" : "ies"} removed</>}
+          {st.probes.unreadable > 0 && <span className="bad"> · {st.probes.unreadable} unreadable</span>}</span>}
+      {mine && st?.error && <span className="bad">rescan failed: {st.error}</span>}
+    </>
+  );
+}
+
+// How much of the library actually meets its language targets. Sourced from the probe table —
+// the only complete inventory, since scan() records a movie/episode only when it HAS a gap.
+const LANG_NAME: Record<string, string> = {
+  fre: "French", eng: "English", jpn: "Japanese", spa: "Spanish", ger: "German",
+  ita: "Italian", por: "Portuguese", rus: "Russian", kor: "Korean", zho: "Chinese",
+};
+const lang = (c: string) => LANG_NAME[c] ?? c.toUpperCase();
+
+function LibBar({ l }: { l: CoverageLib }) {
+  const n = Math.max(l.total, 1);
+  const pct = (v: number) => (v / n) * 100;
+  const seg = [
+    { k: "complete", v: l.complete, cls: "ok", label: "meets target" },
+    { k: "subs", v: l.missing_subs, cls: "warn", label: "missing subtitles" },
+    { k: "audio", v: l.missing_audio, cls: "bad", label: "missing audio" },
+    { k: "both", v: l.missing_both, cls: "bad2", label: "missing audio + subtitles" },
+    { k: "unread", v: l.unreadable, cls: "unk", label: "unreadable" },
+  ].filter(s => s.v > 0);
+  return (
+    <div className="covlib">
+      <div className="covhead">
+        <b>{l.name}</b>
+        <span className="muted">{l.total.toLocaleString()} files · targets {l.targets.audio.join("/")} audio</span>
+        <div className="spacer" />
+        <span className="covpct" title={`${l.complete.toLocaleString()} of ${l.total.toLocaleString()} files meet it`}>
+          {Math.round(pct(l.complete))}%</span>
+      </div>
+      <div className="covbar" role="img"
+        aria-label={`${Math.round(pct(l.complete))}% of ${l.name} meets its language target`}>
+        {seg.map(s => (
+          <span key={s.k} className={`seg ${s.cls}`} style={{ width: `${pct(s.v)}%` }}
+            title={`${s.label}: ${s.v.toLocaleString()} (${pct(s.v).toFixed(1)}%)`} />
+        ))}
+      </div>
+      <div className="covlegend">
+        {seg.map(s => (
+          <span key={s.k}><i className={`dot ${s.cls}`} />{s.label} {s.v.toLocaleString()}</span>
+        ))}
+      </div>
+      <div className="covlangs">
+        {(["audio", "subs"] as const).map(which => (
+          <div className="covlangrow" key={which}>
+            <span className="covlangkind">{which === "audio" ? "🔊 audio" : "💬 subs"}</span>
+            {l.targets[which].map(code => {
+              const have = (which === "audio" ? l.audio : l.subs)[code] ?? 0;
+              // scored against the files that TARGET this language, not the whole library —
+              // a Japanese anime wants a jpn track, a French-made one filed as anime doesn't
+              const of = (which === "audio" ? l.audio_of : l.subs_of)?.[code] ?? l.total;
+              const p = (have / Math.max(of, 1)) * 100;
+              return (
+                <span className="covlang" key={code} title={`${have.toLocaleString()} of the ${of.toLocaleString()} files that target ${lang(code)} ${which} have it`}>
+                  <span className="covlangname">{lang(code)}</span>
+                  <span className="covmini"><span className={p >= 95 ? "ok" : p >= 50 ? "warn" : "bad"}
+                    style={{ width: `${p}%` }} /></span>
+                  <span className="covlangpct">{Math.round(p)}%</span>
+                </span>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
+  const [c, setC] = useState<Coverage | null>(null);
+  const [err, setErr] = useState("");
+  // A swallowed error here renders NOTHING — the whole chart just disappears, which reads as
+  // "the feature was removed" rather than "the request failed". Say which it is.
+  usePoll(() => api.coverage().then(x => { setC(x); setErr(""); })
+    .catch(e => setErr(e.message || "coverage unavailable")), 60000);
+  if (err) return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 6 }}><b>Language coverage</b></div>
+      <div className="sub bad">{err}</div>
+    </div>
+  );
+  if (!c) return null;
+  if (!c.probed)
+    return (
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 6 }}><b>Language coverage</b></div>
+        <div className="muted">Nothing probed yet — run “Re-read everything” on the Library tab.</div>
+      </div>
+    );
+  const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 10 }}>
+        <b>Language coverage</b>
+        <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
+          files meet their target · {pct}%
+          {c.unreadable > 0 && <> · <span className="bad">{c.unreadable.toLocaleString()} unreadable</span></>}</span>
+        {goto && <><div className="spacer" />
+          <button className="btn sec" onClick={() => goto("library")}>Browse files →</button></>}
+      </div>
+      {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+    </div>
+  );
+}
+
+// ---------------- Library browser: which files meet the target, and which don't ----------------
+// /coverage answers "how much" as a number; this answers "which ones", the only form you can act
+// on. Both read the same probe inventory through the same classifier, so a file counted as
+// complete in the chart is in the Complete list here — they cannot disagree.
+const PAGE = 200;
+
+function LibRow({ i }: { i: LibItem }) {
+  // "French, English audio · English subs" — grouped by kind, not one clause per language, so a
+  // file short of three things still reads as one short phrase
+  const miss = [
+    i.missing_audio.length ? `${i.missing_audio.map(lang).join(", ")} audio` : "",
+    i.missing_subs.length ? `${i.missing_subs.map(lang).join(", ")} subs` : "",
+  ].filter(Boolean);
+  return (
+    <div className={`librow ${i.state}`}>
+      <div className="libmain">
+        <div className="libtitle">{i.title}</div>
+        <div className="libfile" title={i.path}>{i.file}</div>
+      </div>
+      <div className="libtracks">
+        {i.state === "unreadable"
+          ? <span className="bad" title={i.err || ""}>⚠ {i.err || "probe failed"}</span>
+          : <>
+              <span title="audio languages read from the file">🔊 {i.audio.map(lang).join(", ") || <span className="muted">none tagged</span>}</span>
+              <span title="subtitle languages read from the file">💬 {i.subs.map(lang).join(", ") || <span className="muted">none</span>}</span>
+            </>}
+      </div>
+      <div className="libmiss">
+        {i.state === "complete"
+          ? <span className="ok-txt">✓ meets target</span>
+          : miss.length > 0 ? <span className="needs">missing {miss.join(" · ")}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+// A file with no audio at all can never be repaired by grafting — there is nothing to sync
+// against and nothing to keep — so the only fix is a fresh copy. Deleting through Radarr/Sonarr
+// (rather than unlinking) is what makes them mark it missing and search again.
+//
+// This deletes the operator's media, so the UI never offers a one-click destructive action: it
+// asks the backend what it WOULD do, shows that, and only then offers the run.
+function RepairPanel({ n, onDone }: { n: number; onDone: () => void }) {
+  const [plan, setPlan] = useState<RepairPlan | null>(null);
+  const [st, setSt] = useState<RepairState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  usePoll(() => { if (st?.running) api.repairState().then(setSt).catch(() => {}); },
+    3000, [st?.running]);
+
+  async function check() {
+    setBusy(true); setErr("");
+    try { setPlan(await api.repairPlan()); }
+    catch (e: any) { setErr(e.message || "check failed"); }
+    finally { setBusy(false); }
+  }
+  async function run() {
+    const known = plan!.total - plan!.unknown;
+    if (!confirm(`Delete ${known} file(s) with no audio track and ask Radarr/Sonarr to `
+      + `download a replacement?\n\nEach file is re-probed first and skipped if it turns out `
+      + `to be readable. This cannot be undone.`)) return;
+    setBusy(true); setErr("");
+    try {
+      const r = await api.repairRun();
+      if (!r.started) { setErr(r.note || "could not start"); return; }
+      setSt(await api.repairState());
+    } catch (e: any) { setErr(e.message || "repair failed"); }
+    finally { setBusy(false); }
+  }
+
+  const running = !!st?.running;
+  const finished = st && !running && st.finished > 0;
+  return (
+    <div className="panel repair">
+      <div className="row">
+        <b>🔇 {n.toLocaleString()} file(s) carry no audio at all</b>
+        <span className="muted">mkvmerge and ffprobe both read them and found zero audio streams,
+          so there is nothing to graft into — the only fix is a fresh copy.</span>
+        <div className="spacer" />
+        {!plan && <button className="btn sec" disabled={busy || running} onClick={check}>
+          {busy ? "Checking…" : "Check what can be replaced"}</button>}
+      </div>
+      {err && <div className="bad" style={{ marginTop: 6 }}>{err}</div>}
+      {plan && !running && !finished && <div className="repair-plan">
+        <div>
+          <b>{(plan.total - plan.unknown).toLocaleString()}</b> would be deleted and re-searched
+          via Radarr/Sonarr
+          {plan.unknown > 0 && <> · <b>{plan.unknown.toLocaleString()}</b> skipped — not in
+            Radarr/Sonarr, so deleting them would just lose the title</>}
+        </div>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn danger" disabled={busy || plan.total === plan.unknown}
+            onClick={run}>Delete {(plan.total - plan.unknown).toLocaleString()} and re-search</button>
+          <button className="btn sec" onClick={() => setPlan(null)}>Cancel</button>
+        </div>
+      </div>}
+      {running && <div className="muted" style={{ marginTop: 6 }}>
+        {st!.phase} · re-probed {st!.checked} of {st!.total} · deleted {st!.deleted}</div>}
+      {finished && <div className="repair-plan">
+        <div><b>{st!.deleted.toLocaleString()}</b> deleted and re-searched
+          {st!.skipped.length > 0 && <> · <b>{st!.skipped.length.toLocaleString()}</b> skipped</>}</div>
+        {st!.skipped.slice(0, 8).map(s => (
+          <div className="muted small" key={s.path}>{s.path.split("/").pop()} — {s.reason}</div>))}
+        {st!.skipped.length > 8 &&
+          <div className="muted small">+{st!.skipped.length - 8} more</div>}
+        {st!.error && <div className="bad">{st!.error}</div>}
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn sec" onClick={() => { setSt(null); setPlan(null); onDone(); }}>
+            Done</button>
+        </div>
+      </div>}
+    </div>
+  );
+}
+
+function Library() {
+  const [state, setState] = useState<"incomplete" | "complete" | "unreadable">("incomplete");
+  const [lib, setLib] = useState("");
+  const [q, setQ] = useState("");
+  const [page, setPage] = useState(0);
+  const [d, setD] = useState<LibPage | null>(null);
+  const [err, setErr] = useState("");
+
+  const load = () => api.library({ state, lib, q, limit: PAGE, offset: page * PAGE })
+    .then(x => { setD(x); setErr(""); })
+    .catch(e => setErr(e.message || "load failed"));
+  usePoll(load, 30000, [state, lib, q, page]);
+  // A filter change invalidates the page number — page 4 of a 2-page result is blank. Reset it in
+  // the same update as the filter (not in an effect) so the poll re-arms once, with both new
+  // values, instead of firing a throwaway request at the old offset first.
+  const pick = <T,>(set: (v: T) => void) => (v: T) => { set(v); setPage(0); };
+
+  const tabs: [typeof state, string, number][] = [
+    ["incomplete", "Target not met", d?.counts.incomplete ?? 0],
+    ["complete", "Complete", d?.counts.complete ?? 0],
+    ["unreadable", "Unreadable", d?.counts.unreadable ?? 0],
+  ];
+  const shown = d?.items.length ?? 0;
+  const pages = Math.ceil((d?.total ?? 0) / PAGE);
+  return (
+    <>
+      <div className="panel">
+        <div className="row" style={{ marginBottom: 8 }}>
+          <b>Library</b>
+          <span className="muted">every file the scanner has read, scored against its language target</span>
+          <div className="spacer" />
+          <RescanButton scope="all" label="files" primary />
+          <RescanButton scope="all" label="everything" full />
+        </div>
+        <div className="row libfilters">
+          <div className="segbtns">
+            {tabs.map(([k, label, n]) => (
+              <button key={k} className={state === k ? "active" : ""} onClick={() => pick(setState)(k)}>
+                {label} <span className="segn">{n.toLocaleString()}</span>
+              </button>
+            ))}
+          </div>
+          <select value={lib} onChange={e => pick(setLib)(e.target.value)}>
+            <option value="">All libraries</option>
+            {(d?.libraries ?? []).map(l =>
+              <option key={l.name} value={l.name}>{l.name} ({l.total.toLocaleString()})</option>)}
+          </select>
+          <input placeholder="filter by title or path…" value={q}
+            onChange={e => pick(setQ)(e.target.value)} style={{ minWidth: 220 }} />
+        </div>
+        {err && <div className="bad">{err}</div>}
+        {/* "unreadable" is not one problem. Only "no audio track" is a broken file; the others
+            say mkvmerge couldn't parse the container, which is about our tools, not the media. */}
+        {state === "unreadable" && d && Object.keys(d.error_kinds).length > 0 &&
+          <div className="errkinds">
+            {Object.entries(d.error_kinds).map(([k, n]) => (
+              <span key={k} className={k === "no audio track" ? "ek broken" : "ek"}>
+                {k} <b>{n.toLocaleString()}</b></span>))}
+          </div>}
+        {d && d.total === 0 && !err &&
+          <div className="muted" style={{ marginTop: 10 }}>
+            {d.counts.complete + d.counts.incomplete + d.counts.unreadable === 0
+              ? "Nothing read yet — hit “Re-read everything” to probe the library."
+              : "Nothing here matches those filters."}
+          </div>}
+        {d && d.total > 0 && <>
+          <div className="libhead">
+            <span>title</span><span>on the file</span><span>gap</span>
+          </div>
+          <div className="liblist">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <span className="muted">
+              showing {(page * PAGE + 1).toLocaleString()}–{(page * PAGE + shown).toLocaleString()}
+              {" "}of {d.total.toLocaleString()}</span>
+            <div className="spacer" />
+            <button className="btn sec" disabled={page === 0} onClick={() => setPage(p => p - 1)}>← prev</button>
+            <button className="btn sec" disabled={page + 1 >= pages} onClick={() => setPage(p => p + 1)}>next →</button>
+          </div>
+        </>}
+      </div>
+      {state === "unreadable" && (d?.repairable ?? 0) > 0 &&
+        <RepairPanel n={d!.repairable} onDone={load} />}
+      <CoveragePanel />
+    </>
+  );
 }
 
 // ---------------- Interactive release search modal ----------------
@@ -312,8 +790,11 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
           <MovieActions m={m} busy={busy} act={act} onRelease={onRelease} onTune={onTune} />
         </div>
         {m.status === "downloading" && <DownloadBar dl={dl} />}
+        {m.status === "ready" && <QueuedLine />}
         {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
+        <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
         {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
+        <DriftBadge d={m.sync_drift} />
         {m.error && <div className="sub bad">{m.error}</div>}
       </div>
     </div>
@@ -346,25 +827,73 @@ function Tile({ label, value, sub, tone, onClick }:
   );
 }
 
+// Is the on-call AI actually fixing anything? The dispatcher runs on the host, outside this app,
+// so the only evidence is whether it calls back. `resolved`/`failed` are verdicts it produced;
+// `needs_human` is mostly the no-callback flip. A wall of needs_human with no callback ever means
+// the dispatcher isn't running — which, without saying so, looks exactly like "it looked at
+// everything and gave up".
+function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
+  if (!ai || !ai.enabled) return null;
+  const seen = ai.pending + ai.resolved + ai.failed + ai.needs_human;
+  if (seen + ai.never_sent === 0) return null;
+  const verdicts = ai.resolved + ai.failed;      // outcomes it actually reported
+  const rate = verdicts > 0 ? Math.round((ai.resolved / verdicts) * 100) : null;
+  const silent = verdicts === 0 && (ai.needs_human > 0 || ai.pending > 0);
+  const ag = ai.agent;
+  // core.ticket() will not overwrite a ticket of the same kind, so the dispatcher is expected to
+  // remove each file once it picks it up. A ticket sitting there for hours is the most direct
+  // evidence available in here that nothing on the host is reading them.
+  const stuck = ag && ag.waiting > 0 && (ag.oldest_age ?? 0) > ai.stale_min * 60;
+  return (
+    <div className={`panel ${stuck || silent ? "warnbar-soft" : ""}`}>
+      <div className="row" style={{ marginBottom: 6 }}>
+        <b>🤖 On-call AI</b>
+        <span className="muted" title="an Unraid user script's cron runs the Claude Code CLI on
+          the tickets vo-merge writes to /config/ai-tickets">host cron · Claude Code CLI</span>
+        {ag && ag.waiting > 0 && <span className={stuck ? "bad" : "muted"}>
+          {ag.waiting} ticket{ag.waiting > 1 ? "s" : ""} waiting
+          {ag.oldest_age != null && <>, oldest {fmtAgo(now - ag.oldest_age, now)}</>}</span>}
+        <span className="muted">{ai.last_callback
+          ? `last verdict ${fmtAgo(ai.last_callback, now)}`
+          : "no verdict ever received"}</span>
+      </div>
+      <div className="aistats">
+        {([["resolved", ai.resolved, "it fixed these"],
+           ["failed", ai.failed, "it examined these and could not fix them"],
+           ["needs_human", ai.needs_human, `flagged for you (includes the ${ai.stale_min}m no-callback flip)`],
+           ["pending", ai.pending, "sent, still waiting for a verdict"],
+           ["never_sent", ai.never_sent, "failed before AI review was on, or never ticketed"],
+          ] as [string, number, string][]).filter(([, n]) => n > 0).map(([k, n, tip]) => (
+          <span className={`aistat ${k}`} key={k} title={tip}>
+            {n.toLocaleString()} <i>{k.replace("_", " ")}</i></span>))}
+      </div>
+      {stuck || silent
+        ? <div className="sub bad" style={{ marginTop: 6 }}>
+            {silent ? "Never called back. " : ""}
+            {stuck && ag
+              ? <>Tickets are sitting unread in <code>{ag.dir}</code> — the dispatcher removes each
+                one when it picks it up, so the Unraid user script almost certainly isn't running.
+                Check the cron in <b>Settings → User Scripts</b> on the host. </>
+              : <>The host script that runs the Claude Code CLI on <code>{ag?.dir}</code> isn't
+                reporting, and nothing outside it can raise an error when it stops. </>}
+            Until it runs, "needs you" here means the dispatcher went quiet — not that it examined
+            these and gave up.</div>
+        : rate != null && <div className="sub muted" style={{ marginTop: 6 }}>
+            {rate}% of the {verdicts.toLocaleString()} it reported on were resolved.</div>}
+    </div>
+  );
+}
+
 function Overview({ goto }: { goto: (tab: string) => void }) {
   const [d, setD] = useState<Dash | null>(null);
   const [dls, setDls] = useState<Record<string, DL>>({});
   const [logLines, setLogLines] = useState<string[]>([]);
   const [err, setErr] = useState("");
 
-  useEffect(() => {
-    const pull = () => api.dashboard().then(x => { setD(x); setErr(""); })
-      .catch(e => setErr(e.message || "dashboard unavailable"));
-    pull(); const t = setInterval(pull, 6000); return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const pull = () => api.downloads().then(x => setDls(x.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const pull = () => api.logs().then(x => setLogLines(x.lines.slice(-14))).catch(() => {});
-    pull(); const t = setInterval(pull, 10000); return () => clearInterval(t);
-  }, []);
+  usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
+    .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
+  usePoll(() => api.downloads().then(x => setDls(x.items || {})).catch(() => {}), 4000);
+  usePoll(() => api.logs().then(x => setLogLines(x.lines.slice(-14))).catch(() => {}), 10000);
 
   if (!d) return <div className="panel muted">{err || "loading overview…"}</div>;
 
@@ -375,6 +904,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const backlog = both("pending", "searching", "no_release");
   const downloading = d.active.filter(a => a.status === "downloading");
   const merging = d.active.filter(a => a.status === "merging");
+  const queued = d.active.filter(a => a.status === "ready");
   const totalSpeed = Object.values(dls).reduce((a, x) => a + (x.dlspeed || 0), 0);
   const diskPct = d.disk ? Math.round((1 - d.disk.free / d.disk.total) * 100) : null;
   const dlOf = (a: { dl_hash?: string | null }) => dls[(a.dl_hash || "").toLowerCase()];
@@ -386,13 +916,16 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           <button className="btn sec" style={{ marginLeft: 10 }} onClick={() => goto("settings")}>Settings</button></div>}
 
       <div className="tilegrid">
-        <Tile label="Merged" value={merged} tone="good"
-          sub={<>{d.merged_24h} in 24 h · {d.merged_7d} in 7 d</>} />
+        {/* `merged` is the terminal state for three outcomes; the sub-line counts only the work
+            vo-merge actually did, so a library re-read can't read as thousands of merges. */}
+        <Tile label="Correct now" value={merged} tone="good"
+          sub={<>{d.merged_24h} merged in 24 h · {d.merged_7d} in 7 d</>} />
         <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
           sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
           tone={d.inflight == null ? "warn" : undefined} />
-        <Tile label="Merging" value={merging.length}
-          sub={merging.length ? merging[0].title : "idle"} />
+        <Tile label="Merging" value={<>{merging.length}<span className="t-cap"> / {d.merge_cap}</span></>}
+          sub={merging.length ? merging[0].title
+            : queued.length ? `${queued.length} queued` : "idle"} />
         <Tile label="Attention" value={attention} tone={attention ? "bad" : undefined}
           onClick={() => goto("review")}
           sub={<>{both("review")} review · {both("sync_fail")} sync · {both("error")} error</>} />
@@ -403,10 +936,13 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
             sub={<>free · {diskPct}% used</>} />}
       </div>
 
+      <CoveragePanel goto={goto} />
+
       <div className="dash-cols">
         <div className="panel">
           <div className="row" style={{ marginBottom: 8 }}><b>Active now</b>
-            <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span></div>
+            <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span>
+            <div className="spacer" /><LiveDot /></div>
           {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
           {d.active.map(a => (
             <div className="dashrow" key={a.key}>
@@ -416,6 +952,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                   {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
                 {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
                 {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
+                {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
                 {a.status === "merging" && a.progress &&
                   <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
               </div>
@@ -426,30 +963,61 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
 
         <div>
           <div className="panel">
+            {/* Only what the on-call AI could not resolve, plus `review` (a human decision by
+                definition). Everything else that failed is still with the AI and is counted,
+                not listed — otherwise this is a list of things already being worked on. */}
             <div className="row" style={{ marginBottom: 8 }}><b>Needs attention</b>
+              {(d.ai_working ?? 0) > 0 &&
+                <span className="muted" title="failed records the AI is still working on — they appear here only if it can't fix them">
+                  {d.ai_working} with the AI</span>}
               {attention > 0 && <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
                 onClick={() => goto("review")}>Open review →</button>}</div>
-            {d.attention.length === 0 && <div className="muted">All clear 🎉</div>}
+            {d.attention.length === 0 && <div className="muted">
+              {(d.ai_working ?? 0) > 0
+                ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
+                : attention > 0
+                  ? `${attention} failure(s), none flagged for you yet.`
+                  : "All clear 🎉"}</div>}
             {d.attention.map(a => (
-              <div className="dashrow" key={a.key}>
-                <div className="dashrow-main">
-                  <div className="dashrow-title">{a.title}</div>
-                  {a.error && <div className="sub bad" title={a.error}>{a.error}</div>}
-                  {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+              // Title on ONE truncated line with the pills pinned beside it, then the message
+              // below at full width. The old shape put the pills in a right-hand COLUMN, which
+              // stole ~110px from the text and stacked them vertically as the panel narrowed.
+              <div className="attn" key={a.key}>
+                <div className="attn-head">
+                  <span className="attn-title" title={a.title}>{a.title}</span>
+                  {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
+                  <Pill s={a.status} />
+                  <AiPill s={a.ai_status} />
                 </div>
-                <Pill s={a.status} />
+                {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
+                {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
               </div>
             ))}
           </div>
 
+          <AiHealthPanel ai={d.ai} now={d.now} />
+
           <div className="panel">
-            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b></div>
+            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b>
+              {d.merged_kinds &&
+                <span className="muted" title="'already correct' files were never touched by vo-merge — a scan found they met their target and closed the record out">
+                  {d.merged_kinds.grafted.toLocaleString()} grafted
+                  {d.merged_kinds.replaced > 0 && <> · {d.merged_kinds.replaced.toLocaleString()} replaced</>}
+                  {d.merged_kinds.already > 0 && <> · {d.merged_kinds.already.toLocaleString()} already correct</>}
+                </span>}</div>
             {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
             {d.recent.map((r, i) => (
               <div className="dashrow" key={i}>
+                <Poster src={r.poster} alt={r.title} />
                 <div className="dashrow-main">
-                  <div className="dashrow-title">{r.title}
-                    {r.langs && <span className="lang-badge">{r.langs}</span>}</div>
+                  <div className="dashrow-title">{r.title}</div>
+                  <div className="sub addrow">
+                    {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
+                    {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
+                    {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
+                    {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+                  </div>
                 </div>
                 <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
               </div>
@@ -485,17 +1053,15 @@ function Films() {
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
+  const [searchMsg, setSearchMsg] = useState("");
 
   async function refresh() {
     setStatus(await api.status());
     setMovies(await api.movies(filter || undefined));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
+  usePoll(refresh, 8000, [filter]);
   // poll live download progress more often than the full list
-  useEffect(() => {
-    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
+  usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
   const setViewP = (v: "grid" | "list") => { setView(v); localStorage.setItem("vo_view", v); };
 
   const shown = useMemo(() => {
@@ -508,6 +1074,17 @@ function Films() {
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
 
+  async function searchAll() {
+    setBusy(true); setSearchMsg("starting…");
+    try {
+      const r = await api.searchAll();
+      setSearchMsg(r.started
+        ? `searching ${r.pending ?? 0} pending · ${r.slots ?? "?"} free slot(s)`
+        : (r.note || "already running"));
+    } catch (e: any) { setSearchMsg("failed: " + (e.message || "")); }
+    finally { setBusy(false); refresh(); }
+  }
+
   return (
     <>
       <div className="panel">
@@ -516,7 +1093,14 @@ function Films() {
             ? <span className="ok">enabled</span> : <span className="muted">disabled</span>}
             {status && <span className="muted"> · grab: {status.grab_mode}</span>}</div>
           <div className="spacer" />
+          {searchMsg && <span className="muted">{searchMsg}</span>}
+          <button className="btn sec" disabled={busy} onClick={searchAll}
+            title="Search every pending title now instead of waiting for the timer (grabs up to the free download slots)">
+            🔍 Search pending</button>
           <button className="btn" disabled={busy} onClick={() => act(api.scan)}>Scan now</button>
+          <RescanButton scope="films" label="films" />
+          <RescanButton scope="films" label="films" full />
+          <RecheckButton scope="films" />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {STATES.map(s => (
@@ -560,12 +1144,14 @@ function Films() {
                     <td style={{ minWidth: 150 }}><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
                       <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
                       {m.status === "downloading" && <DownloadBar dl={dlOf(m)} />}
+                      {m.status === "ready" && <QueuedLine />}
                       {m.status === "merging" && m.progress &&
                       <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}</td>
                     <td>{m.candidate_title
                       ? <>{m.candidate_title}<div className="sub">score {m.candidate_score} · {m.candidate_seeders}s</div></>
                       : <span className="muted">—</span>}</td>
-                    <td className="muted">{m.quality || "—"}</td>
+                    <td className="muted">{m.quality || "—"}
+                      <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} /></td>
                     <td><MovieActions m={m} busy={busy} act={act} onRelease={setRelease} onTune={setTune} /></td>
                   </tr>
                 ))}
@@ -597,6 +1183,7 @@ function Series({ anime }: { anime: boolean }) {
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
   const [relEp, setRelEp] = useState<Episode | null>(null);
+  const [searchMsg, setSearchMsg] = useState("");
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
   const dlOf = (e: Episode) => dls[(e.dl_hash || "").toLowerCase()];
 
@@ -630,13 +1217,21 @@ function Series({ anime }: { anime: boolean }) {
   async function refresh() {
     setEps(await api.tvEpisodes(filter || undefined));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [filter]);
-  useEffect(() => {
-    const pull = () => api.downloads().then(d => setDls(d.items || {})).catch(() => {});
-    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, []);
+  usePoll(refresh, 8000, [filter]);
+  usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+
+  async function searchAll() {
+    setBusy(true); setSearchMsg("starting…");
+    try {
+      const r = await api.searchAll();
+      setSearchMsg(r.started
+        ? `searching ${r.pending ?? 0} pending · ${r.slots ?? "?"} free slot(s)`
+        : (r.note || "already running"));
+    } catch (e: any) { setSearchMsg("failed: " + (e.message || "")); }
+    finally { setBusy(false); refresh(); }
+  }
 
   // seasons + episodes detail, shared by the list rows and the grid cards
   const renderSeasons = (sh: typeof shows[number]) => sh.seasons.map(([season, seps]) => (
@@ -648,12 +1243,18 @@ function Series({ anime }: { anime: boolean }) {
       <table><tbody>
         {seps.map(e => (
           <tr key={e.id}>
-            <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}</td>
+            <td style={{ width: 70 }}>S{pad2(e.season)}E{pad2(e.episode)}
+              {e.aired && <div className="sub" title="the numbering releases use for this episode">
+                aired {e.aired}</div>}</td>
             <td style={{ minWidth: 140 }}><Pill s={e.status} />
+              {e.ai_status && <AiPill s={e.ai_status} />}
               {e.status === "downloading" && <DownloadBar dl={dlOf(e)} />}
+              {e.status === "ready" && <QueuedLine />}
               {e.status === "merging" && e.progress &&
               <div className="sub" style={{ color: "#5ee9a0" }}>{e.progress}</div>}
-              {e.error && <div className="sub bad">{e.error}</div>}</td>
+              <Tracks a={e.audio_langs} s={e.sub_langs} na={e.need_audio} ns={e.need_subs} />
+              {e.error && <div className="sub bad">{e.error}</div>}
+              {e.ai_verdict && <div className="sub" title={e.ai_verdict}>🤖 {e.ai_verdict}</div>}</td>
             <td>{e.candidate_title
               ? <>{e.candidate_title}<div className="sub">score {e.candidate_score} · {e.candidate_seeders}s</div></>
               : <span className="muted">—</span>}</td>
@@ -716,7 +1317,15 @@ function Series({ anime }: { anime: boolean }) {
         <div className="row">
           <div><b>{anime ? "🎌 Anime pipeline" : "📺 TV Shows pipeline"}</b> <span className="muted">episode VO merges</span></div>
           <div className="spacer" />
-          <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>Scan series</button>
+          {searchMsg && <span className="muted">{searchMsg}</span>}
+          <button className="btn sec" disabled={busy} onClick={searchAll}
+            title="Search every pending episode now instead of waiting for the timer">
+            🔍 Search pending</button>
+          <button className="btn" disabled={busy} onClick={() => act(api.tvScan)}>
+            Scan {anime ? "anime" : "series"}</button>
+          <RescanButton scope={anime ? "anime" : "series"} label={anime ? "anime" : "TV shows"} />
+          <RescanButton scope={anime ? "anime" : "series"} label={anime ? "anime" : "TV shows"} full />
+          <RecheckButton scope={anime ? "anime" : "series"} />
         </div>
         <div className="chips" style={{ marginTop: 14 }}>
           {TV_STATES.map(s => (
@@ -763,60 +1372,123 @@ function Series({ anime }: { anime: boolean }) {
 }
 
 // ---------------- Review (needs attention) ----------------
+// The single place a human resolves problems: movies in review/sync_fail/error AND TV episodes
+// in sync_fail/error, each showing what the on-call AI made of it. Items the AI couldn't fix
+// (failed / needs_human) float to the top — that highlighted band is the manual-review queue.
+const aiUnfixed = (s?: string | null) => s === "failed" || s === "needs_human";
+
 function Review() {
   const [movies, setMovies] = useState<Movie[]>([]);
+  const [eps, setEps] = useState<Episode[]>([]);
   const [busy, setBusy] = useState(false);
   const [tune, setTune] = useState<Movie | null>(null);
   const [release, setRelease] = useState<Movie | null>(null);
-  const [ai, setAi] = useState<Record<number, string>>({});
-
-  async function sendToAI(m: Movie) {
-    setAi(s => ({ ...s, [m.tmdb_id]: "…" }));
-    try {
-      const r = await api.aiSend(m.tmdb_id);
-      setAi(s => ({ ...s, [m.tmdb_id]: r.queued ? "queued ✓" : "failed" }));
-    } catch { setAi(s => ({ ...s, [m.tmdb_id]: "failed" })); }
-  }
+  const [relEp, setRelEp] = useState<Episode | null>(null);
+  const [ai, setAi] = useState<Record<string, string>>({});
 
   async function refresh() {
-    const [r, s] = await Promise.all([api.movies("review"), api.movies("sync_fail")]);
-    setMovies([...r, ...s]);
+    const [rv, sf, er, allEps] = await Promise.all([
+      api.movies("review"), api.movies("sync_fail"), api.movies("error"), api.tvEpisodes(),
+    ]);
+    setMovies([...rv, ...sf, ...er]);
+    setEps(allEps.filter(e =>
+      ["error", "sync_fail"].includes(e.status) || aiUnfixed(e.ai_status)));
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, []);
+  usePoll(refresh, 8000);
 
   async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  async function sendAI(k: string, call: () => Promise<{ queued: boolean }>) {
+    setAi(s => ({ ...s, [k]: "…" }));
+    try { const r = await call(); setAi(s => ({ ...s, [k]: r.queued ? "queued ✓" : "failed" })); }
+    catch { setAi(s => ({ ...s, [k]: "failed" })); }
+    refresh();
+  }
+
+  type Row = { kind: "movie"; m: Movie } | { kind: "episode"; e: Episode };
+  const rows: Row[] = [
+    ...movies.map(m => ({ kind: "movie" as const, m })),
+    ...eps.map(e => ({ kind: "episode" as const, e })),
+  ];
+  const aiOf = (r: Row) => r.kind === "movie" ? r.m.ai_status : r.e.ai_status;
+  rows.sort((a, b) => (aiUnfixed(aiOf(b)) ? 1 : 0) - (aiUnfixed(aiOf(a)) ? 1 : 0));
+  const needHuman = rows.filter(r => aiUnfixed(aiOf(r))).length;
+  // 'review' means a human must decide — bulk retry only covers the two failure states
+  const retryable = rows.filter(r =>
+    ["error", "sync_fail"].includes(r.kind === "movie" ? r.m.status : r.e.status)).length;
+
+  const aiCell = (status?: string | null, verdict?: string | null, k?: string) =>
+    status ? <><AiPill s={status} />{verdict && <div className="sub" title={verdict}>{verdict}</div>}</>
+           : <span className="muted">not sent</span>;
 
   return (
+    <>
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>
-        <b>Needs review</b><span className="muted">{movies.length} item{movies.length === 1 ? "" : "s"}</span>
+        <b>Needs review</b>
+        <span className="muted">{rows.length} item{rows.length === 1 ? "" : "s"}
+          {needHuman > 0 && <> · <span className="bad">{needHuman} the AI couldn’t fix</span></>}</span>
+        <div className="spacer" />
+        {retryable > 0 &&
+          <button className="btn sec" disabled={busy}
+            title="Blocklist each failed release, drop its donor, and re-search — films and episodes"
+            onClick={() => act(api.retryAllErrors)}>↻ Retry {retryable} failed</button>}
+        <LiveDot />
       </div>
-      {movies.length === 0
+      {rows.length === 0
         ? <div className="muted">Nothing needs review 🎉</div>
         : <table>
-            <thead><tr><th>Title</th><th>Reason</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Title</th><th>Reason</th><th>AI review</th><th>Actions</th></tr></thead>
             <tbody>
-              {movies.map(m => (
-                <tr key={m.tmdb_id}>
-                  <td><div className="titlecell">
-                    <Poster src={m.poster} alt={m.title} />
-                    <div>{m.title}<div className="sub">{m.original_title} ({m.year})</div>
-                      <Pill s={m.status} /></div>
-                  </div></td>
-                  <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
-                    {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}</td>
-                  <td><div className="row">
-                    <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
-                    <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
-                    <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
-                    <button className="btn sec" disabled={busy || ai[m.tmdb_id] === "…" || ai[m.tmdb_id] === "queued ✓"}
-                      title="File a ticket for the on-call AI agent — it will inspect this item and resync, pick another release, or report back"
-                      onClick={() => sendToAI(m)}>
-                      🤖 {ai[m.tmdb_id] ?? "Send to AI"}</button>
-                  </div></td>
-                </tr>
-              ))}
+              {rows.map(r => {
+                if (r.kind === "movie") {
+                  const m = r.m, k = `m${m.tmdb_id}`;
+                  return (
+                    <tr key={k} className={aiUnfixed(m.ai_status) ? "needshuman" : ""}>
+                      <td><div className="titlecell">
+                        <Poster src={m.poster} alt={m.title} />
+                        <div>{m.title}<div className="sub">{m.original_title} ({m.year})</div>
+                          <Pill s={m.status} /></div>
+                      </div></td>
+                      <td>{m.error ? <span className="bad">{m.error}</span> : <span className="muted">—</span>}
+                        {m.sync_delta != null && <div className="sub">Δ {m.sync_delta.toFixed(2)}s</div>}
+                        <DriftBadge d={m.sync_drift} /></td>
+                      <td>{aiCell(m.ai_status, m.ai_verdict)}</td>
+                      <td><div className="row">
+                        <button className="btn sec" disabled={busy} onClick={() => setTune(m)}>Tune sync</button>
+                        <button className="btn sec" disabled={busy} onClick={() => setRelease(m)}>Search…</button>
+                        <button className="btn sec" disabled={busy} onClick={() => act(() => api.another(m.tmdb_id))}>Pick another</button>
+                        <button className="btn sec" disabled={busy} onClick={() => act(() => api.ignore(m.tmdb_id))}>Ignore</button>
+                        <button className="btn sec" disabled={busy || ai[k] === "…" || ai[k] === "queued ✓"}
+                          title="File a ticket for the on-call AI agent — it inspects this item and resyncs, picks another release, or reports back"
+                          onClick={() => sendAI(k, () => api.aiSend(m.tmdb_id))}>🤖 {ai[k] ?? "Send to AI"}</button>
+                      </div></td>
+                    </tr>
+                  );
+                }
+                const e = r.e, k = `e${e.id}`;
+                return (
+                  <tr key={k} className={aiUnfixed(e.ai_status) ? "needshuman" : ""}>
+                    <td><div className="titlecell">
+                      <Poster src={e.poster} alt={e.series_title} />
+                      <div>{e.series_title} <span className="muted">S{pad2(e.season)}E{pad2(e.episode)}</span>
+                        <div className="sub">{e.aired ? `episode · released as ${e.aired}` : "episode"}</div>
+                        <Pill s={e.status} /></div>
+                    </div></td>
+                    <td>{e.error ? <span className="bad">{e.error}</span> : <span className="muted">—</span>}
+                      {e.sync_delta != null && <div className="sub">Δ {e.sync_delta.toFixed(2)}s</div>}
+                      <DriftBadge d={e.sync_drift} /></td>
+                    <td>{aiCell(e.ai_status, e.ai_verdict)}</td>
+                    <td><div className="row">
+                      <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Search…</button>
+                      <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>
+                      <button className="btn sec" disabled={busy} onClick={() => act(() => api.epIgnore(e.id))}>Ignore</button>
+                      <button className="btn sec" disabled={busy || ai[k] === "…" || ai[k] === "queued ✓"}
+                        title="File a ticket for the on-call AI agent"
+                        onClick={() => sendAI(k, () => api.epAiSend(e.id))}>🤖 {ai[k] ?? "Send to AI"}</button>
+                    </div></td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>}
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
@@ -824,6 +1496,67 @@ function Review() {
         load={() => api.candidates(release.tmdb_id)}
         onGrab={c => api.grab(release.tmdb_id, c.link, c.rid, c.title)}
         onClose={() => setRelease(null)} onGrabbed={refresh} />}
+      {relEp && <ReleaseModal title={`${relEp.series_title} S${pad2(relEp.season)}E${pad2(relEp.episode)}`}
+        load={() => api.episodeCandidates(relEp.id)}
+        onGrab={c => api.episodeGrab(relEp.id, c.link, c.rid, c.title)}
+        onClose={() => setRelEp(null)} onGrabbed={refresh} />}
+    </div>
+    <AiSolvedPanel />
+    </>
+  );
+}
+
+// What the on-call AI actually did. This cannot be built from the table above: a callback leaves
+// the pipeline status untouched, so a record the AI FIXED has usually moved on (back to pending,
+// or downloading, or merged) and no query by status can find it. Without this the AI's work is
+// invisible exactly when it succeeds, and the only trace of it left in the UI is the failures.
+function AiSolvedPanel() {
+  const [outcome, setOutcome] = useState<"resolved" | "failed" | "needs_human" | "all">("resolved");
+  const [d, setD] = useState<AiLog | null>(null);
+  const [open, setOpen] = useState(true);
+  usePoll(() => api.aiLog(outcome, 50).then(setD).catch(() => {}), 15000, [outcome]);
+  if (!d) return null;
+  const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+
+  const tabs: [typeof outcome, string][] = [
+    ["resolved", "Solved"], ["failed", "Couldn’t fix"],
+    ["needs_human", "Handed back"], ["all", "All"]];
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: open ? 10 : 0 }}>
+        <button className="btn sec" style={{ padding: "2px 8px" }}
+          onClick={() => setOpen(o => !o)}>{open ? "▾" : "▸"}</button>
+        <b>🤖 What the AI did</b>
+        <span className="muted">{(d.counts.resolved ?? 0).toLocaleString()} solved of
+          {" "}{total.toLocaleString()} it reported on</span>
+        <div className="spacer" />
+        {open && <div className="segbtns">
+          {tabs.map(([k, label]) => (
+            <button key={k} className={outcome === k ? "active" : ""} onClick={() => setOutcome(k)}>
+              {label}{k !== "all" && <span className="segn">{(d.counts[k] ?? 0).toLocaleString()}</span>}
+            </button>))}
+        </div>}
+      </div>
+      {open && (d.items.length === 0
+        ? <div className="muted">Nothing in this category yet.</div>
+        : <table>
+            <thead><tr><th>Title</th><th>What it did</th><th>Now</th><th>When</th></tr></thead>
+            <tbody>
+              {d.items.map(i => (
+                <tr key={`${i.kind}${i.key}`}>
+                  <td><b>{i.title}</b>{i.sub && <span className="muted"> {i.sub}</span>}</td>
+                  <td>
+                    <AiPill s={i.ai_status} />
+                    {i.ai_verdict && <div className="sub" title={i.ai_verdict}>{i.ai_verdict}</div>}
+                  </td>
+                  <td><Pill s={i.status} />
+                    {i.error && i.ai_status !== "resolved" &&
+                      <div className="sub bad clamp2" title={i.error}>{i.error}</div>}</td>
+                  <td className="muted" style={{ whiteSpace: "nowrap" }}>{fmtAgo(i.ai_at, d.now)}</td>
+                </tr>))}
+            </tbody>
+          </table>)}
     </div>
   );
 }
@@ -852,8 +1585,9 @@ function Settings() {
     for (const key of ["en_indexer_ids", "multi_indexer_ids"])
       if (key in data && typeof data[key] === "string")
         data[key] = data[key].split(",").map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !isNaN(n));
-    if ("series_pilot" in data && typeof data.series_pilot === "string")
-      data.series_pilot = data.series_pilot.split(",").map((x: string) => x.trim()).filter(Boolean);
+    for (const key of ["series_pilot", "anime_dirs"])
+      if (key in data && typeof data[key] === "string")
+        data[key] = data[key].split(",").map((x: string) => x.trim()).filter(Boolean);
     await api.saveSettings(data); setSaved(true); setChanged({});
     api.settings().then(setCfg);
   }
@@ -862,6 +1596,22 @@ function Settings() {
     const r = await api.test(which);
     setTests({ ...tests, [which]: r.ok ? "ok" : (r.error || "failed") });
   }
+
+  // lang_profiles is nested ({movie:{audio:[],subs:[]}, …}); edit it as comma-separated text
+  // and keep the whole object in `changed` so save() sends it in one piece.
+  const prof = (kind: string, which: "audio" | "subs") => {
+    const v = (val("lang_profiles") || {})[kind]?.[which];
+    return Array.isArray(v) ? v.join(", ") : (v ?? "");
+  };
+  const setProf = (kind: string, which: "audio" | "subs", text: string) => {
+    const all = JSON.parse(JSON.stringify(val("lang_profiles") || {}));
+    all[kind] = { ...(all[kind] || {}), [which]: text.split(",").map(x => x.trim()).filter(Boolean) };
+    set("lang_profiles", all);
+  };
+
+  // the *arrs must reach this app by IP, so show the URL the browser is already using
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://<vo-merge>";
+  const tok = val("webhook_token") ? `?token=${encodeURIComponent(val("webhook_token"))}` : "";
 
   const Text = (k: string, type = "text") =>
     <input type={type} value={val(k) ?? ""} onChange={e => set(k, type === "number" ? Number(e.target.value) : e.target.value)} />;
@@ -912,7 +1662,6 @@ function Settings() {
         <input type="text" value={Array.isArray(val("multi_indexer_ids")) ? val("multi_indexer_ids").join(", ") : (val("multi_indexer_ids") ?? "")}
           onChange={e => set("multi_indexer_ids", e.target.value)} /><span className="muted">extra (e.g. FR trackers) for MULTI</span>
         <label>Films</label>{Check("scope_films")}<span />
-        <label>Exclude French-origin</label>{Check("exclude_french_origin")}<span />
       </div>
 
       <div className="section-title">Series (Sonarr)</div>
@@ -924,6 +1673,103 @@ function Settings() {
           onChange={e => set("series_pilot", e.target.value)} /><span className="muted">comma-sep; empty = all tagged</span>
         <label>qB TV category</label>{Text("qb_tv_category")}<span />
         <label>Season-pack threshold</label>{Text("tv_pack_threshold", "number")}<span className="muted">≥ N gap eps → grab a pack</span>
+      </div>
+
+      <div className="section-title">Gap detection &amp; subtitles</div>
+      <div className="form-grid">
+        <label>How gaps are found</label>
+        <select value={val("scan_mode") ?? "files"} onChange={e => set("scan_mode", e.target.value)}>
+          <option value="files">Read the files (accurate)</option>
+          <option value="tag">Trust Radarr/Sonarr metadata (legacy)</option>
+        </select>
+        <span className="muted">"Read the files" probes every library file with mkvmerge, so a
+          stale tag or an un-analysed file can't hide a gap</span>
+        <label>Scan all films</label>{Check("scan_all_movies")}
+        <span className="muted">files mode: consider every Radarr film, not just vo-gap tagged ones</span>
+        <label>Add subtitles</label>{Check("want_subs")}
+        <span className="muted">take the donor's subtitles while grafting its audio</span>
+        <label>Max sub tracks</label>{Text("max_sub_tracks", "number")}
+        <span className="muted">per language (packs ship 6+: full, forced, SDH, signs…)</span>
+        <label>Chase subs alone</label>{Check("subs_only_gap")}
+        <span className="muted">download a release for a file that already has every target
+          audio language but is missing a target subtitle — off by default, this adds a lot of
+          downloads</span>
+      </div>
+
+      <div className="section-title">Instant pickup (webhooks)</div>
+      <div className="muted" style={{ margin: "-4px 0 10px" }}>
+        Without these, a newly imported file waits up to one search interval
+        ({val("search_interval_min") ?? 60} min) for the sweep. Add a <b>Connect → Webhook</b> in
+        Radarr and Sonarr, method POST, triggered <b>On Import</b> and <b>On Upgrade</b>, pointing at:
+        <div className="hookurl">{origin}/api/hook/radarr{tok}</div>
+        <div className="hookurl">{origin}/api/hook/sonarr{tok}</div>
+        Their <b>Test</b> button works. Only the changed file is probed, so a hook costs one
+        mkvmerge call rather than a library sweep.
+      </div>
+      <div className="form-grid">
+        <label>Webhook token</label>{Text("webhook_token")}
+        <span className="muted">optional; when set, the URLs above must carry
+          <code>?token=…</code>. Leave empty for no check (LAN-only, like the rest of the API)</span>
+      </div>
+
+      <div className="section-title">Language targets</div>
+      <div className="muted" style={{ margin: "-4px 0 10px" }}>
+        The end state each kind of title should reach. A file missing any of these is a gap, and
+        the missing languages are what gets grafted off the donor. Comma-separated 3-letter codes.
+      </div>
+      <div className="form-grid">
+        {(["movie", "series", "anime"] as const).flatMap(kind => [
+          <label key={`${kind}-a`}>{kind === "movie" ? "Films" : kind === "series" ? "TV shows" : "Anime"} — audio</label>,
+          <input key={`${kind}-ai`} type="text" value={prof(kind, "audio")}
+            onChange={e => setProf(kind, "audio", e.target.value)} />,
+          <span key={`${kind}-as`} className="muted">
+            {kind === "anime"
+              ? <><b>orig</b> = the title's own original language, resolved per title — keeps the
+                Japanese VO on a Japanese show without demanding a Japanese track from one made
+                in French (Arcane)</>
+              : "e.g. fre, eng"}</span>,
+          <label key={`${kind}-s`}>&nbsp;&nbsp;&nbsp;&nbsp;— subtitles</label>,
+          <input key={`${kind}-si`} type="text" value={prof(kind, "subs")}
+            onChange={e => setProf(kind, "subs", e.target.value)} />,
+          <span key={`${kind}-ss`} className="muted" />,
+        ])}
+        <label>Anime folders</label>
+        <input type="text" value={Array.isArray(val("anime_dirs")) ? val("anime_dirs").join(", ") : (val("anime_dirs") ?? "")}
+          onChange={e => set("anime_dirs", e.target.value)} />
+        <span className="muted">top-level library folders that mean anime; Sonarr's own anime
+          flag and a Japanese original language also select that profile</span>
+      </div>
+
+      <div className="section-title">Queues &amp; limits</div>
+      <div className="form-grid">
+        <label>Download slots</label>{Text("max_inflight_downloads", "number")}
+        <span className="muted">how many downloads run at once (a season pack counts as one)</span>
+        <label>Simultaneous merges</label>{Text("max_parallel_merges", "number")}
+        <span className="muted">merges share the CPU/iGPU — 1 is safest, raise only with headroom</span>
+        <label>Searches per run</label>{Text("max_search_per_run", "number")}
+        <span className="muted">cap on new searches/grabs per cycle</span>
+        <label>Queue check (min)</label>{Text("promote_interval_min", "number")}
+        <span className="muted">how often finished downloads join the merge queue</span>
+        <label>Stall timeout (min)</label>{Text("stall_timeout_min", "number")}
+        <span className="muted">idle+seedless this long → drop &amp; try another release</span>
+        <label>Metadata timeout (min)</label>{Text("meta_timeout_min", "number")}
+        <span className="muted">dead magnet ("fetching metadata", no seeds) → dropped this fast</span>
+        <label>Max download age (min)</label>{Text("dl_max_age_min", "number")}
+        <span className="muted">absolute cap; even a slow trickle is dropped past this</span>
+        <label>Stall check (min)</label>{Text("stall_check_interval_min", "number")}<span />
+        <label>Max release retries</label>{Text("max_sync_retries", "number")}
+        <span className="muted">different releases tried before giving up</span>
+      </div>
+
+      <div className="section-title">On-call AI</div>
+      <div className="form-grid">
+        <label>AI escalation</label>{Check("ai_tickets")}
+        <span className="muted">write a ticket to <code>/config/ai-tickets/</code> when a record
+          lands in error / review / sync_fail. The Unraid user script's cron runs the Claude Code
+          CLI on each one; it acts through this app's REST API and reports the outcome back.</span>
+        <label>AI reply timeout (min)</label>{Text("ai_stale_min", "number")}
+        <span className="muted">no verdict in this long → flag for manual review. This is the
+          only backstop for the host script having stopped running, so don't set it high.</span>
       </div>
 
       <div className="section-title">Master</div>
@@ -944,7 +1790,8 @@ function Logs() {
   const [lines, setLines] = useState<string[]>([]);
   const [auto, setAuto] = useState(true);
   async function refresh() { setLines((await api.logs()).lines); }
-  useEffect(() => { refresh(); if (!auto) return; const t = setInterval(refresh, 5000); return () => clearInterval(t); }, [auto]);
+  useEffect(() => { refresh(); /* always load once on mount */ /* eslint-disable-next-line */ }, []);
+  usePoll(() => { if (auto) refresh().catch(() => {}); }, 5000, [auto]);
   return (
     <div className="panel">
       <div className="row" style={{ marginBottom: 10 }}>
@@ -957,17 +1804,50 @@ function Logs() {
 }
 
 // ---------------- App ----------------
+// Global brake, in the header so it's reachable from every tab. Pausing stops NEW searches,
+// grabs and merges; anything already merging finishes (killing mkvmerge mid-write would leave a
+// corrupt library file), so the header says how many are still in flight.
+function PauseControl() {
+  const [st, setSt] = useState<Status | null>(null);
+  const [busy, setBusy] = useState(false);
+  usePoll(() => api.status().then(setSt).catch(() => {}), 5000);
+  if (!st) return null;
+  const toggle = async () => {
+    setBusy(true);
+    try { await api.pause(!st.paused); await api.status().then(setSt); }
+    finally { setBusy(false); }
+  };
+  return (
+    <>
+      {st.paused
+        ? <span className="badge paused">⏸ paused
+            {!!st.merging_now && <> · {st.merging_now} merge(s) finishing</>}</span>
+        : st.hold === "scanning" &&
+            <span className="badge">⏳ scan running — grabs held</span>}
+      <button className="btn sec" disabled={busy} onClick={toggle}
+        title={st.paused
+          ? "Resume searches, grabs and merges"
+          : "Stop starting new searches, grabs and merges. Work already running finishes; scans keep going."}>
+        {st.paused ? "▶ Resume" : "⏸ Pause"}
+      </button>
+    </>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("overview");
   const tabs: [string, string][] = [
     ["overview", "Overview"],
-    ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"], ["review", "Review"],
+    ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"],
+    ["library", "Library"], ["review", "Review"],
     ["settings", "Settings"], ["logs", "Logs"]];
   return (
     <div className="app">
       <header className="top">
         <h1>🎬 VO Merger</h1>
         <span className="badge">multi-language library builder</span>
+        <div className="spacer" />
+        <PauseControl />
       </header>
       <nav>
         {tabs.map(([k, label]) =>
@@ -977,6 +1857,7 @@ export default function App() {
       {tab === "films" && <Films />}
       {tab === "anime" && <Series anime key="anime" />}
       {tab === "series" && <Series anime={false} key="series" />}
+      {tab === "library" && <Library />}
       {tab === "review" && <Review />}
       {tab === "settings" && <Settings />}
       {tab === "logs" && <Logs />}
