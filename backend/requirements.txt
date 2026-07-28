@@ -4,4 +4,3 @@ apscheduler==3.11.0
 requests==2.32.3
 pydantic==2.10.4
 numpy==2.2.1
-anthropic==0.120.0

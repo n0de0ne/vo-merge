@@ -117,13 +117,11 @@ export interface DashRecent {
 // How the on-call AI dispatcher is actually doing. `resolved`/`failed` are verdicts it produced
 // itself; `needs_human` is mostly the no-callback flip, so a wall of it with last_callback null
 // means the dispatcher never ran — which otherwise looks identical to "it examined and gave up".
-// Which dispatcher answers the page, and — for the built-in one — whether it can actually run.
-// "no verdict ever received" means something different when the loop is ours (a missing key or
-// SDK, visible right here) than when it is a host cron we cannot see from inside the container.
+// The dispatcher runs on the host, outside this container, so the only evidence we have is
+// whether it CONSUMES what we write (tickets should not sit in the directory) and whether it
+// CALLS BACK. `waiting`/`oldest_age` describe the ticket directory.
 export interface AiAgent {
-  mode: string; model: string; sdk: boolean; key: boolean; ready: boolean;
-  running: boolean; current: string | null; last_run: number | null;
-  last_error: string | null; handled: number; resolved: number;
+  enabled: boolean; dir: string; waiting: number; oldest_age: number | null;
 }
 export interface AiHealth {
   enabled: boolean; stale_min: number; last_callback: number | null;

@@ -47,7 +47,6 @@ def get_settings():
     cfg["radarr_key"] = bool(cfg["radarr_key"])
     cfg["sonarr_key"] = bool(cfg.get("sonarr_key"))
     cfg["plex_token"] = bool(cfg["plex_token"])
-    cfg["anthropic_key"] = bool(cfg.get("anthropic_key"))
     return cfg
 
 
@@ -60,8 +59,8 @@ def post_settings(body: SettingsIn):
     # drop masked/unchanged secret placeholders
     d = {k: v for k, v in body.data.items()
          if not (k in ("qb_pass",) and v == "********")
-         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token",
-                        "anthropic_key") and v in (True, False))}
+         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token")
+                  and v in (True, False))}
     cfg = core.save_config(d)
     scheduler.reschedule()
     return {"ok": True}
@@ -868,24 +867,17 @@ def another(tmdb_id: int):
 
 
 def _escalate(kind, summary, ctx, stamp, cfg=None):
-    """Hand ONE record to whichever dispatcher is configured (`ai_mode`).
+    """File ONE record's ticket for the host dispatcher and stamp it as sent.
 
-    Both dispatchers get the identical brief — `agent.movie_context`/`episode_context` build it —
-    so "it worked from the CLI but not in-app" can't happen. In `builtin` mode no ticket file is
-    written: that is what stops the host cron, if it is still installed, from working the same
-    record in parallel with the in-process agent."""
+    The brief comes from `agent.movie_context`/`episode_context` so an operator escalation and
+    the automatic sweep can't give the dispatcher different instructions."""
     cfg = cfg or core.load_config()
-    m = agent.mode(cfg)
-    if m == "off":
-        return {"ok": True, "queued": False, "mode": m}
-    if m == "builtin":
-        stamp()
-        agent.wake()
-        return {"ok": True, "queued": True, "mode": m}
+    if not agent.enabled(cfg):
+        return {"ok": True, "queued": False}
     queued = core.ticket(kind, summary, ctx, force=True)
     if queued:
         stamp()
-    return {"ok": True, "queued": bool(queued), "mode": m}
+    return {"ok": True, "queued": bool(queued)}
 
 
 @api.post("/movie/{tmdb_id}/ai")
@@ -1470,9 +1462,8 @@ def dashboard():
         ai["last_callback"] = last_cb
         ai["enabled"] = bool(cfg.get("ai_tickets", True))
         ai["stale_min"] = cfg.get("ai_stale_min", 60)
-        # Which dispatcher is answering, and — in builtin mode — whether it is actually able to
-        # run. "no verdict ever received" means something very different when the loop is ours
-        # (a missing key or SDK, visible right here) than when it is a host cron we can't see.
+        # The dispatcher runs on the host, so the only evidence available in here is whether it
+        # consumes what we write and whether it calls back. Both are reported.
         ai["agent"] = agent.status(cfg)
 
     try:

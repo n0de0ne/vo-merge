@@ -1,86 +1,36 @@
-"""The on-call AI, running INSIDE vo-merge.
+"""The on-call AI's brief, and whether the host dispatcher is actually consuming it.
 
-Until now the "on-call AI" was a host-side arrangement: vo-merge wrote a ticket file into
-/config/ai-tickets/ and an Unraid user script, on a cron, ran the Claude Code CLI against it.
-That works, but it puts the part that actually fixes things outside the app — outside its
-config, its logs, its restart, and its container image. When the cron doesn't run there is no
-error anywhere: the tickets simply pile up, every record ages past `ai_stale_min`, and the whole
-backlog flips to "AI did not respond within 60m" as though the agent had examined each one and
-given up. That is exactly the failure this repo hit.
+The dispatcher is an Unraid user script on a cron that runs the Claude Code CLI over the ticket
+files vo-merge writes into /config/ai-tickets/. It lives outside this app, so the only evidence
+we have that it exists at all is second-hand — and the failure mode is silent: when the script
+stops running, tickets pile up, every record ages past `ai_stale_min`, and the whole backlog
+flips to "AI did not respond within 60m", which reads exactly like an agent that examined each
+one and gave up. That is the state this install was found in.
 
-So `ai_mode` picks the dispatcher:
+Two things live here, both aimed at that:
 
-  host     — the old behaviour: write the ticket file, let the host cron run the CLI.
-  builtin  — vo-merge runs the agent itself, in-process, over the Anthropic API.
-  off      — no escalation at all.
-
-`builtin` needs nothing on the host and nothing new in the image beyond `pip install anthropic`
-(the Claude Code CLI would mean bundling Node into a python-slim image). It is the SAME agent
-loop the CLI runs: read the record, call the app's REST actions, report the outcome — the action
-surface is unchanged, because it is the app's own API either way.
-
-Two things keep it narrow:
-
-- **An allowlist, not the whole API.** The agent is handed one `vo_api` tool that can only reach
-  read-only endpoints and the per-record actions a reviewer needs. Settings, rescans, the library
-  repair (which deletes media), pause and the bulk retries are NOT reachable — an agent working a
-  single stuck episode has no business re-writing the config or kicking off a library-wide pass.
-- **It must report.** The loop is capped (`ai_max_steps`), one record at a time, `ai_max_records`
-  per sweep. A run that ends without calling `report` is stamped `needs_human` rather than left
-  looking like it succeeded.
+- **The brief itself** (`movie_context` / `episode_context`). It used to be written inline in
+  main.py's escalation endpoints and again, differently, in `pipeline.ai_health_check`. One copy
+  means an operator-escalated record and an auto-escalated one can't be given different
+  instructions.
+- **`status()`** — what the ticket directory actually looks like: how many tickets are sitting
+  there and how long the oldest has waited. `core.ticket` refuses to overwrite a ticket of the
+  same kind ("already awaiting dispatch"), so a file that has been there for days is the closest
+  thing to direct evidence that nothing on the host is reading them.
 """
-import json, re, threading, time
-
-import requests
+import os
+import time
 
 from . import core
 
-# ---------------------------------------------------------------------------------------------
-# What the agent is allowed to call. Anything not matched here is refused with an explanation,
-# which the model can read and route around — a refusal is a tool result, not a crash.
-_ALLOW = [
-    ("GET",  r"/(status|movies|logs|dashboard|coverage|library|downloads|ai_log)$"),
-    ("GET",  r"/tv/(status|episodes)$"),
-    ("GET",  r"/(movie|episode)/[^/]+/(context|candidates)$"),
-    ("GET",  r"/tv/[^/]+/[^/]+/candidates$"),
-    ("POST", r"/movie/[^/]+/(search|merge|grab|sync|sync_probe|set_sync|retry|research|another"
-             r"|ignore|unignore|unfixable|ai_result|apply_offset)$"),
-    ("POST", r"/episode/[^/]+/(retry|grab|assign|sync_probe|set_sync|ignore|unfixable|ai_result)$"),
-    ("POST", r"/search_releases$"),
-    ("POST", r"/tv/[^/]+/[^/]+/grab$"),
-]
-_ALLOW = [(m, re.compile(p)) for m, p in _ALLOW]
-
-# these run mkvmerge/ffmpeg and legitimately take minutes; everything else should be quick
-_SLOW = re.compile(r"/(sync|sync_probe|set_sync|merge|assign|another|grab)$")
-_MAX_RESULT = 12000        # chars of an API response handed back to the model
-
-
-def available():
-    """Is the Anthropic SDK installed? (Kept soft so an older image still boots.)"""
-    try:
-        import anthropic          # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def mode(cfg):
-    if not cfg.get("ai_tickets", True):
-        return "off"
-    m = (cfg.get("ai_mode") or "host").lower()
-    return m if m in ("host", "builtin", "off") else "host"
-
 
 def enabled(cfg):
-    """True when this process should run the agent loop itself."""
-    return mode(cfg) == "builtin" and bool(cfg.get("anthropic_key")) and available()
+    return bool(cfg.get("ai_tickets", True))
 
 
 # ---------------------------------------------------------------------------------------------
-# The ticket payload. Built here rather than in main.py so the host dispatcher and the built-in
-# agent are handed byte-for-byte the same brief — two dispatchers with drifting instructions is
-# how you get "it worked from the CLI but not in-app".
+# The ticket payload. Built here rather than in main.py so an operator escalation and the
+# automatic sweep hand the dispatcher byte-for-byte the same brief.
 
 def movie_context(mv):
     """(summary, context) describing ONE movie record and every action that can fix it."""
@@ -129,7 +79,9 @@ def movie_context(mv):
             f"When done, POST /movie/{tmdb_id}/ai_result with "
             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue "
-            "(needs_human = a person must decide)."),
+            "(needs_human = a person must decide). This callback is the ONLY signal vo-merge has "
+            "that the dispatcher ran at all — a record with no callback is flagged for a human "
+            "after ai_stale_min minutes, indistinguishable from one you examined and gave up on."),
         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md",
     }
     return summary, ctx
@@ -177,267 +129,35 @@ def episode_context(e):
         "report_back": (
             f"When done, POST /episode/{ep_id}/ai_result with "
             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
-            "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue."),
+            "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue. "
+            "This callback is the ONLY signal vo-merge has that the dispatcher ran at all."),
         "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md",
     }
     return summary, ctx
 
 
-SYSTEM = """You are vo-merge's on-call engineer.
-
-vo-merge is a language companion to Radarr/Sonarr: it probes every library file, works out which
-target languages it is missing (`need_audio` / `need_subs`), downloads a release that carries
-them, and grafts the missing audio and subtitle tracks into the existing library file — keeping
-the library file's (usually better) video, A/V-synced.
-
-You are handed ONE record that failed, and the REST actions that can fix it. Work it end to end:
-
-1. Read `/movie/{id}/context` or `/episode/{id}/context` FIRST. It carries probes of both files,
-   the log lines for this record, and (for episodes) every donor file with the season/episode
-   parsed from it. It usually IS the diagnosis.
-2. Act with the endpoints listed in the brief. Common shapes:
-   - "couldn't sync" -> `sync_probe` with a wide `max_lag_s` BEFORE anything else. Windows that
-     agree on a large offset = extra material at the head, fixable; windows that disagree = a
-     genuinely different cut, not fixable with one offset.
-   - framerates differ -> `set_sync` with `drift` = donor_fps/base_fps (25/23.976 = 1.0427083).
-   - donor holds different episodes than the record wants -> `assign` the right file per episode.
-   - nothing found -> `search_releases` with the original/romaji/alternate title and no year.
-   - the release is simply bad -> `another` / `retry` to blocklist it and take the next one.
-3. Finish by calling the `report` tool exactly once. `resolved` = you fixed it or queued a fix
-   that should work; `failed` = you examined it and it cannot be fixed by these actions;
-   `needs_human` = a person must decide. Say what you actually did — a verdict with no action is
-   worse than none, because it clears the record out of the operator's review queue.
-
-Be economical: a handful of calls, not an exhaustive sweep. Never guess an offset you have not
-measured, and never report `resolved` for something you did not actually change."""
-
-
-# ---------------------------------------------------------------------------------------------
-STATE = {"running": False, "last_run": None, "last_error": None,
-         "handled": 0, "resolved": 0, "current": None}
-WAKE = threading.Event()
-_LOCK = threading.Lock()
-
-
-def _base(cfg):
-    return (cfg.get("ai_api_base") or "http://127.0.0.1:8080/api").rstrip("/")
-
-
-def _call_api(cfg, method, path, body):
-    """The agent's one door into the app. Allowlisted, so a review agent can act on its record
-    but cannot re-write settings, start a library pass, or reach the media-deleting repair."""
-    method = (method or "GET").upper()
-    path = "/" + (path or "").lstrip("/")
-    if path.startswith("/api/"):
-        path = path[4:]                       # tolerate the model pasting the full prefix
-    bare = path.split("?", 1)[0].rstrip("/") or "/"
-    if not any(m == method and rx.match(bare) for m, rx in _ALLOW):
-        return (f"refused: {method} {bare} is not on this agent's allowlist. You may read "
-                "status/movies/logs/dashboard/coverage/library/downloads/ai_log, tv/status, "
-                "tv/episodes, {movie,episode}/{id}/{context,candidates}, and act with the "
-                "per-record endpoints in your brief. Settings, rescans, library repair, pause "
-                "and the bulk retries are deliberately out of reach.")
-    url = _base(cfg) + path
-    timeout = 900 if _SLOW.search(bare) else 120
-    try:
-        payload = json.loads(body) if body and body.strip() else None
-    except Exception as ex:
-        return f"bad request: `body` must be a JSON object, got {ex}"
-    try:
-        if method == "GET":
-            r = requests.get(url, timeout=timeout)
-        else:
-            r = requests.post(url, json=(payload if payload is not None else {}), timeout=timeout)
-    except Exception as ex:
-        return f"request failed: {ex}"
-    text = core.redact(r.text or "")
-    if len(text) > _MAX_RESULT:
-        text = text[:_MAX_RESULT] + f"\n…truncated ({len(r.text)} chars total)"
-    return f"HTTP {r.status_code}\n{text}"
-
-
-def _stamp(kind, key, status, verdict):
-    if kind == "movie":
-        mv = core.get_movie(int(key))
-        if mv:
-            core.set_status(int(key), mv["status"], ai_status=status,
-                            ai_verdict=verdict, ai_at=time.time())
-    else:
-        e = core.get_episode(key)
-        if e:
-            core.set_ep_status(key, e["status"], ai_status=status,
-                               ai_verdict=verdict, ai_at=time.time())
-
-
-_STATUSES = ("resolved", "failed", "needs_human")
-
-
-def _handle(client, cfg, kind, key):
-    """Run the agent loop over ONE record. Returns the reported status (or None)."""
-    from anthropic import beta_tool
-
-    rec = core.get_movie(int(key)) if kind == "movie" else core.get_episode(key)
-    if not rec:
-        return None
-    summary, ctx = (movie_context(rec) if kind == "movie" else episode_context(rec))
-    outcome = {"status": None}
-
-    @beta_tool
-    def vo_api(method: str, path: str, body: str = "") -> str:
-        """Call one of vo-merge's own REST endpoints (the actions listed in your brief).
-
-        Args:
-            method: GET or POST.
-            path: the API path, e.g. /movie/1234/context or /episode/1-2-3/sync_probe.
-            body: JSON object as a string, for POST bodies. Omit for GET.
-        """
-        return _call_api(cfg, method, path, body)
-
-    @beta_tool
-    def report(status: str, verdict: str, action_taken: str = "") -> str:
-        """Record the outcome for this record and finish. Call this exactly once, at the end.
-
-        Args:
-            status: resolved (you fixed it), failed (examined, not fixable with these actions),
-                or needs_human (a person must decide).
-            verdict: one line explaining the outcome.
-            action_taken: what you actually did.
-        """
-        st = (status or "").strip().lower()
-        if st not in _STATUSES:
-            return f"status must be one of {_STATUSES}"
-        line = (verdict or "").strip()
-        if action_taken:
-            line = f"{line} — {action_taken}".strip(" —")
-        outcome["status"] = st
-        _stamp(kind, key, st, line[:400] or st)
-        core.log(f"ai(builtin) {kind} {key}: {st} — {line[:100]}")
-        return "recorded"
-
-    params = dict(
-        model=cfg.get("ai_model") or "claude-opus-5",
-        max_tokens=8000,
-        max_iterations=max(4, int(cfg.get("ai_max_steps", 30))),
-        system=SYSTEM,
-        tools=[vo_api, report],
-        messages=[{"role": "user",
-                   "content": f"Record to handle ({kind}): {summary}\n\n"
-                              + json.dumps(ctx, ensure_ascii=False, indent=1, default=str)}],
-        thinking={"type": "adaptive"},
-        output_config={"effort": cfg.get("ai_effort", "medium")},
-    )
-    try:
-        for _ in client.beta.messages.tool_runner(**params):
-            pass
-    except Exception as ex:
-        # An older model rejects adaptive thinking / output_config; retry once plainly rather
-        # than making the whole feature depend on the operator picking a current model.
-        if re.search(r"thinking|output_config|effort", str(ex), re.I):
-            params.pop("thinking", None)
-            params.pop("output_config", None)
-            for _ in client.beta.messages.tool_runner(**params):
-                pass
-        else:
-            raise
-    if not outcome["status"]:
-        # It ran out of steps, or stopped without a verdict. Saying nothing would leave the
-        # record 'pending' until the staleness sweep guessed for it an hour later.
-        _stamp(kind, key, "needs_human",
-               "the on-call agent finished without reporting an outcome (out of steps?)")
-        core.log(f"ai(builtin) {kind} {key}: no report -> needs_human")
-    return outcome["status"]
-
-
-def _queue(cfg):
-    """Records waiting on the AI, oldest first. `ai_health_check` stamps them 'pending'; this is
-    the same set the host dispatcher would have found in its ticket."""
-    n = max(1, int(cfg.get("ai_max_records", 3)))
-    out = []
-    with core.db() as c:
-        for r in c.execute("SELECT tmdb_id FROM movies WHERE ai_status='pending' "
-                           "AND status IN ('error','review','sync_fail') "
-                           "ORDER BY COALESCE(ai_at,0) LIMIT ?", (n,)):
-            out.append(("movie", str(r["tmdb_id"])))
-        for r in c.execute("SELECT id FROM episodes WHERE ai_status='pending' "
-                           "AND status IN ('error','sync_fail') "
-                           "ORDER BY COALESCE(ai_at,0) LIMIT ?", (n,)):
-            out.append(("episode", r["id"]))
-    return out[:n]
-
-
-def run_pending(cfg=None):
-    """Work the pending queue. One record at a time, capped per sweep — this spends real money,
-    so it is deliberately a trickle rather than a stampede."""
-    cfg = cfg or core.load_config()
-    if not enabled(cfg):
-        return 0
-    if cfg.get("paused"):
-        return 0            # pausing means "start nothing new", and the agent starts merges
-    if not _LOCK.acquire(blocking=False):
-        return 0
-    done = 0
-    try:
-        import anthropic
-        q = _queue(cfg)
-        if not q:
-            return 0
-        STATE["running"] = True
-        client = anthropic.Anthropic(api_key=cfg["anthropic_key"])
-        for kind, key in q:
-            STATE["current"] = f"{kind} {key}"
-            try:
-                st = _handle(client, cfg, kind, key)
-                done += 1
-                STATE["handled"] += 1
-                if st == "resolved":
-                    STATE["resolved"] += 1
-                STATE["last_error"] = None
-            except Exception as ex:
-                STATE["last_error"] = core.redact(str(ex))[:300]
-                core.log(f"ai(builtin) {kind} {key} failed: {core.redact(str(ex))[:200]}")
-                _stamp(kind, key, "needs_human",
-                       f"the on-call agent errored: {core.redact(str(ex))[:200]}")
-    finally:
-        STATE["running"] = False
-        STATE["current"] = None
-        STATE["last_run"] = time.time()
-        _LOCK.release()
-    return done
-
-
-def wake():
-    """Something was just escalated — don't wait for the next tick."""
-    WAKE.set()
-
-
-def _worker():
-    while True:
-        WAKE.wait(timeout=300)
-        WAKE.clear()
-        try:
-            run_pending()
-        except Exception as ex:
-            STATE["last_error"] = core.redact(str(ex))[:300]
-            core.log(f"ai agent worker error: {core.redact(str(ex))[:200]}")
-
-
-_started = False
-
-
-def start():
-    global _started
-    if _started:
-        return
-    _started = True
-    threading.Thread(target=_worker, name="ai-agent", daemon=True).start()
+TICKET_DIR = os.path.join(core.CONFIG_DIR, "ai-tickets")
 
 
 def status(cfg=None):
-    """What the UI needs to say whether the built-in agent is alive and configured."""
+    """Is the host dispatcher consuming what we write?
+
+    `core.ticket` will not overwrite a ticket of the same kind — "already awaiting dispatch" —
+    so the dispatcher is expected to remove each file once it has picked it up. A ticket sitting
+    there for hours is therefore the most direct evidence available from inside the container
+    that nothing on the host is reading them. It is evidence, not proof (a dispatcher could be
+    running and leaving the files), so the UI pairs it with `last_callback`, which is."""
     cfg = cfg or core.load_config()
-    m = mode(cfg)
-    return {"mode": m, "model": cfg.get("ai_model") or "claude-opus-5",
-            "sdk": available(), "key": bool(cfg.get("anthropic_key")),
-            "ready": enabled(cfg), "running": STATE["running"], "current": STATE["current"],
-            "last_run": STATE["last_run"], "last_error": STATE["last_error"],
-            "handled": STATE["handled"], "resolved": STATE["resolved"]}
+    waiting, oldest = 0, None
+    try:
+        now = time.time()
+        for name in os.listdir(TICKET_DIR):
+            if not name.endswith(".json"):
+                continue
+            waiting += 1
+            age = now - os.path.getmtime(os.path.join(TICKET_DIR, name))
+            oldest = age if oldest is None else max(oldest, age)
+    except OSError:
+        pass                     # no tickets have ever been filed — the directory is created lazily
+    return {"enabled": enabled(cfg), "dir": TICKET_DIR,
+            "waiting": waiting, "oldest_age": oldest}

@@ -6,7 +6,7 @@ Guidance for Claude (and humans) working on this repo.
 
 **vo-merge** is a **language companion to Radarr and Sonarr**: they decide *what* the library
 holds, vo-merge decides *which languages each file carries*. You declare a target per kind of
-title (`lang_profiles` — e.g. films fre+eng, anime fre+eng+jpn), it probes every file to see what
+title (`lang_profiles` — e.g. films fre+eng, anime fre+eng+original), it probes every file to see what
 is actually there, finds a release on Prowlarr carrying what's missing, downloads it via
 qBittorrent, and **grafts the missing audio and subtitle tracks into the existing library file**
 — keeping the existing (usually higher-res) video, A/V-synced — then replaces the file in place
@@ -730,48 +730,29 @@ and its outcome is written back so failures surface for a human:
    `ai_stale_min` (default 60) while still in a problem state, `ai_health_check` flips it to
    `needs_human` — catching a silently crashed AI.
 
-### Who answers the page (`ai_mode`, `agent.py`)
+### The dispatcher runs on the host, and its failure is silent (`agent.py`)
 
-The dispatcher used to live entirely on the host: vo-merge wrote a ticket into
-`/config/ai-tickets/` and an Unraid user script, on a cron, ran the Claude Code CLI against it.
-**When that script stops running, nothing reports an error.** Tickets pile up, every record ages
-past `ai_stale_min`, and the whole backlog flips to "AI did not respond within 60m" — which reads
-exactly like an agent that examined each one and gave up. That is the state this install was
-found in: every Review row flagged for a human, `last_callback: null`.
+vo-merge writes a ticket into `/config/ai-tickets/`; an **Unraid user script on a cron runs the
+Claude Code CLI** against it. That agent lives outside this app, so the only evidence in here that
+it exists at all is second-hand — and **when the script stops running, nothing reports an error.**
+Tickets pile up, every record ages past `ai_stale_min`, and the whole backlog flips to "AI did not
+respond within 60m", which reads exactly like an agent that examined each one and gave up. That is
+the state this install was found in: every Review row flagged for a human, `last_callback: null`.
 
-| `ai_mode` | who runs the agent |
-|---|---|
-| `host` (default) | write the ticket file; the Unraid cron runs the Claude Code CLI |
-| `builtin` | **vo-merge runs the agent itself**, in-process, over the Anthropic API |
-| `off` | no escalation (same as `ai_tickets: false`) |
+Two things make that visible instead of mysterious:
 
-`builtin` needs nothing on the host and no Node in a python-slim image (bundling the CLI would
-have meant exactly that — it is a Node program). It is the **same loop over the same action
-surface**, because the actions are this app's own REST endpoints either way:
-`agent.movie_context` / `episode_context` build the brief and **both dispatchers are handed the
-identical text**, so "it worked from the CLI but not in-app" can't happen.
+- **`agent.movie_context` / `episode_context` build the brief in ONE place.** It used to be
+  written inline in main.py's escalation endpoints and again, differently, in `ai_health_check`,
+  so an operator-escalated record and an auto-escalated one could be given different instructions.
+- **`agent.status()` reports the ticket directory** — how many tickets are sitting there and how
+  long the oldest has waited. `core.ticket` refuses to overwrite a ticket of the same kind
+  ("already awaiting dispatch"), so the dispatcher is expected to REMOVE each file once it picks
+  it up; a ticket that has sat for hours is the most direct evidence available from inside the
+  container that nothing on the host is reading them. It is evidence, not proof (a dispatcher
+  could run and leave the files), so the On-call AI panel pairs it with `last_callback`, which is.
 
-- **The agent gets ONE tool, `vo_api`, and it is allowlisted.** Read-only endpoints plus the
-  per-record actions a reviewer needs. `/settings`, `/rescan`, `/library/repair` (which deletes
-  media), `/pause` and the bulk retries are deliberately unreachable — an agent working one stuck
-  episode has no business re-writing the config or starting a library-wide pass. A refused call
-  comes back as a tool result explaining what it may call, so it routes around instead of dying.
-- **It must finish by calling `report`.** A run that ends without one — out of steps, or an
-  exception — is stamped `needs_human` rather than left looking like it succeeded.
-- **Brakes:** one record at a time, `ai_max_records` per sweep, `ai_max_steps` tool calls per
-  record, and nothing starts while `paused` (pausing means "start nothing new", and the agent
-  starts merges). In `builtin` mode `ai_health_check` writes **no** ticket file, so a host cron
-  that is still installed can't work the same record in parallel.
-- **Its own daemon thread**, not an APScheduler job: a run can sit for minutes inside a
-  `sync_probe`, and `max_instances=1` would silently drop the stall sweep behind it.
-- The On-call AI panel reports which dispatcher is answering and, for `builtin`, *why* it can't
-  run (no key / SDK missing) — the one thing the host arrangement could never tell you.
-- Config: `ai_mode`, `anthropic_key` (in `_SECRET_KEYS`, so `redact()` scrubs it), `ai_model`
-  (default `claude-opus-5`), `ai_effort`, `ai_max_steps`, `ai_max_records`, `ai_api_base`.
-  All under **Settings → On-call AI**.
-
-The `ai_stale_min` sweep still runs in both modes — it is the backstop for *any* dispatcher going
-quiet, including this one.
+When both say nothing is happening, the panel says so plainly and points at the user script rather
+than leaving "N need you" to be read as a considered give-up.
 
 **"Needs attention" means NEEDS YOU, not "something failed."** Every failure reaches the AI within
 3 minutes, so a panel listing all of them is mostly a list of things already being worked on. It

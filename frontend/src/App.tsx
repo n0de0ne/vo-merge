@@ -827,22 +827,19 @@ function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
   const rate = verdicts > 0 ? Math.round((ai.resolved / verdicts) * 100) : null;
   const silent = verdicts === 0 && (ai.needs_human > 0 || ai.pending > 0);
   const ag = ai.agent;
-  // The built-in dispatcher runs in this container, so we can say WHY it isn't working instead
-  // of leaving the operator to infer it from a wall of needs_human.
-  const broken = ag && ag.mode === "builtin" && !ag.ready
-    ? (!ag.sdk ? "the anthropic package isn't installed in this image (rebuild the container)"
-      : !ag.key ? "no Anthropic API key is set — Settings → On-call AI"
-        : "not ready")
-    : null;
+  // core.ticket() will not overwrite a ticket of the same kind, so the dispatcher is expected to
+  // remove each file once it picks it up. A ticket sitting there for hours is the most direct
+  // evidence available in here that nothing on the host is reading them.
+  const stuck = ag && ag.waiting > 0 && (ag.oldest_age ?? 0) > ai.stale_min * 60;
   return (
-    <div className={`panel ${broken || silent ? "warnbar-soft" : ""}`}>
+    <div className={`panel ${stuck || silent ? "warnbar-soft" : ""}`}>
       <div className="row" style={{ marginBottom: 6 }}>
         <b>🤖 On-call AI</b>
-        {ag && <span className="muted" title={ag.mode === "builtin"
-          ? `runs in this container as ${ag.model}`
-          : "an Unraid user script runs the Claude Code CLI on /config/ai-tickets"}>
-          {ag.mode === "builtin" ? `built in · ${ag.model}` : ag.mode === "host" ? "host cron" : "off"}
-          {ag.running && ag.current ? ` · working ${ag.current}` : ""}</span>}
+        <span className="muted" title="an Unraid user script's cron runs the Claude Code CLI on
+          the tickets vo-merge writes to /config/ai-tickets">host cron · Claude Code CLI</span>
+        {ag && ag.waiting > 0 && <span className={stuck ? "bad" : "muted"}>
+          {ag.waiting} ticket{ag.waiting > 1 ? "s" : ""} waiting
+          {ag.oldest_age != null && <>, oldest {fmtAgo(now - ag.oldest_age, now)}</>}</span>}
         <span className="muted">{ai.last_callback
           ? `last verdict ${fmtAgo(ai.last_callback, now)}`
           : "no verdict ever received"}</span>
@@ -857,22 +854,19 @@ function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
           <span className={`aistat ${k}`} key={k} title={tip}>
             {n.toLocaleString()} <i>{k.replace("_", " ")}</i></span>))}
       </div>
-      {broken
+      {stuck || silent
         ? <div className="sub bad" style={{ marginTop: 6 }}>
-            The built-in dispatcher can't run: {broken}. Until it does, failures stay queued and
-            age out to "needs you".</div>
-        : silent
-          ? <div className="sub bad" style={{ marginTop: 6 }}>
-              Never called back.{ag?.mode === "host"
-                ? " The dispatcher is the host cron running the Claude Code CLI on /config/ai-tickets;"
-                + " if that user script isn't running there is nothing to report an error — switch"
-                + " the dispatcher to \"built in\" (Settings → On-call AI) to run it here instead."
-                : " The dispatcher isn't reporting."} So "needs you" here means it went quiet, not
-              that it examined these and gave up.</div>
-          : rate != null && <div className="sub muted" style={{ marginTop: 6 }}>
-              {rate}% of the {verdicts.toLocaleString()} it reported on were resolved.</div>}
-      {ag?.last_error && <div className="sub bad" style={{ marginTop: 6 }}>
-        last agent error: {ag.last_error}</div>}
+            {silent ? "Never called back. " : ""}
+            {stuck && ag
+              ? <>Tickets are sitting unread in <code>{ag.dir}</code> — the dispatcher removes each
+                one when it picks it up, so the Unraid user script almost certainly isn't running.
+                Check the cron in <b>Settings → User Scripts</b> on the host. </>
+              : <>The host script that runs the Claude Code CLI on <code>{ag?.dir}</code> isn't
+                reporting, and nothing outside it can raise an error when it stops. </>}
+            Until it runs, "needs you" here means the dispatcher went quiet — not that it examined
+            these and gave up.</div>
+        : rate != null && <div className="sub muted" style={{ marginTop: 6 }}>
+            {rate}% of the {verdicts.toLocaleString()} it reported on were resolved.</div>}
     </div>
   );
 }
@@ -1555,7 +1549,7 @@ function AiSolvedPanel() {
 }
 
 // ---------------- Settings ----------------
-const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token", "anthropic_key"];
+const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token"];
 function Settings() {
   const [cfg, setCfg] = useState<Record<string, any> | null>(null);
   const [changed, setChanged] = useState<Record<string, any>>({});
@@ -1757,32 +1751,12 @@ function Settings() {
       <div className="section-title">On-call AI</div>
       <div className="form-grid">
         <label>AI escalation</label>{Check("ai_tickets")}
-        <span className="muted">auto-send failures (error / review / sync_fail) for review</span>
-        <label>Dispatcher</label>
-        <select value={val("ai_mode") ?? "host"} onChange={e => set("ai_mode", e.target.value)}>
-          <option value="host">host cron — Claude Code CLI on /config/ai-tickets</option>
-          <option value="builtin">built in — vo-merge runs the agent itself</option>
-          <option value="off">off</option>
-        </select>
-        <span className="muted">"host" depends on the Unraid user script actually running: when
-          it stops, nothing errors — tickets just pile up and every record ages out to "AI did
-          not respond". "built in" runs the same agent, with the same actions, in this container
-          over the Anthropic API, so the callback can't go missing.</span>
-        <label>Anthropic API key</label>{Secret("anthropic_key")}
-        <span className="muted">required by the built-in dispatcher</span>
-        <label>Model</label>{Text("ai_model")}
-        <span className="muted">claude-opus-5 unless you have a reason</span>
-        <label>Effort</label>
-        <select value={val("ai_effort") ?? "medium"} onChange={e => set("ai_effort", e.target.value)}>
-          {["low", "medium", "high", "xhigh", "max"].map(x => <option key={x} value={x}>{x}</option>)}
-        </select>
-        <span className="muted">how hard it thinks per record</span>
-        <label>Steps per record</label>{Text("ai_max_steps", "number")}
-        <span className="muted">tool calls it may make before it has to report an outcome</span>
-        <label>Records per sweep</label>{Text("ai_max_records", "number")}
-        <span className="muted">it works a trickle, not the whole backlog — this costs money</span>
+        <span className="muted">write a ticket to <code>/config/ai-tickets/</code> when a record
+          lands in error / review / sync_fail. The Unraid user script's cron runs the Claude Code
+          CLI on each one; it acts through this app's REST API and reports the outcome back.</span>
         <label>AI reply timeout (min)</label>{Text("ai_stale_min", "number")}
-        <span className="muted">no verdict in this long → flag for manual review</span>
+        <span className="muted">no verdict in this long → flag for manual review. This is the
+          only backstop for the host script having stopped running, so don't set it high.</span>
       </div>
 
       <div className="section-title">Master</div>
