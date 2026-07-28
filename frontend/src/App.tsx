@@ -434,9 +434,12 @@ function LibBar({ l }: { l: CoverageLib }) {
             <span className="covlangkind">{which === "audio" ? "🔊 audio" : "💬 subs"}</span>
             {l.targets[which].map(code => {
               const have = (which === "audio" ? l.audio : l.subs)[code] ?? 0;
-              const p = pct(have);
+              // scored against the files that TARGET this language, not the whole library —
+              // a Japanese anime wants a jpn track, a French-made one filed as anime doesn't
+              const of = (which === "audio" ? l.audio_of : l.subs_of)?.[code] ?? l.total;
+              const p = (have / Math.max(of, 1)) * 100;
               return (
-                <span className="covlang" key={code} title={`${have.toLocaleString()} of ${l.total.toLocaleString()} files have ${lang(code)} ${which}`}>
+                <span className="covlang" key={code} title={`${have.toLocaleString()} of the ${of.toLocaleString()} files that target ${lang(code)} ${which} have it`}>
                   <span className="covlangname">{lang(code)}</span>
                   <span className="covmini"><span className={p >= 95 ? "ok" : p >= 50 ? "warn" : "bad"}
                     style={{ width: `${p}%` }} /></span>
@@ -453,7 +456,17 @@ function LibBar({ l }: { l: CoverageLib }) {
 
 function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
   const [c, setC] = useState<Coverage | null>(null);
-  usePoll(() => api.coverage().then(setC).catch(() => {}), 60000);
+  const [err, setErr] = useState("");
+  // A swallowed error here renders NOTHING — the whole chart just disappears, which reads as
+  // "the feature was removed" rather than "the request failed". Say which it is.
+  usePoll(() => api.coverage().then(x => { setC(x); setErr(""); })
+    .catch(e => setErr(e.message || "coverage unavailable")), 60000);
+  if (err) return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 6 }}><b>Language coverage</b></div>
+      <div className="sub bad">{err}</div>
+    </div>
+  );
   if (!c) return null;
   if (!c.probed)
     return (

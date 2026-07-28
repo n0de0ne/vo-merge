@@ -85,6 +85,10 @@ export interface CoverageLib {
   name: string; kind: string; total: number; unreadable: number;
   complete: number; missing_audio: number; missing_subs: number; missing_both: number;
   audio: Record<string, number>; subs: Record<string, number>;
+  // how many files actually TARGET each language — not every file in a library wants the same
+  // set, since the anime profile's original-audio slot resolves per title (Blue Lock wants jpn,
+  // Arcane doesn't). Scoring a language against the library total would understate it.
+  audio_of?: Record<string, number>; subs_of?: Record<string, number>;
   targets: { audio: string[]; subs: string[] };
 }
 export interface Coverage {

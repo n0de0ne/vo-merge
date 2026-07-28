@@ -331,6 +331,12 @@ mirrors are skipped in one place — they're symlinks to the same files and woul
 
 - **`GET /api/coverage`** aggregates: per library total, `complete`, `missing_audio`,
   `missing_subs`, `missing_both`, `unreadable`, plus a per-language count for every target code.
+  **The target list is not uniform inside a library** — the anime profile's `orig` slot resolves
+  per title, so Blue Lock targets `jpn` and Arcane doesn't — so the counters accumulate the UNION
+  of targets and each language is scored against `audio_of`/`subs_of` (how many files actually
+  target it), not against the library total. Sizing them from the first file seen threw a
+  `KeyError` on the first title wanting something extra, and since the panel swallowed a failed
+  fetch the entire chart silently vanished; it now shows the error instead of rendering nothing.
   Rendered on the Overview (and under the Library tab) as a stacked bar + per-language mini bars.
 - **`GET /api/library?state=complete|incomplete|unreadable|all&lib=&q=&limit=&offset=`** lists the
   files themselves — coverage says *how much*, this says *which ones*, which is the only form you

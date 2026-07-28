@@ -263,21 +263,33 @@ def coverage():
     the profile its kind targets."""
     cfg = core.load_config()
     libs = {}
+    # The target list is no longer uniform inside a library: the anime profile's `orig` slot
+    # resolves per title, so Blue Lock targets jpn and Arcane (French) doesn't. Sizing the
+    # per-language counters from the first file seen therefore blew up with a KeyError on the
+    # first title that targeted something extra — and since the panel swallows a failed fetch,
+    # the whole coverage chart simply vanished. Accumulate the UNION instead, and count each
+    # language against how many files actually target it (`audio_of`) rather than against the
+    # library total, so "Japanese 100%" means every file that wants it has it.
     for r, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s in _inventory(cfg):
         L = libs.setdefault(top, {"name": top, "kind": kind, "total": 0, "unreadable": 0,
                                   "complete": 0, "missing_audio": 0, "missing_subs": 0,
                                   "missing_both": 0,
-                                  "audio": {k: 0 for k in want_a},
-                                  "subs": {k: 0 for k in want_s},
-                                  "targets": {"audio": want_a, "subs": want_s}})
+                                  "audio": {}, "subs": {}, "audio_of": {}, "subs_of": {},
+                                  "targets": {"audio": [], "subs": []}})
         L["total"] += 1
+        for which, want in (("audio", want_a), ("subs", want_s)):
+            for k in want:
+                if k not in L[which]:
+                    L[which][k] = 0
+                    L["targets"][which].append(k)      # first-seen order: fre, eng, then any VO
         if have_a is None:
             L["unreadable"] += 1
-            continue
-        for k in want_a:
-            if k in have_a: L["audio"][k] += 1
-        for k in want_s:
-            if k in have_s: L["subs"][k] += 1
+            continue                     # can't say whether an unreadable file has a language
+        for which, want, have in (("audio", want_a, have_a), ("subs", want_s, have_s)):
+            for k in want:
+                L[f"{which}_of"][k] = L[f"{which}_of"].get(k, 0) + 1
+                if k in have:
+                    L[which][k] += 1
         if miss_a and miss_s:   L["missing_both"] += 1
         elif miss_a:            L["missing_audio"] += 1
         elif miss_s:            L["missing_subs"] += 1
