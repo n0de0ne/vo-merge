@@ -13,7 +13,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
-                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat)
+                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat, run_mux)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -733,7 +733,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
        and _video_quality(en_file, ei["dur"]) >= _video_quality(fr, fi["dur"]):
         out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        if subprocess.run(["mkvmerge", "-o", out, en_file], capture_output=True).returncode in (0, 1):
+        ok_mux, mux_err = run_mux(["mkvmerge", "-o", out, en_file], out, cfg)
+        if ok_mux:
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
@@ -822,10 +823,9 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_ep_status(ep["id"], "error",
-                           error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
+    ok_mux, mux_err = run_mux(cmd, out, cfg)
+    if not ok_mux:
+        core.set_ep_status(ep["id"], "error", progress="", error=mux_err); return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)

@@ -110,6 +110,14 @@ DEFAULTS = {
     "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
     "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
     "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
+    "mux_timeout_min": 240,                # kill an mkvmerge that runs longer than this. It is a
+                                           # deadlock guard, not a tuning knob — a wedged mux (a
+                                           # stalled /mnt/user read, a hung iGPU decode) held the
+                                           # merge worker forever, and at max_parallel_merges=1
+                                           # that silently stops ALL merging with no error.
+    "sync_decode_timeout_min": 30,         # ...and the same for one sync-detection decode pass,
+                                           # which reads a bounded window (sync_window_dur) and so
+                                           # can never legitimately take this long.
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
@@ -166,8 +174,12 @@ def load_config():
             cfg.update(json.load(open(CONFIG_FILE)))
         except Exception:
             pass
-    _SECRETS.clear()
-    _SECRETS.update(str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8)
+    # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
+    # every job calls this constantly, and a redact() running inside the clear-to-update window
+    # saw an empty set — writing the secret it was meant to scrub verbatim into the log. Rebinding
+    # is atomic as far as other threads are concerned: they see either the old set or the new one.
+    global _SECRETS
+    _SECRETS = {str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8}
     return cfg
 
 
@@ -211,7 +223,7 @@ def save_config(updates: dict):
 _SECRET_QS = re.compile(r'((?:api_?key|apikey|token|passkey|rss_?key|auth|pass(?:word)?)=)[^&\s]+',
                         re.I)
 _SECRET_KEYS = ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token", "plex2_token",
-                "qb_pass", "webhook_token")
+                "qb_pass", "webhook_token", "api_key")
 _SECRETS = set()      # the configured values themselves, refreshed whenever config is read
 
 

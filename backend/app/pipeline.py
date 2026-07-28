@@ -1097,6 +1097,43 @@ def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, 
     return st
 
 
+# ---------------------------------------------------------------- MUX (mkvmerge)
+def _unlink(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        core.log(f"cleanup: could not remove {path}: {e}")
+
+
+def run_mux(cmd, out, cfg=None):
+    """Run one mkvmerge, returning (ok, error). Always removes a partial `out` on failure.
+
+    Two things every mux site got wrong. **No timeout**: a wedged mkvmerge — a stalled /mnt/user
+    read, or the iGPU driver hanging the decode the sync stage feeds it — parked the merge worker
+    forever, and at the default `max_parallel_merges: 1` that is the whole merge pipeline, with
+    nothing detecting or reporting it. **No cleanup**: on rc>=2 (disk full being the classic
+    cause) the half-written file was left in `<libdir>/_merged/`, inside the folder Plex indexes,
+    where it can be picked up as an alternate version — and where it compounds the very disk-full
+    that produced it, once per retry.
+
+    rc=1 is mkvmerge's "completed with warnings", which is a success."""
+    cfg = cfg or core.load_config()
+    timeout = max(60, int(cfg.get("mux_timeout_min", 240)) * 60)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _unlink(out)
+        return False, f"mkvmerge exceeded {timeout // 60}min and was killed"
+    except Exception as e:
+        _unlink(out)
+        return False, f"mkvmerge failed to start: {e}"
+    if r.returncode in (0, 1):
+        return True, None
+    _unlink(out)
+    return False, f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}"
+
+
 # ---------------------------------------------------------------- PROBE (local bins)
 def _ffprobe(path, args):
     try:
@@ -1161,10 +1198,9 @@ def _place_multi(en, mv, cfg, tmdb_id):
     outdir = os.path.dirname(libfile) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
-    r = subprocess.run(["mkvmerge", "-o", out, en], capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error",
-                        error=f"multi remux rc={r.returncode}: {media.mkv_error(r, 200)}"); return
+    ok, err = run_mux(["mkvmerge", "-o", out, en], out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", error=f"multi remux: {err}"); return
     core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
                     merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
@@ -1351,9 +1387,9 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base] + \
           _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
-        core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}")
+    ok, err = run_mux(cmd, out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", progress="", error=err)
         return
     core.set_status(tmdb_id, "merged", merged_file=out, progress="", merge_kind="grafted",
                     sync_offset_ms=offset, sync_drift=drift,
@@ -1392,7 +1428,8 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
             return
         offset_ms = int(round(m))
     # shift EVERY audio track of that language (a release can carry 2+, e.g. 5.1 + 2.0)
-    j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True).stdout)
+    j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True,
+                                  timeout=180).stdout)
     shift_ids = [t["id"] for t in j["tracks"]
                  if t["type"] == "audio" and (t["properties"].get("language") or "").lower().startswith(shift_pfx)]
     if not shift_ids:
@@ -1402,10 +1439,9 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
     for sid in shift_ids:
         cmd += ["--sync", f"{sid}:{offset_ms:+d}"]
     cmd += [f]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error",
-                        error=f"resync mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
+    ok, err = run_mux(cmd, out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", error=f"resync {err}"); return
     shutil.move(out, f)
     core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
     core.log(f"resync {tmdb_id}: shifted {len(shift_ids)} {shift_pfx} track(s) {offset_ms:+d}ms")

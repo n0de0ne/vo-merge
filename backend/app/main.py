@@ -11,6 +11,7 @@ from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 app = FastAPI(title="VO Merger")
 STATIC = os.environ.get("VO_STATIC", "/app/static")
 PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
+PREVIEW_TIMEOUT = 300          # seconds for one 20s preview clip encode
 
 
 def _under(path, root):
@@ -94,29 +95,91 @@ def movies(status: str | None = None):
     return core.get_movies(status)
 
 
+# Secrets the UI must be able to read back, each with its reason. Everything else in
+# core._SECRET_KEYS is masked automatically, so protecting a NEW secret is a matter of adding it
+# to that tuple — nobody has to remember this endpoint. The old hand-written mask list is exactly
+# how plex2_token (a real Plex account token) came to be returned in cleartext beside five
+# siblings that were masked.
+_VISIBLE_SECRETS = {
+    # The Settings page renders the webhook URL to paste into Radarr/Sonarr, and the token IS
+    # that URL's query string — masking it would only move the exposure into a field the
+    # operator then can't use. It is protected by api_key like the rest of the API.
+    "webhook_token",
+}
+
+
+def _mask_secrets(cfg):
+    for k in core._SECRET_KEYS:
+        if k in _VISIBLE_SECRETS or k not in cfg:
+            continue
+        # qb_pass keeps the placeholder form: the UI renders a password input and treats
+        # "********" as "unchanged" when saving. The rest report only whether they are set.
+        cfg[k] = ("********" if cfg[k] else "") if k == "qb_pass" else bool(cfg[k])
+    return cfg
+
+
 @api.get("/settings")
 def get_settings():
-    cfg = core.load_config()
-    cfg["qb_pass"] = "********" if cfg["qb_pass"] else ""   # never echo secret
-    cfg["prowlarr_key"] = bool(cfg["prowlarr_key"])
-    cfg["radarr_key"] = bool(cfg["radarr_key"])
-    cfg["sonarr_key"] = bool(cfg.get("sonarr_key"))
-    cfg["plex_token"] = bool(cfg["plex_token"])
-    return cfg
+    return _mask_secrets(core.load_config())
 
 
 class SettingsIn(BaseModel):
     data: dict
 
 
+# Keys that become APScheduler intervals, with the smallest value that is not self-harm. Zero is
+# not "disabled" here: APScheduler coerces a zero-length interval to one second, so
+# `search_interval_min: 0` runs the whole scan-and-search sweep every second. A non-numeric value
+# is worse — `timedelta(minutes="60")` raises AFTER save_config has already persisted it, so the
+# next boot dies inside scheduler.start() and the app never comes up until config.json is edited
+# by hand on the host.
+_MIN_VALUES = {"search_interval_min": 1, "finish_interval_min": 1, "stall_check_interval_min": 1,
+               "promote_interval_min": 1, "max_parallel_merges": 1, "mux_timeout_min": 1,
+               "sync_decode_timeout_min": 1}
+
+
+def _validate_settings(d):
+    """Coerce each incoming setting to the type of its default and clamp the dangerous ones.
+
+    Nothing validated these before — `save_config` filters on key NAME only, so any type at all
+    could be persisted. Keys with a legitimate 0 or negative meaning (`no_release_retry_h`: 0 =
+    every scan, negative = never) are deliberately not clamped."""
+    out = {}
+    for k, v in d.items():
+        if k not in core.DEFAULTS:
+            continue                       # save_config drops unknown keys anyway
+        default = core.DEFAULTS[k]
+        try:
+            if isinstance(default, bool):          # before int: bool IS an int in Python
+                v = bool(v)
+            elif isinstance(default, int):
+                v = int(v)
+            elif isinstance(default, float):
+                v = float(v)
+            elif isinstance(default, list):
+                if not isinstance(v, list):
+                    raise ValueError
+            elif isinstance(default, dict):
+                if not isinstance(v, dict):
+                    raise ValueError
+            elif isinstance(default, str):
+                v = str(v)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                422, f"{k}: expected {type(default).__name__}, got {type(v).__name__} ({v!r})")
+        if k in _MIN_VALUES and v < _MIN_VALUES[k]:
+            v = _MIN_VALUES[k]
+        out[k] = v
+    return out
+
+
 @api.post("/settings")
 def post_settings(body: SettingsIn):
-    # drop masked/unchanged secret placeholders
+    # Drop the masked placeholders a GET handed out, so saving the form doesn't overwrite a real
+    # secret with "********" or with the boolean that stood in for it.
     d = {k: v for k, v in body.data.items()
-         if not (k in ("qb_pass",) and v == "********")
-         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token")
-                  and v in (True, False))}
-    cfg = core.save_config(d)
+         if not (k in core._SECRET_KEYS and (v == "********" or isinstance(v, bool)))}
+    core.save_config(_validate_settings(d))
     scheduler.reschedule()
     return {"ok": True}
 
@@ -138,13 +201,14 @@ def test(which: str):
         else:
             raise HTTPException(404, "unknown service")
         return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@api.post("/scan")
-def do_scan():
-    return {"found": pipeline.scan()}
+        # These clients pass their credential in the URL — Plex as ?X-Plex-Token=, the *arrs as
+        # ?apikey= — and both ConnectionError and raise_for_status()'s HTTPError quote the full
+        # URL, query string included, in their message. core.redact exists for exactly this and
+        # is applied on the log() and _set_row funnels; this response path never went through it.
+        return {"ok": False, "error": core.redact(str(e))}
 
 
 @api.post("/rescan")
@@ -1606,12 +1670,16 @@ def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
     os.makedirs(out, exist_ok=True)
     ai = _audio_index(f, lang)
     vid, aud = os.path.join(out, "video.mp4"), os.path.join(out, "audio.m4a")
+    # 20-second clips: a run past PREVIEW_TIMEOUT is a wedged decode, and this one blocks a
+    # request thread rather than the merge worker.
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
                     "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "scale=640:-2",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-                    "-movflags", "+faststart", vid], capture_output=True)
+                    "-movflags", "+faststart", vid],
+                   capture_output=True, timeout=PREVIEW_TIMEOUT)
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
-                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
+                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud],
+                   capture_output=True, timeout=PREVIEW_TIMEOUT)
     ver = int(os.path.getmtime(f))           # changes whenever Apply rewrites the file -> busts cache
     return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}_{ver}",
             "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}_{ver}",

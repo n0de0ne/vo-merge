@@ -1562,7 +1562,10 @@ function AiSolvedPanel() {
 }
 
 // ---------------- Settings ----------------
-const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token"];
+// Server-side these are masked to a plain "is it set?" boolean (see main._mask_secrets), so a
+// boolean coming back from the form means "unchanged" and must not be saved over the real value.
+const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token",
+                      "plex2_token", "api_key"];
 function Settings() {
   const [cfg, setCfg] = useState<Record<string, any> | null>(null);
   const [changed, setChanged] = useState<Record<string, any>>({});
