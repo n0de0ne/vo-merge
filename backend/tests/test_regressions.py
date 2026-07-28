@@ -149,7 +149,8 @@ def test_run_mux_kills_and_cleans_up_on_timeout(app_env, tmp_path, monkeypatch):
     ALL merging with nothing reporting it."""
     from app import pipeline
     out = str(tmp_path / "hung.mkv")
-    open(out, "w").write("partial")
+    with open(out, "w") as f:
+        f.write("partial")
 
     def fake_run(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
@@ -215,7 +216,8 @@ def test_tv_usable_applies_both_floors(app_env, best, want, why):
 def test_tv_multi_bonus_matches_the_rest_of_the_scorers(app_env):
     """+20 here against +200 everywhere else meant the one path that decides unattended barely
     expressed the preference the whole design is built on."""
-    src = (open(os.path.join(os.path.dirname(__file__), "..", "app", "tv.py")).read())
+    with open(os.path.join(os.path.dirname(__file__), "..", "app", "tv.py")) as f:
+        src = f.read()
     assert "sc += 40 if subs_only else 200" in src
 
 
@@ -230,11 +232,13 @@ def test_a_broken_config_is_never_overwritten(app_env):
     """load_config fell back to DEFAULTS silently, and the next save — which starts from that
     fallback — wrote the defaults back, erasing every URL and key the operator had entered."""
     app_env.save_config({"min_seeders": 9, "prowlarr_url": "http://real:9696"})
-    open(app_env.CONFIG_FILE, "w").write('{"min_seeders": 9, TRUNCA')
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"min_seeders": 9, TRUNCA')
     app_env.load_config()
     with pytest.raises(app_env.ConfigUnreadable):
         app_env.save_config({"min_seeders": 3})
-    assert "TRUNCA" in open(app_env.CONFIG_FILE).read(), "the operator's file was destroyed"
+    with open(app_env.CONFIG_FILE) as f:
+        assert "TRUNCA" in f.read(), "the operator's file was destroyed"
 
 
 # ------------------------------------------------------------------ finding 21
