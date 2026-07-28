@@ -1825,6 +1825,13 @@ function Settings() {
         <label>AI reply timeout (min)</label>{Text("ai_stale_min", "number")}
         <span className="muted">no verdict in this long → flag for manual review. This is the
           only backstop for the host script having stopped running, so don't set it high.</span>
+        <label>API URL (from the host)</label>{Text("api_url")}
+        <span className="muted"><b>Set this.</b> Every ticket tells the dispatcher where to call —
+          e.g. <code>http://10.0.1.5:8090</code>. Left empty, the brief only carries the
+          in-container address, which a host script can't reach.</span>
+        <label>Docs path (on the host)</label>{Text("docs_path")}
+        <span className="muted">where CLAUDE.md lives for the dispatcher to read, e.g.
+          <code>/mnt/user/appdata/.../CLAUDE.md</code>. Optional.</span>
       </div>
 
       <div className="section-title">Master</div>
