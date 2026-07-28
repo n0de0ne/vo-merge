@@ -165,6 +165,14 @@ export function setApiKey(k: string) {
   try { k ? localStorage.setItem(KEY_STORAGE, k) : localStorage.removeItem(KEY_STORAGE); } catch { /* private mode */ }
 }
 
+/** Append the API key to a URL loaded by the browser directly (a <video src> or a bare fetch
+ *  can't carry the X-API-Key header). The guard accepts ?apikey= for exactly this. */
+export function withKey(url: string): string {
+  const k = getApiKey();
+  if (!k) return url;
+  return url + (url.includes("?") ? "&" : "?") + "apikey=" + encodeURIComponent(k);
+}
+
 export class Unauthorized extends Error {
   constructor() { super("API key required"); this.name = "Unauthorized"; }
 }
@@ -202,7 +210,10 @@ export const api = {
   searchAll: () => j<{ ok: boolean; started: boolean; pending?: number; slots?: number | null; note?: string }>(
     "/api/search_all", { method: "POST" }),
   search: (id: number) => j<Movie>(`/api/movie/${id}/search`, { method: "POST" }),
-  merge: (id: number) => j<Movie>(`/api/movie/${id}/merge`, { method: "POST" }),
+  // Queues rather than merges inline (see pipeline.enqueue_merge). `note` says when nothing will
+  // drain the queue — the pipeline being disabled or paused.
+  merge: (id: number) =>
+    j<{ movie: Movie; queued: boolean; note: string }>(`/api/movie/${id}/merge`, { method: "POST" }),
   sync: (id: number, offset_ms: number) =>
     j<Movie>(`/api/movie/${id}/sync`, { method: "POST", body: JSON.stringify({ offset_ms }) }),
   retry: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/retry`, { method: "POST" }),

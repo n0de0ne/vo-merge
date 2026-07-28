@@ -34,8 +34,12 @@ def _donor_roots(cfg):
     """Every directory a downloaded donor can legitimately live in, as THIS container sees it.
 
     Movies and TV use different qB save paths, and qB reports them under its own /data prefix, so
-    a single configured root would reject half the real donors. Existing (non-empty) directories
-    only, so a mistyped setting can't silently widen this."""
+    a single configured root would reject half the real donors.
+
+    These come from config, so they are only as narrow as the operator's settings: pointing
+    `downloads_mount` at `/media` would widen the donor guard to the whole library. That is a
+    misconfiguration rather than something to defend against here — the guard exists to stop a
+    caller naming an arbitrary path, not to second-guess the mount layout."""
     out = []
     for p in (cfg.get("downloads_mount"),
               pipeline._qb_to_local(cfg.get("qb_download_dir"), cfg),
@@ -249,15 +253,60 @@ def test(which: str):
         return {"ok": False, "error": core.redact(str(e))}
 
 
+def _bg_scan(scope):
+    """Run a progressive scan in the background under SCAN_LOCK, reporting through SCAN_STATE.
+
+    Same locking and progress reporting as /rescan, but none of its extra powers: no probe-cache
+    drop, no prune, and `series_pilot` is honoured — this is "pick up what's new", not "re-read
+    and reconcile the library"."""
+    import threading
+    from . import tv
+
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan is already running",
+                "state": pipeline.SCAN_STATE}
+
+    def _run():
+        st = pipeline.SCAN_STATE
+        st.update(running=True, scope=scope, started=time.time(), finished=0, phase="starting",
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None,
+                  full=False)
+        media.reset_stats()
+        try:
+            cfg = core.load_config()
+            if scope in ("all", "films"):
+                st["phase"] = "films"
+                st["films"] = pipeline.scan(cfg)
+            if scope in ("all", "tv"):
+                st["phase"] = "series & anime"
+                st["episodes"] = tv.scan(cfg)
+            st["phase"] = "done"
+        except Exception as e:
+            st["error"] = str(e); st["phase"] = "error"
+            core.log(f"scan({scope}) failed: {e}")
+        finally:
+            st["running"] = False
+            st["finished"] = time.time()
+            st["read"], st["reused"] = media.STATS["probed"], media.STATS["cached"]
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "state": pipeline.SCAN_STATE}
+
+
 @api.post("/scan")
 def do_scan():
-    """Progressive film scan. Delegates to /rescan so it runs in the background under SCAN_LOCK.
+    """Progressive film scan, in the background under SCAN_LOCK.
 
     It used to call pipeline.scan() inline: minutes of mkvmerge in a request thread, and — since
     scan() takes no lock of its own, its callers always did — a second heavy probe pass could run
     alongside a /rescan already holding SCAN_LOCK, which is exactly what that lock forbids. While
-    it ran, hold_reason() reported nothing, so searches kept grabbing off half-finished state."""
-    return do_rescan(forget=False, scope="films")
+    it ran, hold_reason() reported nothing, so searches kept grabbing off half-finished state.
+
+    Deliberately NOT `do_rescan(scope="films")`: a rescan also prunes records whose file is gone
+    and forces `series_pilot=[]`, and "Scan now" is a different, additive contract. Use the
+    Library tab's re-read buttons for the destructive/whole-library pass."""
+    return _bg_scan("films")
 
 
 @api.post("/rescan")
@@ -949,7 +998,11 @@ def search_all():
 
 @api.post("/movie/{tmdb_id}/search")
 def do_search(tmdb_id: int):
-    pipeline.search_movie(tmdb_id); return core.get_movie(tmdb_id)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
+    return core.get_movie(tmdb_id)
 
 
 @api.post("/movie/{tmdb_id}/merge")
@@ -958,9 +1011,10 @@ def do_merge(tmdb_id: int):
     must not merge inline."""
     if not core.get_movie(tmdb_id):
         raise HTTPException(404, "unknown movie")
-    if not pipeline.enqueue_merge("movie", tmdb_id):
-        raise HTTPException(409, "already merging")
-    return core.get_movie(tmdb_id)
+    queued, note = pipeline.enqueue_merge("movie", tmdb_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"movie": core.get_movie(tmdb_id), "queued": True, "note": note}
 
 
 @api.get("/movie/{tmdb_id}/candidates")
@@ -1000,10 +1054,11 @@ def set_sync(tmdb_id: int, body: SyncIn):
         # otherwise the video scene-cut matcher tries to align it. An explicit offset is an
         # instruction (sync_manual=1, applied verbatim); offset 0 means "detect it", so the flag
         # is cleared or detection would be skipped with a zero shift.
-        if not pipeline.enqueue_merge("movie", tmdb_id, error=None,
-                                      sync_offset_ms=(body.offset_ms or 0),
-                                      sync_manual=1 if body.offset_ms else 0):
-            raise HTTPException(409, "already merging")
+        queued, note = pipeline.enqueue_merge("movie", tmdb_id, error=None,
+                                              sync_offset_ms=(body.offset_ms or 0),
+                                              sync_manual=1 if body.offset_ms else 0)
+        if not queued:
+            raise HTTPException(409, note)
     return core.get_movie(tmdb_id)
 
 
@@ -1038,8 +1093,11 @@ def unignore(tmdb_id: int):
 @api.post("/movie/{tmdb_id}/research")
 def research(tmdb_id: int):
     # search again now (keeps the tried-blocklist so it won't re-pick known-bad releases)
-    core.set_status(tmdb_id, "pending", error=None, dl_hash=None, dl_id=None, en_file=None)
-    pipeline.search_movie(tmdb_id)
+    core.set_status(tmdb_id, "pending", error=None, **pipeline.DONOR_RESET)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
     return core.get_movie(tmdb_id)
 
 
@@ -1060,8 +1118,11 @@ def another(tmdb_id: int):
     except Exception:
         pass
     core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
-                    dl_hash=None, dl_id=None, en_file=None)
-    pipeline.search_movie(tmdb_id)
+                    **pipeline.DONOR_RESET)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
     return core.get_movie(tmdb_id)
 
 
@@ -1255,9 +1316,10 @@ def movie_set_sync(tmdb_id: int, body: SetSyncIn):
         raise HTTPException(404, "unknown movie")
     _set_sync("movie", mv, tmdb_id, body)
     core.log(f"set_sync {tmdb_id}: offset={body.offset_ms}ms drift={body.drift}")
-    if not pipeline.enqueue_merge("movie", tmdb_id):
-        raise HTTPException(409, "already merging")
-    return core.get_movie(tmdb_id)
+    queued, note = pipeline.enqueue_merge("movie", tmdb_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"movie": core.get_movie(tmdb_id), "queued": True, "note": note}
 
 
 @api.post("/episode/{ep_id}/set_sync")
@@ -1269,9 +1331,10 @@ def episode_set_sync(ep_id: str, body: SetSyncIn):
         raise HTTPException(404, "unknown episode")
     _set_sync("episode", e, ep_id, body)
     core.log(f"set_sync {ep_id}: offset={body.offset_ms}ms drift={body.drift}")
-    if not pipeline.enqueue_merge("episode", ep_id):
-        raise HTTPException(409, "already merging")
-    return core.get_episode(ep_id)
+    queued, note = pipeline.enqueue_merge("episode", ep_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"episode": core.get_episode(ep_id), "queued": True, "note": note}
 
 
 class SyncProbeIn(BaseModel):
@@ -1328,7 +1391,7 @@ def movie_sync_probe(tmdb_id: int, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("movie", mv, tmdb_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                   drift=out["drift"]))
-        out["applied"] = pipeline.enqueue_merge("movie", tmdb_id)
+        out["applied"], out["note"] = pipeline.enqueue_merge("movie", tmdb_id)
     return out
 
 
@@ -1345,7 +1408,7 @@ def episode_sync_probe(ep_id: str, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("episode", e, ep_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                  drift=out["drift"]))
-        out["applied"] = pipeline.enqueue_merge("episode", ep_id)
+        out["applied"], out["note"] = pipeline.enqueue_merge("episode", ep_id)
     return out
 
 
@@ -1798,8 +1861,9 @@ def tv_episodes(status: str | None = None):
 
 @api.post("/tv/scan")
 def tv_scan():
-    """Progressive series+anime scan — see do_scan for why this delegates rather than run inline."""
-    return do_rescan(forget=False, scope="tv")
+    """Progressive series+anime scan — see do_scan for why it is backgrounded, and why it is not
+    a rescan."""
+    return _bg_scan("tv")
 
 
 @api.get("/tv/{series_id}/{season}/candidates")

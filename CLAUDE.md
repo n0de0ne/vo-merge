@@ -232,7 +232,7 @@ usually ships them — so taking them costs one extra mkvmerge argument, not ano
 - **Subtitles get the same `--sync` as the audio** — they're timed to the donor's video, so an
   offset *and* a PAL rate stretch apply identically (verified: a cue at 1000 ms lands at 1293 ms
   under `+250 ms, ×1.0427083`).
-- `media.sub_rank()` picks *which* track when a pack ships six: full translation > forced > SDH >
+- `media.sub_rank()` picks *which* track when a pack ships six: full translation > SDH > forced >
   **signs & songs**, and text beats image (PGS/VobSub). Grafted subs are **never default-flagged**
   — a default subtitle starts burned-in for every viewer.
 

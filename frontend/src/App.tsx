@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, setApiKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
+import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
   CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
 
 const fmtTime = (s: number) => {
@@ -166,7 +166,7 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
     try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {}
     try {
       const dd = await api.preview(movie.tmdb_id, "eng", t); setD(dd); setMsg("decoding audio…");
-      const buf = await (await fetch(dd.audio)).arrayBuffer();
+      const buf = await (await fetch(withKey(dd.audio))).arrayBuffer();
       const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
       const ab = await ac.decodeAudioData(buf);
       ctxRef.current = ac; bufRef.current = ab;
@@ -252,7 +252,7 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
           playhead. Sound too early → spike is <b>left</b> of the line → push toward <b>+</b>.</p>
         {msg && <div className="muted">{msg}</div>}
         {d && <>
-          <video ref={v} src={d.video} muted loop playsInline controls
+          <video ref={v} src={withKey(d.video)} muted loop playsInline controls
             style={{ width: "100%", maxHeight: "46vh", borderRadius: 8, background: "#000" }} />
           <div className="row" style={{ margin: "8px 0 2px" }}>
             <span className="muted" style={{ width: 46 }}>scene:</span>
@@ -1760,7 +1760,11 @@ function Settings() {
       <div className="form-grid">
         <label>Webhook token</label>{Text("webhook_token")}
         <span className="muted">optional; when set, the URLs above must carry
-          <code>?token=…</code>. Leave empty for no check (LAN-only, like the rest of the API)</span>
+          <code>?token=…</code>. Leave empty for no check</span>
+        <label>API key</label>{Secret("api_key")}
+        <span className="muted">optional; when set, every API call needs it (this page will ask
+          once and remember). Radarr/Sonarr webhooks are exempt — they use the token above — and
+          so is the container healthcheck. <b>Cross-site requests are refused either way.</b></span>
       </div>
 
       <div className="section-title">Language targets</div>

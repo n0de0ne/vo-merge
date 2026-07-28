@@ -181,23 +181,45 @@ DEFAULTS = {
 _lock = threading.Lock()
 
 
-_CONFIG_BROKEN = {"at": 0.0}     # when the persisted config last failed to parse
+# Whether the persisted config currently fails to parse, and which file state we already
+# complained about. `load_config` runs on EVERY API request and every scheduler tick, so logging
+# the failure each time would bury the real history — the log rotates at 8 MB keeping 3 files, so
+# a broken config would churn through all of it in minutes. Complain once per distinct
+# (mtime, size), i.e. once per edit.
+_CONFIG_BROKEN = {"at": 0.0, "reported": None}
 
 
 def load_config():
     cfg = dict(DEFAULTS)
-    if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = f.read()
+    except OSError:
+        # No file at all is the normal first-run state — and it is also how an operator ACTS ON
+        # the message below, which says "fix or remove the file". Clearing the flag here is what
+        # makes removing it work; keying only off a successful parse left the process refusing to
+        # save for its whole lifetime against a file that no longer existed.
+        _CONFIG_BROKEN.update(at=0.0, reported=None)
+        raw = None
+    if raw is not None:
         try:
-            cfg.update(json.load(open(CONFIG_FILE)))
-            _CONFIG_BROKEN["at"] = 0.0
+            cfg.update(json.loads(raw))
+            _CONFIG_BROKEN.update(at=0.0, reported=None)
         except Exception as e:
             # Silently falling back to DEFAULTS is how a truncated config.json erased an install:
             # every URL and key reads as empty, `enabled` flips to False, and the next save_config
             # — which starts from this very dict — writes the defaults back over the real file.
             # Say so loudly, and refuse to save over it (see save_config).
+            try:
+                st = os.stat(CONFIG_FILE)
+                fingerprint = (st.st_mtime, st.st_size)
+            except OSError:
+                fingerprint = None
+            if _CONFIG_BROKEN["reported"] != fingerprint:
+                _CONFIG_BROKEN["reported"] = fingerprint
+                log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
+                    f"REFUSING to overwrite it. Fix or remove the file.")
             _CONFIG_BROKEN["at"] = _CONFIG_BROKEN["at"] or time.time()
-            log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
-                f"REFUSING to overwrite it. Fix or remove the file.")
     # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
     # every job calls this constantly, and a redact() running inside the clear-to-update window
     # saw an empty set — writing the secret it was meant to scrub verbatim into the log. Rebinding
@@ -327,7 +349,8 @@ def ticket(kind, summary, context=None, key=None, force=False):
     try:
         seen_path = os.path.join(CONFIG_DIR, "ai_tickets_filed.json")
         try:
-            seen = set(json.load(open(seen_path)))
+            with open(seen_path) as f:
+                seen = set(json.load(f))
         except Exception:
             seen = set()
         k = f"{kind}:{key or ''}"
@@ -344,7 +367,8 @@ def ticket(kind, summary, context=None, key=None, force=False):
                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S")},
                       f, ensure_ascii=False, indent=1, default=str)
         seen.add(k)
-        json.dump(sorted(seen)[-3000:], open(seen_path, "w"))
+        with open(seen_path, "w") as f:
+            json.dump(sorted(seen)[-3000:], f)
         log(f"AI-TICKET {kind}: {summary[:70]}")
         return True
     except Exception as e:

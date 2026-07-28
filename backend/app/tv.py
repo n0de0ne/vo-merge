@@ -5,7 +5,7 @@ audio onto each French episode (best video kept), in place.
 
 Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scope_series.
 """
-import os, re, subprocess, shutil, time, threading
+import os, re, shutil, time, threading
 from collections import defaultdict
 from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
@@ -281,7 +281,9 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                 if st_ != prev and prev:
                     core.log(f"tv scan: {ep_id} is marked {prev} but still needs "
                              f"{'+'.join(miss_a + miss_s)} -> re-opening")
-                    extra["attempts"] = 0      # fresh run at the gap, fresh budget (see pipeline)
+                    # fresh run at the gap: fresh budget, and drop the donor whose offset would
+                    # otherwise be replayed onto the next one (see pipeline)
+                    extra.update(attempts=0, **DONOR_RESET)
                 # expect=prev: never drag a record the merge worker just claimed back to a queued
                 # state (see core._set_row).
                 core.set_ep_status(ep_id, st_, expect=prev,
@@ -347,8 +349,13 @@ def _size_bonus(r):
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=(),
-            need_subs=()):
-    """Return best (score, seeders, title, link) for a usable release, or None.
+            need_subs=(), tried=()):
+    """Return best (score, seeders, title, link, rid) for a usable release, or None.
+
+    `tried` is the set of release identities this record has already burned. Without it the
+    blocklist every retry path maintains was decorative on the TV side: the search re-ran, scored
+    the same candidates the same way, and re-picked the identical release — the grab -> stall ->
+    blocklist -> re-grab-the-same-thing loop.
     `absn` = this episode's absolute number, so an anime release that numbers absolutely
     ('Title - 51') still matches a search for its aired S04E15.
     `need` = languages still missing; a French-dub-only release is only worth grabbing when
@@ -396,25 +403,34 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
         if re.search(r'\bMULTI\b', t, re.I): sc += 40 if subs_only else 200
         sc += 60 * media.lang_hits(t, lang_need, query)  # names a language this episode is missing
         link = _pick_link(r)
+        rid = _hash_from_magnet(link) or r.get("guid") or t
+        if rid in tried:
+            continue                     # already grabbed and rejected for this record
         if best is None or sc > best[0]:
-            best = (sc, r.get("seeders") or 0, t, link)
+            best = (sc, r.get("seeders") or 0, t, link, rid)
     return best
 
 
 def _usable(best, cfg):
-    """Does `_search`'s winner clear the same two floors the movie path applies?
+    """Is `_search`'s winner worth grabbing? `_search` returns (score, seeders, title, link).
 
-    `_search` returns (score, seeders, title, link). The old test was
-    `best[0] < cfg["min_seeders"]`, which compares the SCORE against the seeder minimum: the score
-    starts at min(seeders, 100) and then collects a MULTI bonus and +60 per matching language, so a
-    zero-seed release cleared a floor of 5 comfortably. `score_threshold` was never consulted on
-    the TV path at all, and the season-pack branch had no floor whatsoever — so a dead pack was
-    grabbed, stalled for stall_timeout_min, was blocklisted, and the cycle repeated through every
-    dead pack the indexer listed, burning a grab slot and a 12-hour dl_max_age window each time."""
+    The bug this fixes was `best[0] < cfg["min_seeders"]` — comparing the SCORE against the seeder
+    minimum. The score starts at min(seeders, 100) and then collects a MULTI bonus and +60 per
+    matching language, so a zero-seed release cleared a floor of 5 comfortably, and the
+    season-pack branch had no floor whatsoever: a dead pack was grabbed, stalled for
+    stall_timeout_min, was blocklisted, and the cycle repeated through every dead pack the indexer
+    listed, burning a grab slot and a 12-hour dl_max_age window each time.
+
+    Only the SEEDER floor is applied, deliberately. `score_threshold` is calibrated against
+    `pipeline.score_release`, which awards bonuses this scorer does not have (+60 resolution
+    match, +30 source match, +80 id match) — so the same number is a far higher bar here. At the
+    default 60 it would demand ~40 seeders of any release that is neither MULTI nor advertises a
+    missing language, which is exactly the shape of an ordinary English release (English is
+    unmarked, so `lang_hits` is 0 for the common case). Rejecting those is worse than the bug."""
     if not best:
         return False
-    score, seeders = best[0], best[1]
-    return score >= cfg["score_threshold"] and seeders >= cfg["min_seeders"]
+    _score, seeders = best[0], best[1]
+    return seeders >= cfg["min_seeders"]
 
 
 def season_candidates(series_id, season, cfg=None):
@@ -686,15 +702,19 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
     `no_release_retry_h` expired for a large backlog at once, a single cycle ran one Prowlarr query
     per episode across hundreds of episodes — exactly the hammering `max_search_per_run` exists to
     prevent, and re-run by the finish refill every 10 minutes."""
+    import json as _json
     if len(eps) >= cfg["tv_pack_threshold"]:
         q = f"{title} S{season:02d}"
-        best = _search(q, cfg, want_pack=True, season=season,
+        # A pack has to clear every member's blocklist: one episode having burned this release is
+        # reason enough not to grab it again for the whole season.
+        pack_tried = {x for e in eps for x in _json.loads(e.get("tried") or "[]")}
+        best = _search(q, cfg, want_pack=True, season=season, tried=pack_tried,
                        need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
                        need_subs={x for e in eps
                                   for x in (e.get("need_subs") or "").split(",") if x})
         n += 1
         if _usable(best, cfg):
-            sc, seed, rtitle, link = best
+            sc, seed, rtitle, link, rid = best
             h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
             if not h:
                 # grab failed -> mark these eps error (NOT a null-hash download, which would
@@ -704,7 +724,10 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
                 core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
                 return n
             seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
-            claimed = _assign_pack(sid, seasons, h, None, rtitle, cfg)
+            # `rid` (not None): the identity every retry path blocklists. Passing None meant the
+            # blocklist those paths maintain had nothing to record, so a dropped pack was
+            # re-picked by the very next search — the loop this is all meant to break.
+            claimed = _assign_pack(sid, seasons, h, rid, rtitle, cfg)
             core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
                      f"(seasons {sorted(seasons) if seasons else 'ALL'})")
             return n
@@ -715,6 +738,7 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
         rs, rn = rel[e["id"]]
         q = f"{title} S{rs:02d}E{rn:02d}"
         best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
+                       tried=set(_json.loads(e.get("tried") or "[]")),
                        need={x for x in (e.get("need_audio") or "").split(",") if x},
                        need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
         n += 1
@@ -722,13 +746,13 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
             core.set_ep_status(e["id"], "no_release",
                                candidate_title=(best[2] if best else None))
             continue
-        sc, seed, rtitle, link = best
+        sc, seed, rtitle, link, rid = best
         h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
         if not h:
             core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
             core.log(f"tv grab EP '{q}': grab failed -> error")
             continue
-        core.set_ep_status(e["id"], "downloading", dl_hash=h,
+        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
                            candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
         core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
     return n
@@ -801,7 +825,7 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             except Exception: pass
             _plex_ep_refresh(ep, cfg)
         else:
-            core.set_ep_status(ep["id"], "error", error="multi remux failed")
+            core.set_ep_status(ep["id"], "error", error=f"multi remux: {mux_err}")
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     # Only a DELIBERATELY set offset skips detection — see pipeline._merge_movie_impl. A stored
@@ -883,8 +907,11 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     except OSError:
         pass
     core.forget_probe(fr)           # the file changed; its cached languages are now stale
+    # sync_manual=0 — see pipeline: the instruction has been carried out and must not persist to
+    # whatever donor this episode is given next.
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
-                       sync_drift=drift, error=None, progress="", merge_kind="grafted",
+                       sync_drift=drift, sync_manual=0, error=None, progress="",
+                       merge_kind="grafted",
                        added_subs=",".join(sorted({x["lang"] for x in subs})),
                        added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms"

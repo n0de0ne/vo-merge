@@ -518,7 +518,10 @@ def ingest_movie(m, cfg, refresh=False):
         # then hit `attempts >= max_sync_retries` on its first stall — an effective budget of 1
         # per 24-hour cooldown instead of the configured 4. recheck_settled and retry_movie both
         # reset it deliberately; this path just never did.
-        extra["attempts"] = 0
+        # DONOR_RESET because re-opening means "the last donor didn't finish the job, go find
+        # another": its file, its id and — critically — its sync offset all describe a release
+        # this record is about to stop using.
+        extra.update(attempts=0, **DONOR_RESET)
     # `expect=prev` so a record the merge worker claimed between the read above and this write is
     # left alone rather than being dragged back to a queued state underneath a running merge.
     core.set_status(m["tmdbId"], status, expect=prev,
@@ -676,10 +679,12 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
         cand = candidates(tmdb_id, cfg)
     except SearchUnavailable as e:
         # Indexer unreachable — say nothing about whether a release exists. Back to `pending` so
-        # the next sweep retries, instead of `no_release` and a 24-hour cooldown.
+        # the next sweep retries, instead of `no_release` and a 24-hour cooldown. Then RE-RAISE:
+        # every remaining query this cycle would fail the same way, and stage_search stops rather
+        # than burning its budget confirming it. Swallowing it here made that handler dead code.
         core.set_status(tmdb_id, "pending", progress="")
         core.log(f"search {tmdb_id}: indexer unavailable ({e}) -> left pending for the next sweep")
-        return
+        raise
     if not cand or cand[0]["score"] < cfg["score_threshold"] or cand[0]["seeders"] < cfg["min_seeders"]:
         core.set_status(tmdb_id, "no_release",
                         candidate_title=(cand[0]["title"] if cand else None),
@@ -799,7 +804,10 @@ def drop_stalled(mv, t, cfg):
     if why:
         core.log(f"stalled {tmdb_id}: dropped, re-search held off ({why})")
         return
-    search_movie(tmdb_id, cfg)
+    try:
+        search_movie(tmdb_id, cfg)
+    except SearchUnavailable:
+        pass          # the record is back at `pending`; the next sweep retries
 
 
 _WEDGE_SINCE = {"ts": None}
@@ -1445,8 +1453,12 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if not ok:
         core.set_status(tmdb_id, "error", progress="", error=err)
         return
+    # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single
+    # /set_sync keep skipping detection for every future donor this record ever gets — the same
+    # replay bug the flag exists to prevent, just gated behind one manual fix. The offset itself
+    # is still recorded, for display and diagnosis.
     core.set_status(tmdb_id, "merged", merged_file=out, progress="", merge_kind="grafted",
-                    sync_offset_ms=offset, sync_drift=drift,
+                    sync_offset_ms=offset, sync_drift=drift, sync_manual=0,
                     added_subs=",".join(sorted({s["lang"] for s in subs})),
                     added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
@@ -1672,15 +1684,24 @@ def enqueue_merge(kind, ident, **fields):
     waits, and left the record invisible to the stale-merge requeue, which would then re-queue a
     merge that was still running.
 
-    Returns False when the worker already has this record — a second merge would graft the donor's
-    tracks onto the already-merged output."""
+    Returns (queued, note). `queued` is False when the worker already has this record — a second
+    merge would graft the donor's tracks onto the already-merged output. `note` is non-empty when
+    the item is queued but nothing will drain it yet: the worker only runs while `enabled` and not
+    `paused`, and `enabled` is False on a fresh install, so an endpoint that merged inline before
+    would now silently do nothing while still reporting success. Queueing is right; claiming it
+    started is not."""
     key = f"{'m' if kind == 'movie' else 'e'}{ident}"
     if key in _merging_now():
-        return False
+        return False, "already merging"
     setter = core.set_status if kind == "movie" else core.set_ep_status
     setter(ident, "ready", progress="queued for merge", **fields)
     MERGE_WAKE.set()
-    return True
+    cfg = core.load_config()
+    if not cfg.get("enabled"):
+        return True, "queued, but the pipeline is disabled — nothing will merge until you enable it"
+    if cfg.get("paused"):
+        return True, "queued, but the pipeline is paused — it will merge when you resume"
+    return True, ""
 
 
 def merge_queue(cfg=None):

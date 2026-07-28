@@ -201,14 +201,18 @@ def test_redact_scrubs_a_token_out_of_an_exception(app_env):
 
 # ------------------------------------------------------------------ finding 09
 @pytest.mark.parametrize("best,want,why", [
-    ((20, 0, "t", "l"), False, "0 seeders — the old test compared SCORE against min_seeders"),
-    ((100, 0, "t", "l"), False, "0 seeders, high score"),
-    ((40, 30, "t", "l"), False, "well seeded but below score_threshold"),
-    ((65, 30, "t", "l"), True, "clears both floors"),
-    ((60, 5, "t", "l"), True, "exactly at both floors"),
+    ((20, 0, "t", "l", "r"), False, "0 seeders — the old test compared SCORE against min_seeders"),
+    ((100, 0, "t", "l", "r"), False, "0 seeders, high score"),
+    ((40, 30, "t", "l", "r"), True, "low score but well seeded — see the note below"),
+    ((65, 30, "t", "l", "r"), True, "clears the floor"),
+    ((60, 5, "t", "l", "r"), True, "exactly at the floor"),
+    ((60, 4, "t", "l", "r"), False, "one seeder short"),
     (None, False, "no result"),
 ])
-def test_tv_usable_applies_both_floors(app_env, best, want, why):
+def test_tv_usable_applies_the_seeder_floor(app_env, best, want, why):
+    """Only the SEEDER floor, deliberately — `score_threshold` is calibrated against
+    pipeline.score_release, which has bonuses this scorer lacks. See
+    test_tv_usable_does_not_reject_an_ordinary_english_release."""
     from app import tv
     assert tv._usable(best, {"min_seeders": 5, "score_threshold": 60}) is want, why
 
@@ -350,3 +354,139 @@ def test_merged_at_is_stamped_once_on_the_transition(app_env):
     assert first
     app_env.set_status(7, "merged", audio_langs="fre,eng")
     assert app_env.get_movie(7)["merged_at"] == first
+
+
+# ------------------------------------------------------------------ second-pass review
+# The fixes above were themselves reviewed, and these are the defects that review found in them.
+# They are the subtler half: each one leaves the original bug technically fixed while restoring
+# its effect through a path the first fix didn't consider.
+
+def test_a_carried_out_manual_offset_does_not_persist_to_the_next_donor(app_env):
+    """`sync_manual` gates detection, and nothing cleared it after the merge that consumed it —
+    so one `/set_sync` kept skipping detection for every donor the record was ever given
+    afterwards. The stale-offset bug, surviving behind a single manual fix."""
+    app_env.upsert_movie({"tmdb_id": 20, "imdb_id": "tt20", "radarr_id": 20, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(20, "pending", sync_offset_ms=38000, sync_manual=1)   # the AI's /set_sync
+    # ...the merge that applies it must consume the instruction
+    app_env.set_status(20, "merged", sync_offset_ms=38000, sync_manual=0, merge_kind="grafted")
+    assert app_env.get_movie(20)["sync_manual"] == 0
+
+
+def test_reopening_a_record_drops_the_donor_and_its_offset(app_env):
+    """A scan re-opens `merged`/`no_release` by design. Without DONOR_RESET the record kept the
+    previous donor's en_file AND its offset, which the next merge would apply blind."""
+    from app import pipeline
+    app_env.upsert_movie({"tmdb_id": 21, "imdb_id": "tt21", "radarr_id": 21, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(21, "merged", en_file="/donor1.mkv", dl_hash="abc",
+                       sync_offset_ms=38000, sync_manual=1)
+    app_env.set_status(21, "pending", expect="merged", attempts=0, **pipeline.DONOR_RESET)
+    mv = app_env.get_movie(21)
+    assert mv["en_file"] is None and mv["sync_offset_ms"] == 0 and not mv["sync_manual"]
+
+
+def test_tv_usable_does_not_reject_an_ordinary_english_release(app_env):
+    """Applying the movie-calibrated `score_threshold` to the TV scorer was a regression: that
+    scorer has no +60 resolution / +30 source / +80 id bonuses, so 60 demanded ~40 seeders of any
+    release that is neither MULTI nor advertises a missing language — which is exactly what a
+    plain English release looks like, since English is unmarked."""
+    from app import tv
+    cfg = {"min_seeders": 5, "score_threshold": 60}
+    # Show.S01E05.1080p.WEB-DL with 20 seeders: score = min(20,100) + 20 (RES) = 40
+    assert tv._usable((40, 20, "Show.S01E05.1080p.WEB-DL", "l", "rid"), cfg) is True
+    assert tv._usable((20, 0, "dead", "l", "rid"), cfg) is False       # the real bug: 0 seeders
+    assert tv._usable((120, 3, "starved", "l", "rid"), cfg) is False
+
+
+def test_tv_search_honours_the_blocklist(app_env, monkeypatch):
+    """The TV blocklist was decorative: `dl_id` was never recorded on the automatic path and
+    `_search` never read `tried`, so a dropped release was re-picked by the very next search —
+    the grab -> stall -> blocklist -> re-grab-the-same-thing loop."""
+    from app import tv
+
+    class FakePro:
+        def __init__(self, *a, **k): pass
+        def search(self, q, ids):
+            return [{"title": "Show.S01E05.1080p.WEB-DL-A", "seeders": 30,
+                     "magnetUrl": "magnet:?xt=urn:btih:" + "a" * 40, "size": 2e9},
+                    {"title": "Show.S01E05.720p.WEB-DL-B", "seeders": 20,
+                     "magnetUrl": "magnet:?xt=urn:btih:" + "b" * 40, "size": 1e9}]
+    monkeypatch.setattr(tv, "Prowlarr", FakePro)
+    cfg = dict(app_env.DEFAULTS, min_seeders=5)
+
+    first = tv._search("Show S01E05", cfg, season=1, ep=5)
+    assert first is not None and len(first) == 5, "must return the release id to blocklist"
+    second = tv._search("Show S01E05", cfg, season=1, ep=5, tried={first[4]})
+    assert second is not None and second[4] != first[4]
+    assert tv._search("Show S01E05", cfg, season=1, ep=5,
+                      tried={first[4], second[4]}) is None
+
+
+def test_a_broken_config_logs_once_not_once_per_request(app_env):
+    """load_config runs on every API request and every scheduler tick. Logging the parse failure
+    each time churned through all 3 rotated files in minutes, burying the real history."""
+    app_env.save_config({"min_seeders": 9})
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"min_seeders": 9, TRUNCA')
+    before = len(app_env.tail_log(9999))
+    for _ in range(20):
+        app_env.load_config()
+    assert len(app_env.tail_log(9999)) - before == 1
+
+
+def test_removing_a_broken_config_lets_saves_work_again(app_env):
+    """The log line says "fix or remove the file" — but the flag only cleared on a successful
+    parse, so removing it left the process refusing to save for its whole lifetime."""
+    app_env.save_config({"min_seeders": 9})
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"min_seeders": 9, TRUNCA')
+    app_env.load_config()
+    with pytest.raises(app_env.ConfigUnreadable):
+        app_env.save_config({"min_seeders": 3})
+    os.remove(app_env.CONFIG_FILE)                       # the operator does what it says
+    app_env.load_config()
+    app_env.save_config({"min_seeders": 3})
+    assert app_env.load_config()["min_seeders"] == 3
+
+
+def test_search_movie_reraises_so_the_sweep_can_stop(app_env, monkeypatch):
+    """stage_search wraps search_movie in `except SearchUnavailable` to abandon the sweep, but
+    search_movie caught it itself — making that handler dead code, so the film sweep ran all 25
+    queries against a down indexer instead of stopping at the first."""
+    from app import pipeline
+    app_env.upsert_movie({"tmdb_id": 22, "imdb_id": "tt22", "radarr_id": 22, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(22, "pending")
+
+    def boom(*a, **k):
+        raise pipeline.SearchUnavailable("connection refused")
+    monkeypatch.setattr(pipeline, "candidates", boom)
+    with pytest.raises(pipeline.SearchUnavailable):
+        pipeline.search_movie(22, dict(app_env.DEFAULTS))
+    # ...and the record is left retryable, not settled into a 24h cooldown
+    assert app_env.get_movie(22)["status"] == "pending"
+
+
+def test_enqueue_merge_reports_when_nothing_will_drain_the_queue(app_env):
+    """The API used to merge inline, so it ran regardless of `enabled`/`paused`. Queueing is
+    right, but `enabled` is False on a fresh install — reporting success while nothing happens
+    is not."""
+    from app import pipeline
+    app_env.upsert_movie({"tmdb_id": 23, "imdb_id": "tt23", "radarr_id": 23, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.save_config({"enabled": False})
+    queued, note = pipeline.enqueue_merge("movie", 23)
+    assert queued is True and "disabled" in note
+
+    app_env.save_config({"enabled": True, "paused": True})
+    queued, note = pipeline.enqueue_merge("movie", 23)
+    assert queued is True and "paused" in note
+
+    app_env.save_config({"enabled": True, "paused": False})
+    queued, note = pipeline.enqueue_merge("movie", 23)
+    assert queued is True and note == ""
