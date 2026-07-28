@@ -76,10 +76,23 @@ holding a grab slot — the merger could sit idle with completed downloads waiti
   `MERGE_WAKE` (an `Event`) makes a promotion start the merge immediately.
 - A failed merge marks only that record `error` — it can no longer abort the whole cycle.
 - **The in-flight cap counts `downloading` only** (`ACTIVE_STATES`), so a slot frees at 100%
-  and new grabs continue while the queue drains. `KEEP_DONOR_STATES` still covers
-  `ready`/`merging` so the orphan sweep never deletes a donor out from under the worker.
+  and new grabs continue while the queue drains. `KEEP_DONOR_STATES` covers `ready`/`merging`
+  so the orphan sweep never deletes a donor out from under the worker — and **`error` too**,
+  because the AI's advertised repair for a numbering mismatch is `POST /episode/{id}/assign
+  {path}`, which needs those exact files, and the host dispatcher arrives minutes to hours later.
+  Deleting them 3 minutes after the error made that repair path dead on arrival.
+- **Nothing merges inline — including the API.** `/merge`, `/sync`, `/set_sync` and
+  `sync_probe apply` all go through `pipeline.enqueue_merge`, which sets `ready`, wakes the
+  worker and returns (409 if the worker already holds the record). Calling `merge_movie()`
+  directly took the MERGE_GATE slot but neither *claimed* the record nor registered it in
+  `_MERGING_NOW`, so an operator or AI merge raced the worker: both wrote the same
+  `_merged/<name>.mkv` and both moved it onto the library file.
 - Stale `merging` records (>15 min, not in `_merging_now()`) go back to `ready` rather than
-  being re-merged inline. SQLite runs in **WAL** — the worker writes concurrently.
+  being re-merged inline. The 15-minute test needs a real heartbeat: `_set_row` deliberately
+  holds `updated` when the status is unchanged, so a merging record's timestamp is frozen at the
+  moment it started and any merge past 15 minutes looked interrupted. `pipeline._beat` forces
+  the bump (safe: a `merging` record is in neither the attention panel nor the FIFO queue).
+  SQLite runs in **WAL** — the worker writes concurrently.
 
 ## Gap detection — read the files, not the metadata (`media.py`)
 
@@ -293,7 +306,79 @@ in seconds. Point Radarr/Sonarr **Connect → Webhook** (POST, *On Import* + *On
 - The hook answers immediately and ingests on a worker thread — a probe plus a Prowlarr search is
   far slower than an *arr webhook timeout. The follow-up search honours the same brakes as
   everything else (`hold_reason`, `SEARCH_LOCK`, the in-flight cap).
-- `webhook_token` (empty = no check) adds `?token=…` if you ever expose the endpoint.
+- `webhook_token` (empty = no check) adds `?token=…` if you ever expose the endpoint. It is
+  exempt from `api_key` — the *arrs can't be taught a custom header.
+
+## API access (`main._guard`)
+
+The API had no authentication of any kind, which is defensible for a LAN-only tool right up to
+the point where its endpoints delete media (`/library/repair`), rewrite service credentials
+(`/settings`) and drop torrents. Two checks now sit in one middleware on the `api` sub-app:
+
+- **Origin refusal, always on.** Several of those endpoints take only query parameters, so a
+  plain HTML form on any page the operator visits could fire them cross-site — and since a form
+  POST triggers no preflight, CORS (correctly absent) never got a say. A browser always sends
+  `Origin` on a state-changing request and cannot forge it, so refusing a *present and mismatched*
+  Origin closes that shape while leaving every real caller alone: the SPA matches `Host`, and
+  curl / the host AI dispatcher send no Origin at all.
+- **`api_key`, off by default.** Empty preserves the historical open-on-the-LAN behaviour. Set it
+  and every call needs `X-API-Key` (or `?apikey=`); the SPA prompts once and keeps it in
+  localStorage, and a 401 clears it so a rotated key re-prompts instead of leaving blank panels.
+  `/hook/*` and `/health` are exempt — the *arrs and the container healthcheck can't send headers.
+
+**Path containment (`main._under`).** `os.path.join(root, user_path)` **discards `root` when
+`user_path` is absolute**, so a join is not a containment check even though it looks like one.
+That is how `GET //config/config.json` served the API keys, the qB password and both Plex tokens
+(reproduced against a live server; dot-segment traversal was already normalised away, which is why
+it survived casual testing). Both the SPA file server and `/episode/{id}/assign` now resolve the
+path and require it to stay under a trusted root — for `assign`, one of the real donor
+directories, so a *library* file can no longer be nominated as the donor for another episode.
+
+## Nothing runs unbounded (`pipeline.run_mux`, `sync._decode_timeout`)
+
+No mux or decode had a timeout. A wedged mkvmerge or ffmpeg — a stalled `/mnt/user` read, or the
+iGPU driver hanging a decode — parked the merge worker **forever**, and at the default
+`max_parallel_merges: 1` that silently stops all merging. Worse, the worker had already registered
+the record in `_MERGING_NOW`, which is exactly what shields it from the stale-merge requeue, so
+the one recovery mechanism was disabled precisely when it was needed.
+
+- `mux_timeout_min` (240) and `sync_decode_timeout_min` (30) bound the two classes. A decode
+  killed on timeout reports `offdet_video.TIMEOUT_RC` so `scene_cuts` does **not** then retry in
+  software — that fallback would hang for just as long a second time.
+- `run_mux` owns all four mux sites and **removes the partial output on every failure path**. On
+  rc≥2 (disk full being the classic cause) the half-written file used to be left in
+  `<libdir>/_merged/`, where Plex can index it as an alternate version and where it compounds the
+  very disk-full that produced it, once per retry.
+- A test walks the AST of every backend module and fails if any `subprocess` call lacks a
+  `timeout` — grep can't see the multi-line ones.
+
+## Two things that look like one thing
+
+- **A measured sync offset is not an instruction (`sync_manual`).** A merge records what it
+  measured, and a stored non-zero `sync_offset_ms` used to make the next merge skip detection
+  entirely. Since a scan re-opens a `merged` record whose file still has a gap, the routine path
+  was: merge at +38 s against one donor, re-open for a missing subtitle, grab an *unrelated*
+  donor, mux it with a blind 38-second shift, mark it `merged`. Only `/set_sync` sets
+  `sync_manual=1`, and only that skips detection. `pipeline.DONOR_RESET` clears every
+  donor-specific field as one unit — the sync fields were exactly the ones each retry path forgot.
+- **An unreachable indexer is not a verdict (`pipeline.SearchUnavailable`).** `candidates()` and
+  `tv._search()` returned `[]` on any exception, which the callers read as "nothing suitable
+  exists" and wrote `no_release` — a state that then sits out `no_release_retry_h` (24 h). One
+  Prowlarr restart during a sweep could park a large slice of the backlog for a day on a decision
+  nobody made. Now they raise; records stay `pending`, the sweep abandons early rather than
+  burning its budget confirming the indexer is down, and the interactive endpoints return 503.
+
+## Writes that must not clobber (`core._set_row(expect=…)`)
+
+A scan reads a record, decides what status it should carry, then writes it back — and the merge
+worker can claim `ready → merging` in between. Writing unconditionally put `ready` back underneath
+a running merge, and the record was claimed and merged a second time into the same output path.
+`set_status`/`set_ep_status` take `expect=` and return whether the write applied; losing it is
+harmless, because the scan was only refreshing language columns and the next pass redoes it.
+
+Also here: a **re-opened record gets `attempts=0`**. Nothing reset it, so a record re-opened at
+`attempts=4` grabbed one release and hit `max_sync_retries` on its first stall — an effective
+budget of 1 per 24-hour cooldown instead of the configured 4.
 
 ## What "merged" actually means (`merge_kind`)
 
@@ -817,9 +902,35 @@ Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `lang_pr
 `stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
 `promote_interval_min`, `max_inflight_downloads` (download slots) /`max_parallel_merges`
 (concurrent merges, applied live via `MERGE_GATE`), `enabled` (master switch),
-`ai_tickets`/`ai_stale_min` (AI-review escalation, see below).
+`ai_tickets`/`ai_stale_min` (AI-review escalation, see below), `api_key` (empty = open on the
+LAN), `mux_timeout_min`/`sync_decode_timeout_min` (deadlock guards, not tuning knobs),
+`db_backup_keep` (nightly `VACUUM INTO /config/backup/`), and `api_url`/`docs_path` (what the AI
+ticket tells the dispatcher — these used to be one install's hard-coded LAN address and
+`/mnt/nvme` path).
 Most of these are editable in the UI under **Settings → Queues & limits**.
-Secrets are masked in the GET /api/settings response.
+
+**Settings are validated** (`main._validate_settings`): each value is coerced to the type of its
+default and the scheduler-driving keys are clamped to a minimum. `save_config` filtered on key
+NAME only, so `search_interval_min: 0` became a one-second full sweep (APScheduler coerces a zero
+interval to 1 s) and a non-numeric value raised only *after* being persisted — killing every
+subsequent startup inside `scheduler.start()` until `config.json` was hand-edited on the host.
+Keys with a meaningful 0 or negative (`no_release_retry_h`) are deliberately not clamped.
+
+**Config writes are atomic** (temp file + `os.replace`), and a `config.json` that exists but
+won't parse is reported loudly and **refused as a save target**. `json.dump` straight onto the
+file truncates first, so a crash mid-write left a partial file; `load_config` then silently fell
+back to DEFAULTS and the next save — which starts from that same fallback — wrote the defaults
+back over every URL and key the operator had entered.
+
+Secrets are masked in the `GET /api/settings` response, driven from `core._SECRET_KEYS` rather
+than a hand-written list — which is how `plex2_token` (a real Plex account token) came to be
+returned in cleartext beside five masked siblings. `webhook_token` stays visible on purpose
+(`main._VISIBLE_SECRETS`): the UI renders it as part of the webhook URL.
+
+**Defaults are not install-specific.** `en_indexer_ids` is empty (Prowlarr's numeric IDs are
+per-instance, and an empty list means "every configured indexer" — it used to ship one install's
+IDs, so a fresh deployment queried indexers that didn't exist and recorded the empty result as
+"no release exists"), and `series_pilot` is empty rather than three personal show names.
 
 ### Paths / mounts (all three must line up)
 - `/media` = host `/mnt/user/Plex` (Radarr/Sonarr/Plex report `/data/...` — see `plex_media_prefix`).
@@ -882,12 +993,37 @@ before going back to `pending`. Two reasons that matters:
 
 `review` is deliberately excluded — it means a human must decide, not that something failed.
 
+## Tests
+
+`backend/tests/`, run with `python -m pytest` from `backend/`. There were none for a long time,
+and every defect in the July 2026 review was the kind a unit test catches at the point of writing.
+
+- **`test_media.py`** covers the gap decision itself — `norm_lang`, signs-vs-real subtitles,
+  `sub_rank`, release-name parsing, the `orig` token, `wanted_audio`/`wanted_subs`. These are
+  pure functions whose fixtures are strings, which is why the suite starts here: the whole
+  "which languages is this file missing" decision is testable with no disk and no indexer.
+- **`test_regressions.py`** pins each fixed defect, named for the failure it prevents. Add to it
+  rather than starting a new file — a test that says *why* is the only durable form of these
+  notes.
+
+Write the test first when a bug is silent in production (a desynced file marked `merged`, a
+secrets file served over HTTP). Those are exactly the ones nobody notices twice.
+
+**Type-checking is part of the frontend build**: `npm run build` is `tsc --noEmit && vite build`,
+and `strict` is on. esbuild strips types without checking them, so without the `tsc` step a type
+error builds and ships perfectly happily.
+
 ## CI
 
-`.github/workflows/docker-publish.yml` builds and pushes to GHCR on `main`, on `v*` tags, and on
-`claude/**` branches, so a feature branch can be pulled onto Unraid before it merges. Only `main`
-publishes `:latest`; a branch build is tagged with its sanitised branch name
-(`ghcr.io/n0de0ne/vo-merge:claude-<branch>`).
+- `.github/workflows/ci.yml` — pytest + `compileall` (backend) and the typed build (frontend), on
+  every push **and pull request**, so a branch outside the publish filter is still checked.
+  Nothing validated anything before: the only workflow built the image and pushed it.
+- `.github/workflows/docker-publish.yml` builds and pushes to GHCR on `main`, on `v*` tags, and on
+  `claude/**` branches, so a feature branch can be pulled onto Unraid before it merges. Only `main`
+  publishes `:latest`; a branch build is tagged with its sanitised branch name
+  (`ghcr.io/n0de0ne/vo-merge:claude-<branch>`).
+- `.github/dependabot.yml` — monthly grouped bumps for pip, npm and actions. Pinning with nothing
+  that ever moves the pins is how `requests` sat on CVE-2024-47081 for a year.
 
 **The image name is pinned to a literal owner on purpose.** It used to be
 `ghcr.io/${{ github.repository_owner }}/vo-merge`, which silently followed the `alanstrok` →
