@@ -1,0 +1,348 @@
+"""Regression tests for defects found in the July 2026 review.
+
+Each test is named for the behaviour it locks down and says which failure it prevents. Several
+of these bugs were silent in production — a desynced file marked `merged`, a secrets file served
+over HTTP — so a test that fails loudly is the whole point.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+@pytest.fixture()
+def app_env(tmp_path, monkeypatch):
+    """A throwaway /config with its own DB, with every module re-imported against it."""
+    monkeypatch.setenv("VO_CONFIG", str(tmp_path))
+    for mod in [m for m in list(sys.modules) if m.startswith("app")]:
+        del sys.modules[mod]
+    from app import core
+    core.CONFIG_DIR = str(tmp_path)
+    core.CONFIG_FILE = os.path.join(str(tmp_path), "config.json")
+    core.DB_FILE = os.path.join(str(tmp_path), "vo-merge.db")
+    core.LOG_FILE = os.path.join(str(tmp_path), "vo-merge.log")
+    core.init_db(); core.init_tv(); core.init_indexes(); core.init_probe_cache()
+    return core
+
+
+# ------------------------------------------------------------------ finding 01
+def test_static_path_containment_rejects_absolute_paths(tmp_path):
+    """`os.path.join(STATIC, "/config/config.json")` returns /config/config.json — the join
+    discards its left operand — so the SPA route served the API keys, the qB password and both
+    Plex tokens to anyone who asked. Reproduced against a live server before the fix."""
+    from app.main import _under
+    static = tmp_path / "static"; static.mkdir()
+    (static / "index.html").write_text("spa")
+    secret = tmp_path / "config.json"; secret.write_text('{"prowlarr_key": "leak"}')
+
+    assert _under(str(static / "index.html"), str(static)) is True
+    assert _under(str(secret), str(static)) is False, "absolute path escaped the static root"
+    assert _under("/etc/passwd", str(static)) is False
+    assert _under(str(static / ".." / "config.json"), str(static)) is False
+
+
+def test_donor_must_live_under_a_download_root(app_env):
+    """/episode/{id}/assign took any absolute path, so a LIBRARY file could be named as the donor
+    for an unrelated episode — whose own library file is then replaced by the merge of the two."""
+    from app import main
+    roots = main._donor_roots(dict(app_env.DEFAULTS))
+    donor = "/media/.Téléchargements/completed/audio-merge-tv/9_S01/ep.mkv"
+    library = "/media/Anime/Blue Lock/Season 01/ep.mkv"
+    assert any(main._under(donor, r) for r in roots)
+    assert not any(main._under(library, r) for r in roots)
+
+
+# ------------------------------------------------------------------ finding 02
+def test_a_measured_offset_is_not_replayed_onto_the_next_donor(app_env):
+    """The worst failure mode in the app: a merge stored sync_offset_ms, nothing cleared it, and
+    a stored offset skipped detection entirely — so a re-opened record muxed a completely
+    different donor with the previous donor's shift and reported success."""
+    from app import pipeline
+    app_env.upsert_movie({"tmdb_id": 1, "imdb_id": "tt1", "radarr_id": 1, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    # a successful merge records what it measured
+    app_env.set_status(1, "merged", sync_offset_ms=38000, sync_drift=None)
+    assert app_env.get_movie(1)["sync_offset_ms"] == 38000
+    assert not app_env.get_movie(1)["sync_manual"], "a measurement is not an instruction"
+
+    # the record is sent back for a different release
+    app_env.set_status(1, "pending", **pipeline.DONOR_RESET)
+    mv = app_env.get_movie(1)
+    assert mv["sync_offset_ms"] == 0 and not mv["sync_manual"] and mv["dl_hash"] is None
+
+
+def test_a_deliberate_offset_survives_and_is_marked_manual(app_env):
+    """/set_sync exists so the AI can apply a known offset; that one MUST skip detection."""
+    app_env.upsert_movie({"tmdb_id": 2, "imdb_id": "tt2", "radarr_id": 2, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(2, "pending", sync_offset_ms=250, sync_drift=1.0427083, sync_manual=1)
+    mv = app_env.get_movie(2)
+    assert mv["sync_manual"] == 1 and mv["sync_offset_ms"] == 250
+
+
+def test_donor_reset_covers_every_donor_field(app_env):
+    """Kept as one constant because the sync fields were exactly the ones each retry path forgot."""
+    from app import pipeline
+    assert set(pipeline.DONOR_RESET) == {"dl_hash", "dl_id", "en_file",
+                                         "sync_offset_ms", "sync_drift", "sync_manual"}
+
+
+# ------------------------------------------------------------------ finding 03 / 13
+def test_a_scan_cannot_resurrect_a_record_the_worker_claimed(app_env):
+    """The scan reads a status, decides, then writes back — and the worker can claim
+    ready -> merging in between. Writing unconditionally put `ready` back underneath a running
+    merge, and the record was merged a second time into the same output path."""
+    app_env.upsert_movie({"tmdb_id": 3, "imdb_id": "tt3", "radarr_id": 3, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(3, "ready")
+    assert app_env.claim_movie(3, "ready", "merging") is True        # the worker wins the race
+    applied = app_env.set_status(3, "ready", expect="ready", audio_langs="fre")
+    assert applied is False
+    assert app_env.get_movie(3)["status"] == "merging"
+
+
+def test_claim_is_exclusive_under_concurrency(app_env):
+    """Only one caller may take a queued item, or the same file is merged twice."""
+    app_env.upsert_movie({"tmdb_id": 4, "imdb_id": "tt4", "radarr_id": 4, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(4, "ready")
+    wins = []
+    def race():
+        if app_env.claim_movie(4, "ready", "merging"):
+            wins.append(1)
+    ts = [threading.Thread(target=race) for _ in range(12)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert sum(wins) == 1
+
+
+# ------------------------------------------------------------------ finding 05 / 06
+def test_run_mux_removes_a_partial_output_on_failure(app_env, tmp_path):
+    """Disk full gives rc>=2, and the half-written file used to be left inside the library folder
+    where Plex indexes it — compounding the very disk-full that produced it, once per retry."""
+    from app import pipeline
+    out = str(tmp_path / "partial.mkv")
+    ok, err = pipeline.run_mux(
+        ["sh", "-c", f"echo partial > {out}; echo 'Error: disk full'; exit 2"], out, {})
+    assert ok is False and "disk full" in err
+    assert not os.path.exists(out)
+
+
+def test_run_mux_keeps_output_on_warnings(app_env, tmp_path):
+    """mkvmerge rc=1 means 'completed with warnings' and is a success."""
+    from app import pipeline
+    out = str(tmp_path / "warned.mkv")
+    ok, err = pipeline.run_mux(["sh", "-c", f"echo muxed > {out}; exit 1"], out, {})
+    assert ok is True and err is None and os.path.exists(out)
+
+
+def test_run_mux_kills_and_cleans_up_on_timeout(app_env, tmp_path, monkeypatch):
+    """An unbounded mux held the merge worker forever, and at max_parallel_merges=1 that stops
+    ALL merging with nothing reporting it."""
+    from app import pipeline
+    out = str(tmp_path / "hung.mkv")
+    open(out, "w").write("partial")
+
+    def fake_run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    ok, err = pipeline.run_mux(["mkvmerge"], out, {"mux_timeout_min": 240})
+    assert ok is False and "exceeded 240min" in err
+    assert not os.path.exists(out)
+
+
+def test_every_subprocess_call_has_a_timeout():
+    """The wedge this prevents is invisible: no error, no log line, merging simply stops."""
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    missing = []
+    for f in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(f.read_text())):
+            if isinstance(node, ast.Call) and \
+               ast.unparse(node.func) in ("subprocess.run", "subprocess.check_output",
+                                          "subprocess.call"):
+                if not any(k.arg == "timeout" for k in node.keywords):
+                    missing.append(f"{f.name}:{node.lineno}")
+    assert not missing, f"subprocess calls with no timeout: {missing}"
+
+
+# ------------------------------------------------------------------ finding 07 / 12
+def test_every_secret_is_masked_or_explicitly_exempt(app_env):
+    """The mask list was hand-written, so plex2_token — a real Plex account token — was returned
+    in cleartext beside five siblings that were masked."""
+    from app import main
+    app_env.save_config({k: f"SECRET-VALUE-{k}" for k in app_env._SECRET_KEYS})
+    masked = main.get_settings()
+    for k in app_env._SECRET_KEYS:
+        if k in main._VISIBLE_SECRETS:
+            continue
+        assert masked[k] != f"SECRET-VALUE-{k}", f"{k} leaked in cleartext"
+
+
+def test_redact_scrubs_a_token_out_of_an_exception(app_env):
+    """/api/test/plex returned str(e), and both ConnectionError and HTTPError quote the full URL
+    — query string, X-Plex-Token and all."""
+    app_env.save_config({"plex_token": "PLEX-TOK-ABCDEFGH"})
+    app_env.load_config()                      # refresh the redaction set
+    msg = "Max retries exceeded with url: /identity?X-Plex-Token=PLEX-TOK-ABCDEFGH"
+    out = app_env.redact(msg)
+    assert "PLEX-TOK-ABCDEFGH" not in out and "***" in out
+
+
+# ------------------------------------------------------------------ finding 09
+@pytest.mark.parametrize("best,want,why", [
+    ((20, 0, "t", "l"), False, "0 seeders — the old test compared SCORE against min_seeders"),
+    ((100, 0, "t", "l"), False, "0 seeders, high score"),
+    ((40, 30, "t", "l"), False, "well seeded but below score_threshold"),
+    ((65, 30, "t", "l"), True, "clears both floors"),
+    ((60, 5, "t", "l"), True, "exactly at both floors"),
+    (None, False, "no result"),
+])
+def test_tv_usable_applies_both_floors(app_env, best, want, why):
+    from app import tv
+    assert tv._usable(best, {"min_seeders": 5, "score_threshold": 60}) is want, why
+
+
+def test_tv_multi_bonus_matches_the_rest_of_the_scorers(app_env):
+    """+20 here against +200 everywhere else meant the one path that decides unattended barely
+    expressed the preference the whole design is built on."""
+    src = (open(os.path.join(os.path.dirname(__file__), "..", "app", "tv.py")).read())
+    assert "sc += 40 if subs_only else 200" in src
+
+
+# ------------------------------------------------------------------ finding 11
+def test_config_write_is_atomic_and_leaves_no_temp_file(app_env):
+    app_env.save_config({"min_seeders": 9})
+    assert app_env.load_config()["min_seeders"] == 9
+    assert not os.path.exists(app_env.CONFIG_FILE + ".tmp")
+
+
+def test_a_broken_config_is_never_overwritten(app_env):
+    """load_config fell back to DEFAULTS silently, and the next save — which starts from that
+    fallback — wrote the defaults back, erasing every URL and key the operator had entered."""
+    app_env.save_config({"min_seeders": 9, "prowlarr_url": "http://real:9696"})
+    open(app_env.CONFIG_FILE, "w").write('{"min_seeders": 9, TRUNCA')
+    app_env.load_config()
+    with pytest.raises(app_env.ConfigUnreadable):
+        app_env.save_config({"min_seeders": 3})
+    assert "TRUNCA" in open(app_env.CONFIG_FILE).read(), "the operator's file was destroyed"
+
+
+# ------------------------------------------------------------------ finding 21
+@pytest.mark.parametrize("data,want", [
+    ({"search_interval_min": 0}, 1),          # 0 -> APScheduler fires every second
+    ({"search_interval_min": "60"}, 60),      # numeric string coerced
+    ({"max_parallel_merges": 0}, 1),          # 0 merges = nothing ever merges
+])
+def test_settings_are_coerced_and_clamped(app_env, data, want):
+    from app import main
+    assert list(main._validate_settings(data).values())[0] == want
+
+
+def test_a_non_numeric_interval_is_rejected_before_it_is_persisted(app_env):
+    """timedelta(minutes="abc") raised AFTER save_config had written it, so the next boot died
+    inside scheduler.start() and the app never came up until config.json was hand-edited."""
+    from fastapi import HTTPException
+    from app import main
+    with pytest.raises(HTTPException):
+        main._validate_settings({"search_interval_min": "abc"})
+
+
+def test_negative_and_zero_stay_allowed_where_they_mean_something(app_env):
+    """no_release_retry_h: 0 = retry every scan, negative = never. Clamping those breaks them."""
+    from app import main
+    assert main._validate_settings({"no_release_retry_h": 0})["no_release_retry_h"] == 0
+    assert main._validate_settings({"no_release_retry_h": -1})["no_release_retry_h"] == -1
+
+
+# ------------------------------------------------------------------ finding 22 / 25 / 32
+def test_tail_log_returns_the_last_lines_without_reading_the_whole_file(app_env):
+    for i in range(5000):
+        app_env.log(f"line {i}")
+    tail = app_env.tail_log(5)
+    assert len(tail) == 5 and "line 4999" in tail[-1]
+
+
+def test_log_rotates_instead_of_growing_forever(app_env, monkeypatch):
+    monkeypatch.setattr(app_env, "LOG_MAX_BYTES", 20000)
+    for i in range(3000):
+        app_env.log(f"line {i} " + "x" * 60)
+    assert os.path.exists(app_env.LOG_FILE + ".1")
+    assert os.path.getsize(app_env.LOG_FILE) < 60000
+
+
+def test_hot_queries_use_an_index(app_env):
+    """There were no indexes at all beyond the primary keys, so every `WHERE status=? ORDER BY
+    updated DESC` was a full scan — run several times a minute by the background jobs."""
+    with app_env.db() as c:
+        plan = list(c.execute("EXPLAIN QUERY PLAN "
+                              "SELECT * FROM episodes WHERE status=? ORDER BY updated DESC",
+                              ("ready",)))
+    assert "INDEX" in plan[0][-1].upper()
+
+
+def test_concurrent_upserts_do_not_raise(app_env):
+    """SELECT-then-INSERT raced: a webhook ingest and the scheduled scan reaching a new title at
+    the same moment made the loser raise IntegrityError, aborting that whole scan pass."""
+    errs = []
+    def w():
+        for _ in range(40):
+            try:
+                app_env.upsert_movie({"tmdb_id": 99, "imdb_id": "tt9", "radarr_id": 9,
+                                      "title": "Race", "original_title": "Race", "year": 2020,
+                                      "original_lang": "french", "french_path": "/r.mkv",
+                                      "quality": "1080p"})
+            except Exception as e:                      # noqa: BLE001 - recording it IS the test
+                errs.append(e)
+    ts = [threading.Thread(target=w) for _ in range(6)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert not errs
+
+
+def test_upsert_never_disturbs_the_pipeline_status(app_env):
+    app_env.upsert_movie({"tmdb_id": 5, "imdb_id": "tt5", "radarr_id": 5, "title": "A",
+                          "original_title": "A", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(5, "downloading")
+    app_env.upsert_movie({"tmdb_id": 5, "imdb_id": "tt5", "radarr_id": 5, "title": "B",
+                          "original_title": "A", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    mv = app_env.get_movie(5)
+    assert mv["status"] == "downloading" and mv["title"] == "B"
+
+
+# ------------------------------------------------------------------ updated / merged_at
+def test_updated_only_moves_on_a_real_state_change(app_env):
+    """It is the sort key for Needs attention and the FIFO order of the merge queue, so a write
+    that changes nothing must not reshuffle the dashboard."""
+    app_env.upsert_movie({"tmdb_id": 6, "imdb_id": "tt6", "radarr_id": 6, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(6, "error", error="boom")
+    first = app_env.get_movie(6)["updated"]
+    app_env.set_status(6, "error", ai_status="pending")      # the 3-minute sweep
+    assert app_env.get_movie(6)["updated"] == first
+    app_env.set_status(6, "pending")
+    assert app_env.get_movie(6)["updated"] > first
+
+
+def test_merged_at_is_stamped_once_on_the_transition(app_env):
+    """Every later write with status='merged' — including a scan re-reading the file — used to
+    reset it, floating old merges back into 'Recently merged'."""
+    app_env.upsert_movie({"tmdb_id": 7, "imdb_id": "tt7", "radarr_id": 7, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(7, "merged", merge_kind="grafted")
+    first = app_env.get_movie(7)["merged_at"]
+    assert first
+    app_env.set_status(7, "merged", audio_langs="fre,eng")
+    assert app_env.get_movie(7)["merged_at"] == first

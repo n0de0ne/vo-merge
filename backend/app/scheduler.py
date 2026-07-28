@@ -120,6 +120,14 @@ def _stall_job():
         core.log(f"stall_job error: {e}")
 
 
+def _backup_job():
+    try:
+        cfg = core.load_config()
+        core.backup_db(keep=int(cfg.get("db_backup_keep", 7)))
+    except Exception as e:
+        core.log(f"backup_job error: {e}")
+
+
 def start():
     cfg = core.load_config()
     _sched.add_job(_search_job, "interval", minutes=cfg["search_interval_min"],
@@ -130,6 +138,11 @@ def start():
                    id="stall", replace_existing=True)
     _sched.add_job(_promote_job, "interval", minutes=cfg.get("promote_interval_min", 1),
                    id="promote", replace_existing=True)
+    # Nightly at 04:00 — the DB holds the whole probe inventory and every record's state, and
+    # nothing backed it up. Cheap: VACUUM INTO on a few thousand rows is well under a second.
+    if int(cfg.get("db_backup_keep", 7)) > 0:
+        _sched.add_job(_backup_job, "cron", hour=4, minute=0,
+                       id="backup", replace_existing=True)
     _sched.start()
     ensure_merge_workers()          # background merger(s) draining the 'ready' queue
     core.log("scheduler started")

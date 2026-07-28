@@ -326,7 +326,12 @@ def sub_rank(s):
     answer to "this file is missing English subtitles". It used to sort ahead of forced, which is
     how a donor carrying both handed over the signs track.
 
-    Then forced below full, SDH below that, and image subs (VobSub/PGS) below text."""
+    The full order is: full translation, then SDH, then forced, then signs; and within each,
+    text beats image (VobSub/PGS). SDH above forced is deliberate — it carries ALL the dialogue
+    (plus sound descriptions), whereas a forced track only covers the passages the filmmaker
+    marked, so for someone who can't follow the audio the SDH track is the more complete
+    subtitle. (This docstring used to claim forced outranked SDH, which the tuple below has
+    never done.)"""
     image = 1 if re.search(r'(pgs|vobsub|dvd|hdmv)', str(s.get("codec") or ""), re.I) else 0
     signs = 1 if (s.get("signs") if "signs" in s else is_signs(s.get("name"))) else 0
     return (signs, 1 if s.get("forced") else 0, 1 if s.get("sdh") else 0, image, s["id"])

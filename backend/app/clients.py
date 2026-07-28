@@ -12,9 +12,14 @@ class Prowlarr:
         r.raise_for_status(); return r.json()
 
     def search(self, query, indexer_ids):
-        # Prowlarr wants repeated indexerIds params; requests handles list values.
-        return self._get("/api/v1/search", query=query, type="search",
-                         indexerIds=indexer_ids)
+        # Prowlarr wants repeated indexerIds params; requests handles list values. Omitting the
+        # parameter entirely searches EVERY configured indexer, which is what an empty list has
+        # to mean: indexer IDs are per-instance numbers, so a fresh install has none configured
+        # and "search nothing" would make every title look like it has no releases.
+        params = {"query": query, "type": "search"}
+        if indexer_ids:
+            params["indexerIds"] = list(indexer_ids)
+        return self._get("/api/v1/search", **params)
 
     def ping(self):
         return self._get("/api/v1/system/status")

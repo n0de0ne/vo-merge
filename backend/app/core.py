@@ -24,7 +24,10 @@ DEFAULTS = {
     "plex2_url": "",                       # optional replica PMS (e.g. http://10.0.1.2:32400)
     "plex2_token": "",                     # replica's own token (usually a different account)
     "plex_media_prefix": "/data",          # how Plex sees what this app mounts at /media
-    "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
+    # Prowlarr's numeric indexer IDs are per-INSTANCE, so shipping one install's values means a
+    # fresh deployment silently queries indexers that don't exist there — and an empty result is
+    # then recorded as "no release exists". Empty = search every configured indexer.
+    "en_indexer_ids": [],
     "multi_indexer_ids": [],               # extra indexers to also search for MULTI (e.g. FR trackers)
     "vo_gap_tag": "vo-gap",
     "qb_category": "audio-merge",
@@ -39,6 +42,11 @@ DEFAULTS = {
     "delete_donor": True,
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "no_seed_public": True,                        # public donors: stop at 100%, never seed
+    # How the host AI dispatcher reaches this API, e.g. "http://10.0.1.5:8090". Written into every
+    # ticket; empty = tell it only the in-container address. This was hard-coded to one install's
+    # LAN address, as was the CLAUDE.md path below.
+    "api_url": "",
+    "docs_path": "",                               # host path to CLAUDE.md, for the ticket brief
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
@@ -47,7 +55,9 @@ DEFAULTS = {
     "grab_mode": "auto",                   # auto | approval
     "scope_films": True,
     "scope_series": False,
-    "series_pilot": ["The Neighborhood", "Friends", "My Wife and Kids"],  # only these series run (empty = all tagged)
+    # Which series the pipeline acts on; empty = all of them. This used to ship three personal
+    # show names, which quietly limited every other install to those three.
+    "series_pilot": [],
     "sonarr_url": "http://10.0.1.3:8989",
     "sonarr_key": "",
     "sonarr_vo_gap_tag": "vo-gap",
@@ -146,6 +156,10 @@ DEFAULTS = {
                                            # in qB at once (a season pack counts as one). vo-merge
                                            # won't grab another until a merge finishes + donor is
                                            # freed, dropping the count below the cap.
+    "db_backup_keep": 7,                   # nightly VACUUM INTO /config/backup/, keeping this
+                                           # many daily snapshots (0 = no backup). The DB is the
+                                           # probe inventory plus every record's state, and it
+                                           # runs in WAL — a plain file copy of it is torn.
     "enabled": False,                      # master switch; off until configured
     "webhook_token": "",                   # optional shared secret for /api/hook/*. Empty =
                                            # no check (matches the rest of this LAN-only API).
@@ -605,6 +619,39 @@ def prune_missing_records():
                 c.execute(f"DELETE FROM {table} WHERE {key} IN ({','.join('?' * len(chunk))})", chunk)
         out.append(len(gone))
     return tuple(out)
+
+
+BACKUP_DIR = os.path.join(CONFIG_DIR, "backup")
+
+
+def backup_db(keep=7):
+    """Snapshot the database, keeping the last `keep` daily copies.
+
+    This file is the app's entire memory — the probe cache (the only complete inventory of the
+    library) plus every record's pipeline state — and nothing backed it up. It runs in WAL mode,
+    so copying the file while the app is live is torn by construction; `VACUUM INTO` takes a
+    consistent snapshot through SQLite itself, which is the supported way to do this hot."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"vo-merge-{time.strftime('%Y%m%d')}.db")
+    tmp = dest + ".tmp"
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        with db() as c:
+            c.execute("VACUUM INTO ?", (tmp,))
+        os.replace(tmp, dest)
+    except Exception as e:
+        log(f"backup failed: {e}")
+        return None
+    old = sorted(f for f in os.listdir(BACKUP_DIR)
+                 if f.startswith("vo-merge-") and f.endswith(".db"))
+    for f in old[:-keep] if keep > 0 else []:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, f))
+        except OSError:
+            pass
+    log(f"backup: {dest} ({os.path.getsize(dest) // 1024} KB), keeping {keep}")
+    return dest
 
 
 def probe_stats():

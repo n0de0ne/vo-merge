@@ -884,7 +884,7 @@ def ai_health_check(cfg=None):
         core.ticket("errors-review",
                     f"{len(news)} NEW record(s) in error/review/sync_fail",
                     {"records": news[:60], "total_new": len(news),
-                     "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+                     "api": agent._api_hint(),
                      "report_back": (
                          "After handling each record, POST its outcome so it leaves the operator's "
                          "manual-review queue: movies -> /movie/{id}/ai_result, episodes -> "

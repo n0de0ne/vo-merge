@@ -1,5 +1,6 @@
 """FastAPI app: REST API + serves the built React SPA."""
 import hmac, os, subprocess, time
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -8,10 +9,42 @@ from pydantic import BaseModel
 from . import agent, core, scheduler, pipeline, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
-app = FastAPI(title="VO Merger")
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """Migrations, then the scheduler. `@app.on_event("startup")` is deprecated and slated for
+    removal, and it swallowed the distinction between 'the app failed to start' and 'a startup
+    step raised' — a lifespan failure stops the app cleanly instead."""
+    core.init_db()
+    core.init_tv()
+    core.init_indexes()
+    core.init_probe_cache()
+    core.migrate_config()
+    scheduler.start()
+    yield
+
+
+app = FastAPI(title="VO Merger", lifespan=_lifespan)
 STATIC = os.environ.get("VO_STATIC", "/app/static")
 PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
 PREVIEW_TIMEOUT = 300          # seconds for one 20s preview clip encode
+
+
+def _donor_roots(cfg):
+    """Every directory a downloaded donor can legitimately live in, as THIS container sees it.
+
+    Movies and TV use different qB save paths, and qB reports them under its own /data prefix, so
+    a single configured root would reject half the real donors. Existing (non-empty) directories
+    only, so a mistyped setting can't silently widen this."""
+    out = []
+    for p in (cfg.get("downloads_mount"),
+              pipeline._qb_to_local(cfg.get("qb_download_dir"), cfg),
+              pipeline._qb_to_local(cfg.get("qb_tv_download_dir"), cfg),
+              "/downloads"):
+        p = (p or "").rstrip("/")
+        if p and p not in out:
+            out.append(p)
+    return out
 
 
 def _under(path, root):
@@ -25,16 +58,6 @@ def _under(path, root):
     root = os.path.realpath(root)
     path = os.path.realpath(path)
     return path == root or path.startswith(root + os.sep)
-
-
-@app.on_event("startup")
-def _startup():
-    core.init_db()
-    core.init_tv()
-    core.init_indexes()
-    core.init_probe_cache()
-    core.migrate_config()
-    scheduler.start()
 
 
 # ----- API -----
@@ -68,6 +91,8 @@ async def _guard(request: Request, call_next):
     if root and path.startswith(root):
         path = path[len(root):]
     is_hook = path.startswith("/hook/")
+    if path == "/health":
+        return await call_next(request)     # the container healthcheck carries no credential
     if request.method not in _SAFE_METHODS:
         origin = request.headers.get("origin")
         if origin:
@@ -80,6 +105,15 @@ async def _guard(request: Request, call_next):
         if not hmac.compare_digest(got, key):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
+
+
+@api.get("/health")
+def health():
+    """Liveness only — no DB, no config, no disk. Deliberately trivial so the container
+    HEALTHCHECK measures whether uvicorn is answering, not whether SQLite is slow. /api/status is
+    the one that reports real state, and it runs count queries, which is the wrong thing to hang a
+    restart policy on. Exempt from api_key so the healthcheck needs no credential."""
+    return {"ok": True}
 
 
 @api.get("/status")
@@ -215,6 +249,17 @@ def test(which: str):
         return {"ok": False, "error": core.redact(str(e))}
 
 
+@api.post("/scan")
+def do_scan():
+    """Progressive film scan. Delegates to /rescan so it runs in the background under SCAN_LOCK.
+
+    It used to call pipeline.scan() inline: minutes of mkvmerge in a request thread, and — since
+    scan() takes no lock of its own, its callers always did — a second heavy probe pass could run
+    alongside a /rescan already holding SCAN_LOCK, which is exactly what that lock forbids. While
+    it ran, hold_reason() reported nothing, so searches kept grabbing off half-finished state."""
+    return do_rescan(forget=False, scope="films")
+
+
 @api.post("/rescan")
 def do_rescan(forget: bool = False, scope: str = "all"):
     """Re-decide the gaps from the FILES, one library at a time, in the background — a full
@@ -246,8 +291,8 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     import threading
     from . import tv
 
-    if scope not in ("all", "films", "anime", "series"):
-        raise HTTPException(422, "scope must be all | films | anime | series")
+    if scope not in ("all", "films", "anime", "series", "tv"):
+        raise HTTPException(422, "scope must be all | films | anime | series | tv")
     if not pipeline.SCAN_LOCK.acquire(blocking=False):
         return {"ok": True, "started": False, "note": "a scan is already running",
                 "state": pipeline.SCAN_STATE}
@@ -265,6 +310,7 @@ def do_rescan(forget: bool = False, scope: str = "all"):
             top = (path or "")[len(mount) + 1:].split(os.sep, 1)[0].lower()
             if scope == "anime":  return top in anime
             if scope == "series": return top in series
+            if scope == "tv":     return top in anime or top in series
             return top not in anime and top not in series
         with core.db() as c:
             if scope == "all":
@@ -306,9 +352,10 @@ def do_rescan(forget: bool = False, scope: str = "all"):
             if scope in ("all", "films"):
                 st["phase"] = "films"
                 st["films"] = pipeline.scan(cfg)
-            if scope in ("all", "anime", "series"):
-                st["phase"] = "anime" if scope == "anime" else ("series" if scope == "series" else "series & anime")
-                kinds = None if scope == "all" else (scope,)
+            if scope in ("all", "anime", "series", "tv"):
+                st["phase"] = ("anime" if scope == "anime" else
+                               "series" if scope == "series" else "series & anime")
+                kinds = None if scope in ("all", "tv") else (scope,)
                 st["episodes"] = tv.scan(cfg, kinds=kinds)
             st["phase"] = "done"
             core.log(f"rescan({scope}, {'full' if forget else 'progressive'}): "
@@ -1165,6 +1212,14 @@ def episode_assign(ep_id: str, body: AssignIn):
         raise HTTPException(400, f"no such file: {body.path}")
     if not body.path.lower().endswith((".mkv", ".mp4", ".m4v", ".avi", ".ts")):
         raise HTTPException(400, "not a video file")
+    # A donor is something we downloaded. Nothing confined this before, so any absolute path on
+    # the container — including a library file, or a symlink pointing at one — could be named as
+    # the donor for an unrelated episode, whose library file is then replaced in place with the
+    # merge of the two.
+    roots = _donor_roots(core.load_config())
+    if not any(_under(body.path, r) for r in roots):
+        raise HTTPException(400, "donor must be a downloaded file, under one of: "
+                                 + ", ".join(roots))
     core.set_ep_status(ep_id, "ready", en_file=body.path, error=None,
                        progress="queued for merge (assigned)")
     pipeline.MERGE_WAKE.set()
@@ -1743,8 +1798,8 @@ def tv_episodes(status: str | None = None):
 
 @api.post("/tv/scan")
 def tv_scan():
-    from . import tv
-    return {"found": tv.scan()}
+    """Progressive series+anime scan — see do_scan for why this delegates rather than run inline."""
+    return do_rescan(forget=False, scope="tv")
 
 
 @api.get("/tv/{series_id}/{season}/candidates")

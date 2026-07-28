@@ -28,6 +28,11 @@ export interface Episode {
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
+// What a scan/rescan POST returns: it starts a background pass rather than doing the work in
+// the request, so there is no count to report yet — poll rescanState() for progress.
+export interface RescanStart {
+  ok: boolean; started: boolean; note?: string; state?: RescanState;
+}
 export interface RescanState {
   running: boolean; scope: string; phase: string; started: number; finished: number;
   films: number | null; episodes: number | null; error: string | null;
@@ -189,7 +194,8 @@ export const api = {
     j<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ data }) }),
   test: (which: string) =>
     j<{ ok: boolean; error?: string }>(`/api/test/${which}`, { method: "POST" }),
-  scan: () => j<{ found: number }>("/api/scan", { method: "POST" }),
+  // Now a background scan (see main.do_scan) — same shape as rescan, not { found }.
+  scan: () => j<RescanStart>("/api/scan", { method: "POST" }),
   pause: (on: boolean) =>
     j<{ ok: boolean; paused: boolean; in_flight: string[] }>(
       "/api/pause", { method: "POST", body: JSON.stringify({ on }) }),
@@ -222,10 +228,9 @@ export const api = {
   tvStatus: () => j<TvStatus>("/api/tv/status"),
   tvEpisodes: (status?: string) =>
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
-  tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
-  rescan: (scope: "all" | "films" | "anime" | "series" = "all", forget = false) =>
-    j<{ ok: boolean; started: boolean; note?: string }>(
-      `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
+  tvScan: () => j<RescanStart>("/api/tv/scan", { method: "POST" }),
+  rescan: (scope: "all" | "films" | "anime" | "series" | "tv" = "all", forget = false) =>
+    j<RescanStart>(`/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   coverage: () => j<Coverage>("/api/coverage"),
   // re-probe everything in a settled state (merged / no_release) and re-open what's below target

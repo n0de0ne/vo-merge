@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
+import { api, setApiKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
+  CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -19,6 +19,37 @@ const fmtEta = (s: number) => (!s || s <= 0 || s >= 8640000 ? "" : "ETA " + fmtT
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
+// ---------------------------------------------------------------- error reporting
+// Failures used to be swallowed twice over: the act() helpers were try/finally with no catch, so
+// a failed grab/retry/merge click told the user nothing, and usePoll invoked its refresh
+// uncaught, so a backend that was down produced an unhandled rejection every few seconds behind a
+// silently stale screen. One subscriber-based sink means every one of those surfaces in the same
+// banner, and it lives outside React so api.ts and non-component code can report too.
+type ErrSink = (msg: string | null) => void;
+const errSinks = new Set<ErrSink>();
+
+export function reportError(e: unknown) {
+  if (e && (e as Error).name === "Unauthorized") { errSinks.forEach(f => f("__auth__")); return; }
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(e);
+  errSinks.forEach(f => f(msg));
+}
+
+function useErrorSink() {
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    const f: ErrSink = m => setErr(m);
+    errSinks.add(f);
+    return () => { errSinks.delete(f); };
+  }, []);
+  return [err, setErr] as const;
+}
+
+/** Run an action, surfacing any failure instead of dropping it. */
+export async function runAction(fn: () => Promise<unknown>) {
+  try { await fn(); return true; } catch (e) { reportError(e); return false; }
+}
+
 // Poll `fn` every `ms`, but ONLY while the tab is visible. Browsers throttle background-tab
 // timers, so a tab left open would silently go stale (the "won't update without a reload"
 // complaint). We pause while hidden and fire an immediate refresh the moment the tab is
@@ -28,7 +59,18 @@ function usePoll(fn: () => void, ms: number, deps: any[] = []) {
   saved.current = fn;
   useEffect(() => {
     let alive = true;
-    const run = () => { if (alive && !document.hidden) saved.current(); };
+    // Catch here, not at each call site. Every refresh function was invoked uncaught, so a
+    // backend that is down produced an unhandled rejection on every tick behind a screen that
+    // silently showed stale data. Reporting it once, centrally, is what makes "the list stopped
+    // updating" visible instead of mysterious.
+    const run = () => {
+      if (!alive || document.hidden) return;
+      try {
+        const r = saved.current() as unknown;
+        if (r && typeof (r as Promise<unknown>).catch === "function")
+          (r as Promise<unknown>).catch(reportError);
+      } catch (e) { reportError(e); }
+    };
     run();
     const id = setInterval(run, ms);
     const onVis = () => { if (!document.hidden) run(); };   // instant refresh on return
@@ -1072,7 +1114,9 @@ function Films() {
   }, [movies, q]);
   const dlOf = (m: Movie) => dls[(m.dl_hash || "").toLowerCase()];
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
 
   async function searchAll() {
     setBusy(true); setSearchMsg("starting…");
@@ -1220,7 +1264,9 @@ function Series({ anime }: { anime: boolean }) {
   usePoll(refresh, 8000, [filter]);
   usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
 
   async function searchAll() {
     setBusy(true); setSearchMsg("starting…");
@@ -1396,7 +1442,9 @@ function Review() {
   }
   usePoll(refresh, 8000);
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
   async function sendAI(k: string, call: () => Promise<{ queued: boolean }>) {
     setAi(s => ({ ...s, [k]: "…" }));
     try { const r = await call(); setAi(s => ({ ...s, [k]: r.queued ? "queued ✓" : "failed" })); }
@@ -1837,8 +1885,51 @@ function PauseControl() {
   );
 }
 
+/** Asks for the API key when the server has one set. Shown instead of the app, since nothing
+ *  can load without it. */
+function ApiKeyGate({ onDone }: { onDone: () => void }) {
+  const [key, setKey] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [bad, setBad] = useState(false);
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setChecking(true); setBad(false);
+    setApiKey(key.trim());
+    try { await api.status(); onDone(); }
+    catch { setApiKey(""); setBad(true); }
+    finally { setChecking(false); }
+  }
+  return (
+    <div className="app">
+      <header className="top"><h1>🎬 VO Merger</h1></header>
+      <div className="panel" style={{ maxWidth: 460 }}>
+        <div className="section-title">API key required</div>
+        <p className="muted" style={{ marginTop: 0 }}>
+          This server has <code>api_key</code> set. Enter it to continue — it is kept in this
+          browser only.
+        </p>
+        <form onSubmit={submit} style={{ display: "flex", gap: 8 }}>
+          <input type="password" autoFocus value={key} placeholder="API key"
+                 onChange={e => setKey(e.target.value)} style={{ flex: 1 }} />
+          <button className="btn primary" disabled={checking || !key.trim()}>
+            {checking ? "checking…" : "Unlock"}
+          </button>
+        </form>
+        {bad && <div className="err" style={{ marginTop: 10 }}>That key was rejected.</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("overview");
+  const [err, setErr] = useErrorSink();
+  const [locked, setLocked] = useState(false);
+  // A 401 clears the stored key and reports "__auth__", so a rotated key prompts again instead
+  // of leaving every panel silently empty.
+  useEffect(() => { if (err === "__auth__") { setLocked(true); setErr(null); } }, [err, setErr]);
+  if (locked) return <ApiKeyGate onDone={() => { setLocked(false); setErr(null); }} />;
+
   const tabs: [string, string][] = [
     ["overview", "Overview"],
     ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"],
@@ -1852,6 +1943,12 @@ export default function App() {
         <div className="spacer" />
         <PauseControl />
       </header>
+      {err && (
+        <div className="errbar" role="alert">
+          <span>{err}</span>
+          <button className="btn small" onClick={() => setErr(null)}>dismiss</button>
+        </div>
+      )}
       <nav>
         {tabs.map(([k, label]) =>
           <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{label}</button>)}
