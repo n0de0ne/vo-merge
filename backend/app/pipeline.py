@@ -600,6 +600,11 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need
     return sc
 
 
+class SearchUnavailable(Exception):
+    """The indexer could not be reached. Distinct from "the indexer returned nothing", which is a
+    real answer that legitimately settles a record into `no_release`."""
+
+
 def candidates(tmdb_id, cfg=None, include_tried=False):
     """Scored English/MULTI release candidates for a movie (no grab) — powers the UI's
     interactive search and the auto-picker."""
@@ -618,7 +623,13 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
     try:
         results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
-        core.log(f"candidates {tmdb_id}: {e}"); return []
+        # An empty list is a VERDICT — "nothing suitable exists" — and the caller writes
+        # `no_release`, which then sits out `no_release_retry_h` (24h by default). A Prowlarr
+        # restart or a network blip during a sweep is not that verdict, and returning [] made a
+        # transient failure indistinguishable from one, parking a slice of the backlog for a day
+        # on a decision nobody made.
+        core.log(f"candidates {tmdb_id}: {e}")
+        raise SearchUnavailable(str(e)) from e
     import json as _json
     tried = set(_json.loads(mv.get("tried") or "[]"))
     out = []
@@ -642,10 +653,24 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
     cfg = cfg or core.load_config()
     if do_grab is None:
         do_grab = (cfg["grab_mode"] == "auto")
-    if not core.get_movie(tmdb_id):
+    mv = core.get_movie(tmdb_id)
+    if not mv:
         return
-    core.set_status(tmdb_id, "searching")
-    cand = candidates(tmdb_id, cfg)
+    # Claim pending -> searching atomically. A plain set_status let two overlapping sweeps (the
+    # hourly search job, the 10-minute finish refill and any webhook can all be in stage_search at
+    # once) both pick up the same record and grab two different releases for it — the second
+    # dl_hash overwriting the first and orphaning a torrent. A record already in `searching`
+    # belongs to whoever claimed it.
+    if mv["status"] == "pending" and not core.claim_movie(tmdb_id, "pending", "searching"):
+        return
+    try:
+        cand = candidates(tmdb_id, cfg)
+    except SearchUnavailable as e:
+        # Indexer unreachable — say nothing about whether a release exists. Back to `pending` so
+        # the next sweep retries, instead of `no_release` and a 24-hour cooldown.
+        core.set_status(tmdb_id, "pending", progress="")
+        core.log(f"search {tmdb_id}: indexer unavailable ({e}) -> left pending for the next sweep")
+        return
     if not cand or cand[0]["score"] < cfg["score_threshold"] or cand[0]["seeders"] < cfg["min_seeders"]:
         core.set_status(tmdb_id, "no_release",
                         candidate_title=(cand[0]["title"] if cand else None),
@@ -1579,7 +1604,15 @@ def stage_search(cfg=None):
         return
     cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0
     for mv in core.get_movies("pending"):
-        search_movie(mv["tmdb_id"], cfg); n += 1
+        try:
+            search_movie(mv["tmdb_id"], cfg)
+        except SearchUnavailable:
+            # Indexer down: every remaining query this cycle fails the same way, so stop rather
+            # than burn the budget confirming it. The records keep their state and retry next
+            # sweep. (search_movie handles its own record; this is only about the sweep.)
+            core.log("search films: indexer unavailable -> abandoning this sweep")
+            return
+        n += 1
         if n >= cap:
             break
 

@@ -37,6 +37,27 @@ def _promote_job():
         core.log(f"promote_job error: {e}")
 
 
+def _run_search(cfg):
+    """One search sweep, behind SEARCH_LOCK.
+
+    The lock's own comment says hammering the indexers concurrently gets you rate-limited, and the
+    API paths honoured it — but the scheduler's two entry points (`_search_job` hourly and
+    `_finish_job`'s refill every 10 minutes) called stage_search directly, so two or three sweeps
+    could and did overlap. Each computes its own grab budget up front, so overlapping sweeps also
+    collectively exceed max_inflight_downloads. Non-blocking: a sweep already running is doing
+    this same work, so there is nothing to wait for."""
+    if not pipeline.SEARCH_LOCK.acquire(blocking=False):
+        core.log("search: a sweep is already running -> skipping this one")
+        return
+    try:
+        if cfg.get("scope_films", True):
+            pipeline.stage_search(cfg)
+        if cfg.get("scope_series"):
+            tv.stage_search(cfg)
+    finally:
+        pipeline.SEARCH_LOCK.release()
+
+
 def _search_job():
     try:
         cfg = core.load_config()
@@ -55,10 +76,7 @@ def _search_job():
         finally:
             if scanning:
                 pipeline.SCAN_LOCK.release()
-        if cfg.get("scope_films", True):
-            pipeline.stage_search(cfg)
-        if cfg.get("scope_series"):
-            tv.stage_search(cfg)
+        _run_search(cfg)
     except Exception as e:
         core.log(f"search_job error: {e}")
 
@@ -81,11 +99,7 @@ def _finish_job():
     # merges freed slots + deleted donors -> top the download queue back up to the in-flight cap
     if refill:
         try:
-            cfg = core.load_config()
-            if cfg.get("scope_films", True):
-                pipeline.stage_search(cfg)
-            if cfg.get("scope_series"):
-                tv.stage_search(cfg)
+            _run_search(core.load_config())
         except Exception as e:
             core.log(f"finish refill error: {e}")
 

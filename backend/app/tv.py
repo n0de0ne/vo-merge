@@ -13,7 +13,8 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
-                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat, run_mux)
+                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat, run_mux,
+                       SearchUnavailable)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -354,7 +355,11 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     try:
         results = pro.search(query, cfg["en_indexer_ids"])
     except Exception as e:
-        core.log(f"tv search '{query}': {e}"); return None
+        # Unreachable indexer, not "no such release" — see pipeline.SearchUnavailable. Returning
+        # None here made the caller write `no_release` and sit out a 24-hour cooldown on a verdict
+        # nobody reached.
+        core.log(f"tv search '{query}': {e}")
+        raise SearchUnavailable(str(e)) from e
     qt = _toks(query.rsplit(" S", 1)[0] if " S" in query else query)
     best = None
     for r in results:
@@ -379,12 +384,33 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
         sc = min(int(r.get("seeders") or 0), 100)
         if subs_only:      sc += _size_bonus(r)      # harvesting text: smaller is better
         elif RES.search(t): sc += 20
-        if re.search(r'\bMULTI\b', t, re.I): sc += 20
+        # MULTI carries several natively-synced dubs and is what the whole design prefers — the
+        # movie scorer, season_candidates and episode_candidates all weight it +200. This one path
+        # (the AUTOMATIC episode picker) used +20, so the one place the preference decides
+        # something unattended barely expressed it. Subtitle-only keeps the small +40: there the
+        # bonus competes with a size preference, and at +200 a 38 GB pack beat a 2 GB one.
+        if re.search(r'\bMULTI\b', t, re.I): sc += 40 if subs_only else 200
         sc += 60 * media.lang_hits(t, lang_need, query)  # names a language this episode is missing
         link = _pick_link(r)
         if best is None or sc > best[0]:
             best = (sc, r.get("seeders") or 0, t, link)
     return best
+
+
+def _usable(best, cfg):
+    """Does `_search`'s winner clear the same two floors the movie path applies?
+
+    `_search` returns (score, seeders, title, link). The old test was
+    `best[0] < cfg["min_seeders"]`, which compares the SCORE against the seeder minimum: the score
+    starts at min(seeders, 100) and then collects a MULTI bonus and +60 per matching language, so a
+    zero-seed release cleared a floor of 5 comfortably. `score_threshold` was never consulted on
+    the TV path at all, and the season-pack branch had no floor whatsoever — so a dead pack was
+    grabbed, stalled for stall_timeout_min, was blocklisted, and the cycle repeated through every
+    dead pack the indexer listed, burning a grab slot and a 12-hour dl_max_age window each time."""
+    if not best:
+        return False
+    score, seeders = best[0], best[1]
+    return score >= cfg["score_threshold"] and seeders >= cfg["min_seeders"]
 
 
 def season_candidates(series_id, season, cfg=None):
@@ -412,7 +438,9 @@ def season_candidates(series_id, season, cfg=None):
     try:
         results = pro.search(query, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
-        core.log(f"season_candidates: {e}"); return []
+        # See pipeline.SearchUnavailable — [] means "no such release", which this is not.
+        core.log(f"season_candidates: {e}")
+        raise SearchUnavailable(str(e)) from e
     qt = _toks(title); out = []
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
@@ -518,7 +546,9 @@ def episode_candidates(ep_id, cfg=None):
         results = pro.search(f"{title} S{season:02d}E{ep:02d}",
                              cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as ex:
-        core.log(f"episode_candidates: {ex}"); return []
+        # See pipeline.SearchUnavailable — [] means "no such release", which this is not.
+        core.log(f"episode_candidates: {ex}")
+        raise SearchUnavailable(str(ex)) from ex
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
@@ -634,53 +664,70 @@ def stage_search(cfg=None):
     for (sid, title, season), eps in sorted(by_season.items(), key=_order):
         if n >= cap:
             break
-        if len(eps) >= cfg["tv_pack_threshold"]:
-            q = f"{title} S{season:02d}"
-            best = _search(q, cfg, want_pack=True, season=season,
-                           need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
-                           need_subs={x for e in eps
-                                      for x in (e.get("need_subs") or "").split(",") if x})
-            if best:
-                sc, seed, rtitle, link = best
-                h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
-                if not h:
-                    # grab failed -> mark these eps error (NOT a null-hash download, which would
-                    # loop grab -> reconcile-to-pending -> re-grab forever)
-                    for e in eps:
-                        core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                    core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
-                    n += 1
-                    continue
-                seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
-                claimed = _assign_pack(sid, seasons, h, None, rtitle, cfg)
-                core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
-                         f"(seasons {sorted(seasons) if seasons else 'ALL'})")
-                n += 1
-                continue
-            # no pack -> fall through to per-episode
-        for e in eps:
-            if n >= cap:
-                break
-            rs, rn = rel[e["id"]]
-            q = f"{title} S{rs:02d}E{rn:02d}"
-            best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                           need={x for x in (e.get("need_audio") or "").split(",") if x},
-                           need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
-            if not best or best[0] < cfg["min_seeders"]:
-                core.set_ep_status(e["id"], "no_release",
-                                   candidate_title=(best[2] if best else None))
-                continue
+        try:
+            n = _search_season(sid, title, season, eps, rel, cfg, n, cap)
+        except SearchUnavailable:
+            # The indexer is down, so every remaining query this cycle would fail the same way.
+            # Abandon the sweep with the records untouched — the next one retries — rather than
+            # marking hundreds of episodes `no_release` and sitting out a 24-hour cooldown each.
+            core.log("tv search: indexer unavailable -> abandoning this sweep, records left as-is")
+            return
+
+
+def _search_season(sid, title, season, eps, rel, cfg, n, cap):
+    """Search one season group — a pack when enough episodes are missing, else per episode —
+    and return the updated search counter.
+
+    `n` counts SEARCHES, not grabs. Counting only grabs made the `no_release` path free, so when
+    `no_release_retry_h` expired for a large backlog at once, a single cycle ran one Prowlarr query
+    per episode across hundreds of episodes — exactly the hammering `max_search_per_run` exists to
+    prevent, and re-run by the finish refill every 10 minutes."""
+    if len(eps) >= cfg["tv_pack_threshold"]:
+        q = f"{title} S{season:02d}"
+        best = _search(q, cfg, want_pack=True, season=season,
+                       need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
+                       need_subs={x for e in eps
+                                  for x in (e.get("need_subs") or "").split(",") if x})
+        n += 1
+        if _usable(best, cfg):
             sc, seed, rtitle, link = best
-            h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
+            h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
             if not h:
-                core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                core.log(f"tv grab EP '{q}': grab failed -> error")
-                n += 1
-                continue
-            core.set_ep_status(e["id"], "downloading", dl_hash=h,
-                               candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
-            core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
-            n += 1
+                # grab failed -> mark these eps error (NOT a null-hash download, which would
+                # loop grab -> reconcile-to-pending -> re-grab forever)
+                for e in eps:
+                    core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
+                return n
+            seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
+            claimed = _assign_pack(sid, seasons, h, None, rtitle, cfg)
+            core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
+                     f"(seasons {sorted(seasons) if seasons else 'ALL'})")
+            return n
+        # no usable pack -> fall through to per-episode
+    for e in eps:
+        if n >= cap:
+            break
+        rs, rn = rel[e["id"]]
+        q = f"{title} S{rs:02d}E{rn:02d}"
+        best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
+                       need={x for x in (e.get("need_audio") or "").split(",") if x},
+                       need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
+        n += 1
+        if not _usable(best, cfg):
+            core.set_ep_status(e["id"], "no_release",
+                               candidate_title=(best[2] if best else None))
+            continue
+        sc, seed, rtitle, link = best
+        h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
+        if not h:
+            core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+            core.log(f"tv grab EP '{q}': grab failed -> error")
+            continue
+        core.set_ep_status(e["id"], "downloading", dl_hash=h,
+                           candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
+        core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
+    return n
 
 
 # ------------------------------------------------------------------ FINISH (map + merge)

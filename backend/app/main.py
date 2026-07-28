@@ -911,7 +911,12 @@ def do_merge(tmdb_id: int):
 
 @api.get("/movie/{tmdb_id}/candidates")
 def movie_candidates(tmdb_id: int):
-    return pipeline.candidates(tmdb_id, include_tried=True)
+    try:
+        return pipeline.candidates(tmdb_id, include_tried=True)
+    except pipeline.SearchUnavailable as e:
+        # An empty list would read as "no releases exist for this title", which is a very
+        # different thing to tell someone staring at an interactive search.
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 class GrabIn(BaseModel):
@@ -1738,7 +1743,10 @@ def tv_scan():
 @api.get("/tv/{series_id}/{season}/candidates")
 def tv_season_candidates(series_id: int, season: int):
     from . import tv
-    return tv.season_candidates(series_id, season)
+    try:
+        return tv.season_candidates(series_id, season)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 @api.post("/tv/{series_id}/{season}/grab")
@@ -1768,7 +1776,10 @@ def ep_ignore(ep_id: str):
 @api.get("/episode/{ep_id}/candidates")
 def ep_candidates(ep_id: str):
     from . import tv
-    return tv.episode_candidates(ep_id)
+    try:
+        return tv.episode_candidates(ep_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 @api.post("/episode/{ep_id}/grab")
