@@ -142,6 +142,13 @@ DEFAULTS = {
     "webhook_token": "",                   # optional shared secret for /api/hook/*. Empty =
                                            # no check (matches the rest of this LAN-only API).
                                            # Set it and Radarr/Sonarr must send ?token=… .
+    "api_key": "",                         # optional shared secret for the WHOLE API. Empty = no
+                                           # check, which is the historical behaviour. Set it and
+                                           # every /api call must send `X-API-Key: …` (or
+                                           # ?apikey=…); /api/hook/* is exempt because the *arrs
+                                           # can't be taught an extra header and already have
+                                           # webhook_token. Cross-origin POSTs are refused
+                                           # regardless — see main._guard.
     "paused": False,                       # temporary brake: no NEW searches, grabs or merges.
                                            # Work already in flight finishes (killing mkvmerge
                                            # mid-write would leave a corrupt file), so the load
@@ -320,6 +327,14 @@ def init_db():
                                    "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                    # rate-stretch ratio applied at merge (PAL etc); 1.0 = none
                                    "sync_drift": "REAL",
+                                   # 1 = the offset/drift above were set DELIBERATELY (an operator
+                                   # or the AI via /set_sync) and must be applied as-is. A merge
+                                   # also records what it measured, for display — but that is a
+                                   # fact about the donor it measured, not an instruction for the
+                                   # next one, and treating the two the same is how a re-opened
+                                   # record re-merged an unrelated release with the old release's
+                                   # offset and skipped detection entirely.
+                                   "sync_manual": "INTEGER DEFAULT 0",
                                    # what the FILE actually holds (from mkvmerge, not metadata)
                                    "audio_langs": "TEXT", "sub_langs": "TEXT",
                                    "needs": "TEXT",          # audio | subs | audio+subs
@@ -360,6 +375,7 @@ def init_tv():
                                      # AI-review round-trip (see movies table)
                                      "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                      "sync_drift": "REAL",
+                                     "sync_manual": "INTEGER DEFAULT 0",   # see movies table
                                      # what the FILE actually holds (see movies table)
                                      "audio_langs": "TEXT", "sub_langs": "TEXT",
                                      "needs": "TEXT", "added_subs": "TEXT",

@@ -147,10 +147,34 @@ export interface Dash {
   next_runs: Record<string, number>; now: number;
 }
 
+// When the server has an api_key set, every request needs it. It is kept in localStorage so a
+// reload doesn't log you out; a 401 clears it and prompts again, so a rotated key can't leave the
+// UI permanently wedged against a stale one.
+const KEY_STORAGE = "vo-merge.apiKey";
+
+export function getApiKey(): string {
+  try { return localStorage.getItem(KEY_STORAGE) || ""; } catch { return ""; }
+}
+
+export function setApiKey(k: string) {
+  try { k ? localStorage.setItem(KEY_STORAGE, k) : localStorage.removeItem(KEY_STORAGE); } catch { /* private mode */ }
+}
+
+export class Unauthorized extends Error {
+  constructor() { super("API key required"); this.name = "Unauthorized"; }
+}
+
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
+  const key = getApiKey();
   const r = await fetch(url, {
-    headers: { "Content-Type": "application/json" }, ...opts,
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...(key ? { "X-API-Key": key } : {}),
+      ...(opts?.headers || {}),
+    },
   });
+  if (r.status === 401) { setApiKey(""); throw new Unauthorized(); }
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   return r.json();
 }

@@ -1,7 +1,8 @@
 """FastAPI app: REST API + serves the built React SPA."""
-import os, subprocess, time
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import hmac, os, subprocess, time
+from urllib.parse import urlsplit
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from . import agent, core, scheduler, pipeline, media
@@ -10,6 +11,19 @@ from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 app = FastAPI(title="VO Merger")
 STATIC = os.environ.get("VO_STATIC", "/app/static")
 PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
+
+
+def _under(path, root):
+    """True when `path` really resolves inside `root`.
+
+    Both the SPA file server and the donor-assign endpoint take a caller-supplied path and join it
+    onto a trusted root, and `os.path.join` silently returns the caller's path verbatim when it is
+    absolute — so the join is not a containment check, it just looks like one. Compare the RESOLVED
+    paths (symlinks included: the library is full of them, and `/media/...-EN` mirrors point back
+    into the real tree)."""
+    root = os.path.realpath(root)
+    path = os.path.realpath(path)
+    return path == root or path.startswith(root + os.sep)
 
 
 @app.on_event("startup")
@@ -23,6 +37,47 @@ def _startup():
 
 # ----- API -----
 api = FastAPI()
+
+_SAFE_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
+
+
+@api.middleware("http")
+async def _guard(request: Request, call_next):
+    """Two checks the API had neither of: a shared secret, and a cross-origin refusal.
+
+    Nothing here authenticated anything. That is defensible for a LAN-only tool right up to the
+    point where the endpoints delete media (`/library/repair`), rewrite service credentials
+    (`/settings`) and drop torrents — and several of those take only query parameters, so a plain
+    HTML form on any page the operator visits can fire them cross-site. No preflight is involved
+    in that shape, so CORS (correctly absent) never gets a say.
+
+    - **Origin check** — a browser always sends `Origin` on a state-changing request and cannot
+      forge it; a form POST from another site therefore carries a foreign one, while the SPA's own
+      fetch matches `Host` and curl/the host AI dispatcher send none at all. Refusing only a
+      PRESENT-and-mismatched Origin closes the CSRF shape without breaking any real caller, so it
+      is on unconditionally.
+    - **`api_key`** — off by default (empty), preserving current behaviour for existing installs.
+      Set it and every call needs `X-API-Key`. `/hook/*` is exempt: Radarr and Sonarr can't be
+      taught a custom header, and they already authenticate with `webhook_token`."""
+    # A mounted sub-app sees the FULL path in scope["path"] with the mount prefix in root_path
+    # (older Starlette strips it instead), so strip it ourselves rather than assuming either.
+    path = request.scope.get("path", "")
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root):]
+    is_hook = path.startswith("/hook/")
+    if request.method not in _SAFE_METHODS:
+        origin = request.headers.get("origin")
+        if origin:
+            host = request.headers.get("host") or ""
+            if urlsplit(origin).netloc.lower() != host.lower():
+                return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
+    key = str(core.load_config().get("api_key") or "").strip()
+    if key and not is_hook:
+        got = request.headers.get("x-api-key") or request.query_params.get("apikey") or ""
+        if not hmac.compare_digest(got, key):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 @api.get("/status")
@@ -781,7 +836,13 @@ def do_search(tmdb_id: int):
 
 @api.post("/movie/{tmdb_id}/merge")
 def do_merge(tmdb_id: int):
-    pipeline.merge_movie(tmdb_id); return core.get_movie(tmdb_id)
+    """Queue the merge; the background worker runs it. See pipeline.enqueue_merge for why this
+    must not merge inline."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    if not pipeline.enqueue_merge("movie", tmdb_id):
+        raise HTTPException(409, "already merging")
+    return core.get_movie(tmdb_id)
 
 
 @api.get("/movie/{tmdb_id}/candidates")
@@ -813,10 +874,13 @@ def set_sync(tmdb_id: int, body: SyncIn):
         pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms or None)
     else:
         # not merged (sync_fail/error) -> re-attempt the merge; manual offset if given,
-        # otherwise the video scene-cut matcher tries to align it.
-        core.set_status(tmdb_id, mv["status"] if mv else "pending",
-                        sync_offset_ms=(body.offset_ms or 0), error=None)
-        pipeline.merge_movie(tmdb_id)
+        # otherwise the video scene-cut matcher tries to align it. An explicit offset is an
+        # instruction (sync_manual=1, applied verbatim); offset 0 means "detect it", so the flag
+        # is cleared or detection would be skipped with a zero shift.
+        if not pipeline.enqueue_merge("movie", tmdb_id, error=None,
+                                      sync_offset_ms=(body.offset_ms or 0),
+                                      sync_manual=1 if body.offset_ms else 0):
+            raise HTTPException(409, "already merging")
     return core.get_movie(tmdb_id)
 
 
@@ -1041,8 +1105,11 @@ def _set_sync(kind: str, rec, ident, body: SetSyncIn):
     if body.drift is not None and not (0.9 <= body.drift <= 1.11):
         raise HTTPException(422, "drift must be a rate ratio near 1.0 (0.9–1.11)")
     setter = core.set_status if kind == "movie" else core.set_ep_status
+    # sync_manual marks this as an INSTRUCTION rather than a measurement, which is what makes the
+    # merge apply it verbatim and skip detection. A merge's own measured offset is stored too, but
+    # without this flag, so it can never be replayed onto a different donor.
     setter(ident, rec["status"], sync_offset_ms=int(body.offset_ms),
-           sync_drift=body.drift, error=None)
+           sync_drift=body.drift, sync_manual=1, error=None)
     return setter
 
 
@@ -1057,7 +1124,8 @@ def movie_set_sync(tmdb_id: int, body: SetSyncIn):
         raise HTTPException(404, "unknown movie")
     _set_sync("movie", mv, tmdb_id, body)
     core.log(f"set_sync {tmdb_id}: offset={body.offset_ms}ms drift={body.drift}")
-    pipeline.merge_movie(tmdb_id)
+    if not pipeline.enqueue_merge("movie", tmdb_id):
+        raise HTTPException(409, "already merging")
     return core.get_movie(tmdb_id)
 
 
@@ -1070,7 +1138,8 @@ def episode_set_sync(ep_id: str, body: SetSyncIn):
         raise HTTPException(404, "unknown episode")
     _set_sync("episode", e, ep_id, body)
     core.log(f"set_sync {ep_id}: offset={body.offset_ms}ms drift={body.drift}")
-    tv.merge_ready_episode(ep_id)
+    if not pipeline.enqueue_merge("episode", ep_id):
+        raise HTTPException(409, "already merging")
     return core.get_episode(ep_id)
 
 
@@ -1128,8 +1197,7 @@ def movie_sync_probe(tmdb_id: int, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("movie", mv, tmdb_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                   drift=out["drift"]))
-        pipeline.merge_movie(tmdb_id)
-        out["applied"] = True
+        out["applied"] = pipeline.enqueue_merge("movie", tmdb_id)
     return out
 
 
@@ -1146,8 +1214,7 @@ def episode_sync_probe(ep_id: str, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("episode", e, ep_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                  drift=out["drift"]))
-        tv.merge_ready_episode(ep_id)
-        out["applied"] = True
+        out["applied"] = pipeline.enqueue_merge("episode", ep_id)
     return out
 
 
@@ -1651,7 +1718,12 @@ if os.path.isdir(STATIC):
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        f = os.path.join(STATIC, full_path)
-        if full_path and os.path.isfile(f):
+        # `os.path.join` DISCARDS its left operand when the right one is absolute, so a request
+        # for "//config/config.json" resolved to /config/config.json — the API keys, the qB
+        # password and both Plex tokens — and "//etc/passwd" likewise. Dot-segments are already
+        # normalised away by the ASGI layer; this is purely the absolute-path case, which is why
+        # it survives casual testing. Resolve, then require the result to stay under STATIC.
+        f = os.path.realpath(os.path.join(STATIC, full_path))
+        if full_path and _under(f, STATIC) and os.path.isfile(f):
             return FileResponse(f)
         return FileResponse(os.path.join(STATIC, "index.html"))

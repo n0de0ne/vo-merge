@@ -13,7 +13,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
-                       CLOSEABLE)
+                       CLOSEABLE, _orig_codes, DONOR_RESET, blocklist, _beat)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -577,7 +577,7 @@ def retry_episode(ep_id, cfg=None):
     # attempts is reset because an operator asking for a retry means "try again": a sync_fail
     # record has already spent its budget and would otherwise fail straight back to sync_fail.
     core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
-                       dl_hash=None, dl_id=None, en_file=None, progress="")
+                       **DONOR_RESET, progress="")
     return True
 
 
@@ -752,11 +752,14 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             core.set_ep_status(ep["id"], "error", error="multi remux failed")
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
-    offset = ep.get("sync_offset_ms") or 0
+    # Only a DELIBERATELY set offset skips detection — see pipeline._merge_movie_impl. A stored
+    # measurement describes the donor it was measured against, not the next one.
+    manual = bool(ep.get("sync_manual"))
+    offset = (ep.get("sync_offset_ms") or 0) if manual else 0
     # framerate mismatch is handled by the drift detector below (not rejected upfront);
     # only bail here if auto-sync is off, since a constant offset can't fix frame drift.
     fps_diff = not sync.fps_close(ei["fps"], fi["fps"])
-    if fps_diff and not offset and not cfg.get("auto_sync", True):
+    if fps_diff and not manual and not cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
                            error=f"framerate differs ({ei['fps']} vs {fi['fps']}), auto-sync off"); return
     eq, fq = _video_quality(en_file, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -766,7 +769,11 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     kind = media.kind_of(fr, ep.get("orig_lang"), cfg,
                          series_type=ep.get("series_type") or "standard")
     want_a, _ = media.profile(kind, cfg, ep.get("orig_lang"))
-    picked = media.wanted_audio(di, bi, want_a)
+    # `extra` keeps the original-language VO eligible when a title's original language isn't in
+    # the profile and no English track exists — the whole point of carrying VO for subtitle
+    # viewers. The movie path has always passed it; TV silently didn't, so a series whose
+    # original language is neither English nor French never got its VO grafted.
+    picked = media.wanted_audio(di, bi, want_a, extra=_orig_codes(ep.get("orig_lang")))
     ids = [a["id"] for a in picked]
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
@@ -789,15 +796,15 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         _plex_ep_refresh(ep, cfg)
         return
     # manual offset skips detection; honour a stored stretch ratio (see pipeline)
-    drift = (ep.get("sync_drift") or None) if offset else None
+    drift = (ep.get("sync_drift") or None) if manual else None
     if drift and abs(drift - 1.0) < 1e-6:
         drift = None
-    if not offset and cfg.get("auto_sync", True):
+    if not manual and cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, (daidx[ids[0]] if ids else 0),
             min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
-            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint,
+            on_progress=lambda msg: _beat("episode", ep["id"], msg), hint=hint,
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
@@ -810,7 +817,7 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
     what = "audio" if ids else ""
     what = (what + "+subs") if (what and subs) else (what or "subs")
-    core.set_ep_status(ep["id"], "merging", progress=f"muxing {what}…")
+    core.set_ep_status(ep["id"], "merging", progress=f"muxing {what}…", updated=time.time())
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
@@ -858,7 +865,7 @@ def _drop_stalled_eps(eps, t, cfg):
         attempts = (e.get("attempts") or 0) + 1
         st = "no_release" if attempts >= cfg.get("max_sync_retries", 4) else "pending"
         core.set_ep_status(e["id"], st, tried=_json.dumps(tried), attempts=attempts,
-                           dl_hash=None, dl_id=None, en_file=None, progress="",
+                           **DONOR_RESET, progress="",
                            error=("all releases stalled" if st == "no_release" else None))
     core.log(f"tv stall: '{t.get('name','')[:50]}' stalled ({seeds} seeds) -> blocklisted "
              f"{len(eps)} ep(s), re-searching")
@@ -1060,11 +1067,13 @@ def stage_finish(cfg=None):
     for h, eps in by_hash.items():
         t = torrents.get(h)
         if not t:
-            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
+            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search,
+            # blocklisting the release so the next search can't re-pick it (see pipeline).
             for e in eps:
-                core.set_ep_status(e["id"], "pending", dl_hash=None, dl_id=None,
-                                   en_file=None, error=None, progress="")
-            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) -> re-queued")
+                core.set_ep_status(e["id"], "pending", **DONOR_RESET, error=None, progress="",
+                                   tried=blocklist(e))
+            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) "
+                     f"-> re-queued (release blocklisted)")
             continue
         if (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
             _drop_stalled_eps(eps, t, cfg)
