@@ -28,11 +28,23 @@ Deleting the claimed file is the ack; the agent's `POST …/ai_result` callback 
     restart: unless-stopped
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - VO_URL=http://10.0.1.5:8090/api          # cross-watch: alarm when vo-merge is down
+      - NOTIFY_URL=${NOTIFY_URL}                  # same value as vo-merge's notify_url
       # AGENT_CMD=claude -p --dangerously-skip-permissions   # default
-      # AGENT_TIMEOUT_S=1800  POLL_S=30  RETRY_MIN=45  MAX_ATTEMPTS=3
+      # AGENT_TIMEOUT_S=1800  POLL_S=30  RETRY_MIN=45  MAX_ATTEMPTS=3  VO_DOWN_ALARM_MIN=15
     volumes:
       - /mnt/user/appdata/vo-merge/ai-tickets:/tickets
 ```
+
+## Who watches the watcher
+
+The two processes watch **each other**: vo-merge alarms when this loop's heartbeat goes stale
+with tickets queued (`pipeline.check_dispatcher`), and this loop pings vo-merge's `/api/health`
+(exempt from `api_key`) and fires the same out-of-band alarm when vo-merge itself is the thing
+that's down — the one failure vo-merge's own watchdogs can never report. Set `VO_URL` +
+`NOTIFY_URL` to enable it. The residual blind spot is the whole HOST dying, which no software on
+the host can report: if that matters, point an external uptime ping (healthchecks.io, another
+machine's Uptime-Kuma) at either `/api/health` or the notify channel's silence.
 
 Unraid: install as a container from this Dockerfile with the same single volume mapping and the
 API key variable; leave the default restart policy on. The agent reaches vo-merge over the LAN

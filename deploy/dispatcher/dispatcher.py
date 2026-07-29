@@ -21,6 +21,14 @@ The agent itself is the Claude Code CLI (or anything else set via AGENT_CMD) poi
 ticket's own brief: every ticket already carries the API base, the record, the action surface
 and the report-back instruction, so the prompt here only frames it.
 
+This loop is also THE WATCHER OF THE WATCHER. Every alarm vo-merge can raise lives inside
+vo-merge — so when vo-merge itself is down (crashloop, dead container, refused port), nothing
+anywhere could say so. The two processes now watch each other: vo-merge watches this loop via
+the heartbeat, and this loop pings vo-merge's /api/health (exempt from api_key by design) and
+raises the out-of-band alarm itself when it stays unreachable past VO_DOWN_ALARM_MIN. A
+whole-host outage still needs a ping from OUTSIDE the box (healthchecks.io, another machine's
+Uptime-Kuma) — no in-host software can report the host's own death.
+
 Environment:
   TICKETS         ticket directory (default /tickets — mount vo-merge's ai-tickets here)
   AGENT_CMD       agent command; the prompt is piped to stdin
@@ -29,6 +37,11 @@ Environment:
   POLL_S          idle poll interval (default 30)
   RETRY_MIN       minutes before a crashed (still-claimed) ticket is requeued (default 45)
   MAX_ATTEMPTS    runs before a ticket is moved to dead/ (default 3)
+  VO_URL          vo-merge API base for the cross-watch, e.g. http://10.0.1.5:8090/api
+                  (empty = cross-watch off)
+  NOTIFY_URL      where the vo-merge-down alarm goes (same shapes vo-merge's notify.py takes:
+                  ntfy topic, Discord/Slack webhook)
+  VO_DOWN_ALARM_MIN  minutes of continuous unreachability before alarming (default 15)
   ANTHROPIC_API_KEY (or a mounted ~/.claude) — the CLI's own auth
 """
 import json
@@ -37,6 +50,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.request
 
 TICKETS = os.environ.get("TICKETS", "/tickets")
 CLAIMED = os.path.join(TICKETS, "claimed")
@@ -47,6 +61,9 @@ AGENT_TIMEOUT_S = int(os.environ.get("AGENT_TIMEOUT_S", "1800"))
 POLL_S = int(os.environ.get("POLL_S", "30"))
 RETRY_MIN = int(os.environ.get("RETRY_MIN", "45"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+VO_URL = os.environ.get("VO_URL", "").rstrip("/")
+NOTIFY_URL = os.environ.get("NOTIFY_URL", "")
+VO_DOWN_ALARM_MIN = int(os.environ.get("VO_DOWN_ALARM_MIN", "15"))
 
 
 def log(msg):
@@ -106,6 +123,61 @@ def requeue_crashed():
                 log(f"requeued crashed ticket {n} (attempt {attempts})")
         except OSError as e:
             log(f"requeue {n} failed: {e}")
+
+
+def notify(title, body):
+    """Best-effort POST to NOTIFY_URL, matching vo-merge's own notify.py payload shapes."""
+    if not NOTIFY_URL:
+        return
+    u = NOTIFY_URL.lower()
+    try:
+        if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
+            data = json.dumps({"content": f"**{title}**\n{body}"[:1900]}).encode()
+            req = urllib.request.Request(NOTIFY_URL, data=data,
+                                         headers={"Content-Type": "application/json"})
+        elif "hooks.slack.com" in u:
+            data = json.dumps({"text": f"*{title}*\n{body}"[:2900]}).encode()
+            req = urllib.request.Request(NOTIFY_URL, data=data,
+                                         headers={"Content-Type": "application/json"})
+        else:
+            req = urllib.request.Request(NOTIFY_URL, data=body.encode(),
+                                         headers={"Title": title, "Priority": "high"})
+        urllib.request.urlopen(req, timeout=10)
+        log(f"notified: {title}")
+    except Exception as e:
+        log(f"notify failed: {e}")
+
+
+_VO = {"down_since": None, "alarmed": False}
+
+
+def check_vo():
+    """The cross-watch: vo-merge's watchdogs cannot report vo-merge's own death. One /health
+    probe per cycle; a sustained failure raises the alarm ONCE per outage, and recovery both
+    announces itself and re-arms."""
+    if not VO_URL:
+        return
+    try:
+        urllib.request.urlopen(f"{VO_URL}/health", timeout=10)
+    except Exception as e:
+        now = time.time()
+        if _VO["down_since"] is None:
+            _VO["down_since"] = now
+            log(f"vo-merge unreachable ({e})")
+        elif not _VO["alarmed"] and now - _VO["down_since"] > VO_DOWN_ALARM_MIN * 60:
+            _VO["alarmed"] = True
+            notify("vo-merge: vo-merge itself is DOWN",
+                   f"{VO_URL}/health has been unreachable for "
+                   f"{int((now - _VO['down_since']) / 60)}min ({e}). The pipeline and all of "
+                   f"its own alarms are offline; check the vo-merge container.")
+        return
+    if _VO["alarmed"]:
+        notify("vo-merge: back up",
+               f"{VO_URL}/health answers again after "
+               f"{int((time.time() - (_VO['down_since'] or time.time())) / 60)}min down.")
+    if _VO["down_since"]:
+        log("vo-merge reachable again")
+    _VO.update(down_since=None, alarmed=False)
 
 
 def prompt_for(ticket):
@@ -169,6 +241,7 @@ def main():
     while True:
         try:
             beat()
+            check_vo()
             requeue_crashed()
             names = queued()
             if names:

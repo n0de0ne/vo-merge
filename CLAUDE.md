@@ -1095,6 +1095,19 @@ dispatcher dead, config broken, disk floor, `dep-*` (a dependency continuously u
 "qB error, returning" logs never could; surfaced on `/api/status` as `deps_down`), and the
 needs-human digest. Never per-merge chatter.
 
+**Who watches the watcher:** all of the above lives inside vo-merge, so vo-merge's own death is
+the one failure it can never report. The sidecar dispatcher closes that loop — it pings
+`/api/health` each cycle (`VO_URL`) and raises the same out-of-band alarm (`NOTIFY_URL`) when
+vo-merge stays unreachable past `VO_DOWN_ALARM_MIN`, so the two processes watch each other. A
+whole-host outage still needs an external uptime ping; no in-host software can report the
+host's own death.
+
+Post-merge QC is **drift-aware**: `sync.audio_windows` hands `qc_grafted_audio` the raw
+per-window residuals, and a line through them whose span exceeds `qc_max_offset_ms` across the
+runtime rejects the merge — a wrong STRETCH ratio (windows disagreeing *linearly*) used to be
+indistinguishable from noise and sailed through the consensus check. Scattered disagreement is
+still inconclusive-accept; two points must span 2× the limit, since any two points fit a line.
+
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
 Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `lang_profiles`, `anime_dirs`, `want_subs`/`max_sub_tracks`/`subs_only_gap`, `*_url`/`*_key` for Prowlarr/Radarr/Sonarr/qB/Plex, `en_indexer_ids`,

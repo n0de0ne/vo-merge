@@ -1087,21 +1087,53 @@ def test_qc_rejects_only_on_confident_misalignment(app_env, monkeypatch):
     that — and must NOT reject good merges of quiet films on absent evidence."""
     from app import pipeline, sync
     cfg = dict(app_env.DEFAULTS)
-    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (3800, 0.8))
+    # constant misalignment: confident windows agreeing on a value beyond the limit
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 3800, 0.8), (2500, 3750, 0.7), (4500, 3820, 0.8)])
     ok, res, conf = pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)
-    assert ok is False and res == 3800, "confident large residual must reject"
-    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (120, 0.9))
+    assert ok is False and abs(res - 3800) < 100, "confident agreed residual must reject"
+    # aligned: small residuals agree
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 100, 0.9), (2500, 140, 0.8), (4500, 90, 0.9)])
     assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
-    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (3800, 0.1))
-    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True, \
-        "low confidence = inconclusive = accept (absence of evidence)"
-    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (None, 0.0))
+    # low confidence everywhere = inconclusive = accept (absence of evidence)
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 3800, 0.1), (2500, -2000, 0.2)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    monkeypatch.setattr(sync, "audio_windows", lambda *a, **k: [])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    # scattered confident noise: no agreement, no line -> inconclusive, accept
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 2400, 0.5), (2500, -2100, 0.5), (4500, 600, 0.5)])
     assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
     called = []
-    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: called.append(1) or (0, 1.0))
+    monkeypatch.setattr(sync, "audio_windows", lambda *a, **k: called.append(1) or [])
     assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000,
                                      dict(cfg, postmerge_qc=False))[0] is True
     assert not called, "postmerge_qc off must not decode anything"
+
+
+def test_qc_catches_a_wrong_drift_by_its_growing_residual(app_env, monkeypatch):
+    """A wrong STRETCH used to hide in the inconclusive bucket: the consensus collapse only
+    reported that windows disagreed, which is also what noise looks like. The signature that
+    tells them apart is the trend — a residual that grows linearly across the runtime IS a
+    drifting graft, and the one failure class the phase-3 QC still let through."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    # 1 ms/s residual (the realistic wrong-ratio case, e.g. 25/24 applied for 25/23.976):
+    # +500ms at 500s, +2500ms at 2500s, +4500ms at 4500s over a 5000s film -> span ~5000ms
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 500, 0.7), (2500, 2500, 0.6), (4500, 4500, 0.7)])
+    ok, res, conf = pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)
+    assert ok is False and res > 1500, "a linear residual across the runtime must reject"
+    # two points only: any two points fit a line perfectly, so the bar doubles
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 200, 0.7), (4500, 1800, 0.7)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True, \
+        "two points spanning less than 2x the limit are not confident drift evidence"
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 200, 0.7), (4500, 4200, 0.7)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is False
 
 
 def test_recycle_keeps_replaced_originals_and_purges_on_ttl(app_env, tmp_path):

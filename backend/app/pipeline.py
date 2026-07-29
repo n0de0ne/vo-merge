@@ -1999,30 +1999,63 @@ def qc_grafted_audio(out, n_base_auds, dur, cfg, tag=""):
     them is ~0 (different languages correlate through music and effects — the same signal
     `resync_movie` has always used to repair these by hand).
 
-    Asymmetric on purpose: rejection requires CONFIDENT evidence of misalignment (conf ≥
-    qc_min_conf AND |residual| > qc_max_offset_ms). An inconclusive measurement — dialogue-free
-    windows, wildly different mixes — accepts the merge, because burning the retry budget on
-    absent evidence would reject good merges of quiet films. A wrong constant offset is caught
-    reliably; a wrong drift shows up as windows that disagree, which lands in the inconclusive
-    bucket — narrower coverage, stated honestly.
+    Asymmetric on purpose: rejection requires CONFIDENT evidence of misalignment (points at
+    conf ≥ qc_min_conf, agreeing with each other or falling on a line). An inconclusive
+    measurement — dialogue-free windows, wildly different mixes, scattered noise — accepts the
+    merge, because burning the retry budget on absent evidence would reject good merges of
+    quiet films.
+
+    Two failure signatures, told apart from the same points (`sync.audio_windows`):
+    - a wrong CONSTANT offset: the residuals agree on one value beyond `qc_max_offset_ms`;
+    - a wrong STRETCH ratio: the residual GROWS across the runtime. The old consensus-based
+      check collapsed the windows into one verdict, so this exact signature — windows that
+      disagree *linearly* — read as "inconclusive" and a wrong drift sailed through. A line
+      through the confident points whose span across the runtime exceeds the limit is a
+      drifting graft (R² ≥ 0.85 with 3+ points; two points must disagree by 2× the limit,
+      since any two points fit a line perfectly).
 
     Returns (ok, residual_ms|None, conf)."""
     if not cfg.get("postmerge_qc", True) or n_base_auds < 1:
         return True, None, 0.0
+    import statistics
     try:
-        m, c = sync.audio_consensus(out, 0, n_base_auds, dur, cfg, tag=f"{tag} qc")
+        pts = sync.audio_windows(out, 0, n_base_auds, dur, cfg, tag=f"{tag} qc")
     except Exception as e:
-        core.log(f"qc{tag}: consensus failed ({e}) — inconclusive, accepting")
+        core.log(f"qc{tag}: measurement failed ({e}) — inconclusive, accepting")
         return True, None, 0.0
-    if m is None or c < float(cfg.get("qc_min_conf", 0.35)):
-        core.log(f"qc{tag}: inconclusive (conf {c:.2f}) — accepting")
-        return True, (None if m is None else int(round(m))), c
-    if abs(m) > int(cfg.get("qc_max_offset_ms", 1500)):
-        core.log(f"qc{tag}: grafted audio is OFF by {int(m):+d}ms (conf {c:.2f}) — rejecting "
-                 f"the merge before it reaches the library")
-        return False, int(round(m)), c
-    core.log(f"qc{tag}: grafted audio aligned ({int(m):+d}ms residual, conf {c:.2f})")
-    return True, int(round(m)), c
+    min_conf = float(cfg.get("qc_min_conf", 0.35))
+    lim = int(cfg.get("qc_max_offset_ms", 1500))
+    good = [(t, m, c) for t, m, c in pts if c >= min_conf]
+    if not good:
+        best = max((c for _, _, c in pts), default=0.0)
+        core.log(f"qc{tag}: inconclusive (best conf {best:.2f}) — accepting")
+        return True, None, best
+    conf = max(c for _, _, c in good)
+    if len(good) >= 2:
+        b, _a, r2 = sync._linfit([t for t, _, _ in good], [m for _, m, _ in good])
+        span = abs(b) * (dur or 0)
+        if span > lim and (r2 >= 0.85 if len(good) >= 3 else span > 2 * lim):
+            core.log(f"qc{tag}: grafted audio DRIFTS ~{int(span)}ms across the runtime "
+                     f"(R²={r2:.2f}, conf {conf:.2f}) — rejecting before it reaches the library")
+            return False, int(round(span)), conf
+        med = statistics.median(m for _, m, _ in good)
+        agree = [m for _, m, _ in good if abs(m - med) <= 300]
+        if len(agree) >= 2 and abs(med) > lim:
+            core.log(f"qc{tag}: grafted audio is OFF by {int(med):+d}ms (conf {conf:.2f}) — "
+                     f"rejecting before it reaches the library")
+            return False, int(round(med)), conf
+        if len(agree) >= 2:
+            core.log(f"qc{tag}: grafted audio aligned ({int(med):+d}ms residual, conf {conf:.2f})")
+            return True, int(round(med)), conf
+        core.log(f"qc{tag}: confident points scatter with no pattern — inconclusive, accepting")
+        return True, int(round(med)), conf
+    m = good[0][1]
+    if abs(m) > lim:
+        core.log(f"qc{tag}: grafted audio is OFF by {int(m):+d}ms (single window, conf "
+                 f"{conf:.2f}) — rejecting before it reaches the library")
+        return False, int(round(m)), conf
+    core.log(f"qc{tag}: grafted audio aligned ({int(m):+d}ms residual, conf {conf:.2f})")
+    return True, int(round(m)), conf
 
 
 RECYCLE_DIRNAME = ".vo-merge-recycle"
