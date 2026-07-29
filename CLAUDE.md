@@ -738,6 +738,37 @@ So we don't measure the stretch, we **hypothesis-test** it:
 - `verify_hint` now quick-verifies a *ratio* hint too, so a PAL season pack doesn't redo the full
   scan for every episode.
 
+## The donor's path goes stale (`pipeline.resolve_donor_path`)
+
+`en_file` is captured when a download completes, from the torrent's `content_path`. But qB then
+**moves** the finished torrent out of its incomplete directory into the completed one, and the
+merge — which runs later, off the `ready` queue — still holds the pre-move path. `os.path.exists`
+fails and the record is marked `merge: missing en_file` while the donor is sitting on disk,
+intact, under its new name. It is a stale cached path, not a missing file.
+
+This is **not** the Unraid mover: both containers read through `/mnt/user`, a FUSE union the
+mover is transparent to. Nothing here is mover-aware, and nothing should be.
+
+Both merge entry points (`_merge_movie_impl`, `merge_ready_episode`) therefore re-ask qB before
+declaring the donor gone — qB is the thing that moved it and always knows where it is now:
+
+1. the cached path still exists → return it (no qB call at all);
+2. otherwise `torrent(dl_hash)` → `content_path`, then `save_path`, each through `_qb_to_local`
+   (qB says `/data/...`, we read `/media/...`), taking the largest video when it's a directory;
+3. otherwise the **file list**, which is relative to `save_path` and so survives a rename of the
+   torrent's own root folder;
+4. nothing resolves → `None`, and the caller's existing error path is still exactly right.
+
+A resolved path is written back to the record, so the next stage and the operator see the truth.
+`os.path.exists` is kept as the final gate on both paths. `clients.QBittorrent.torrent(hash)`
+exists for step 2: `hashes=` on `/torrents/info` costs one small request and finds the torrent
+whatever category it is in.
+
+The orphan sweep is the other way a donor goes missing, and is already guarded:
+`KEEP_DONOR_STATES` covers `ready`/`merging`, and a record in `grabbed` carries no `dl_hash` yet
+(it is written at `downloading`), so the sweep cannot match one — the 30-minute `added_on` grace
+is what covers that window.
+
 ## Stalled-download handling
 
 `_is_stalled(t, cfg)`: incomplete + active > `stall_timeout_min` (default **5**) + `dlspeed==0` +

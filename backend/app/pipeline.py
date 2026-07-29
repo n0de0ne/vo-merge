@@ -1288,6 +1288,62 @@ def _find_video(folder):
     return best
 
 
+def resolve_donor_path(cfg, dl_hash, cached, tag=""):
+    """The donor's CURRENT path, re-asked of qB when the cached one no longer resolves.
+
+    `en_file` is captured when a download completes, from the torrent's `content_path`. But qB
+    then MOVES the finished torrent out of its incomplete directory into the completed one, and
+    the merge — which runs later, from a queue — still holds the pre-move path. `os.path.exists`
+    fails, and the record is marked `merge: missing en_file` while the file is sitting on disk
+    perfectly intact under its new name. That is a stale cached path, not a missing donor.
+
+    (Specifically NOT the Unraid mover: both containers read through /mnt/user, which is a FUSE
+    union the mover is transparent to. Nothing here is mover-aware.)
+
+    Asking qB is the fix, because qB is the thing that moved it and always knows where it is now.
+    Returns an existing path, or None when the donor is genuinely gone — in which case the
+    caller's existing error path is still exactly right."""
+    if cached and os.path.exists(cached):
+        return cached                       # fast path: nothing moved
+    if not dl_hash:
+        return None
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        t = qb.torrent(dl_hash)
+    except Exception as e:
+        core.log(f"donor re-resolve{tag}: qB error {e}")
+        return None
+    if not t:
+        return None                         # qB no longer has it -> genuinely gone
+    for raw in (t.get("content_path"), t.get("save_path")):
+        p = _qb_to_local(raw or "", cfg)
+        if not p or not os.path.exists(p):
+            continue
+        vid = _find_video(p) if os.path.isdir(p) else p
+        if vid and os.path.exists(vid):
+            if vid != cached:
+                core.log(f"donor re-resolve{tag}: qB moved it -> {vid}")
+            return vid
+    # content_path/save_path didn't land: fall back to the file list, which is relative to
+    # save_path and survives a rename of the torrent's own root folder.
+    try:
+        root = _qb_to_local(t.get("save_path") or "", cfg)
+        best = None
+        for f in qb.files(dl_hash) or []:
+            name = f.get("name") or ""
+            if not name.lower().endswith(VIDEXT):
+                continue
+            p = os.path.join(root, name)
+            if os.path.exists(p) and (best is None or (f.get("size") or 0) > best[0]):
+                best = ((f.get("size") or 0), p)
+        if best:
+            core.log(f"donor re-resolve{tag}: matched via file list -> {best[1]}")
+            return best[1]
+    except Exception as e:
+        core.log(f"donor re-resolve{tag}: file list failed: {e}")
+    return None
+
+
 # ---------------------------------------------------------------- MERGE + FINISH
 def _video_quality(path, dur):
     """(height, video_bitrate) — to pick the better-looking source. mkv often omits
@@ -1370,9 +1426,20 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     replaces the library file IN PLACE (keeps its name, so Plex/Radarr paths stay valid)."""
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
-    if not mv or not mv.get("en_file") or not mv.get("french_path"):
-        core.set_status(tmdb_id, "error", error="merge: missing en_file or french_path"); return
-    en, fr = mv["en_file"], mv["french_path"]
+    if not mv or not mv.get("french_path"):
+        core.set_status(tmdb_id, "error", error="merge: missing french_path"); return
+    # Re-ask qB where the donor is before declaring it missing: it moves a torrent out of its
+    # incomplete directory on completion, and the path we cached at promote time is then stale.
+    # See resolve_donor_path — this is the "merge: missing en_file" that fires on donors sitting
+    # intact on disk. A new path is persisted so the next stage (and the operator) sees the truth.
+    en = resolve_donor_path(cfg, mv.get("dl_hash"), mv.get("en_file"), tag=f" {tmdb_id}")
+    if en and en != mv.get("en_file"):
+        core.set_status(tmdb_id, mv["status"], en_file=en)
+    fr = mv["french_path"]
+    if not en:
+        core.set_status(tmdb_id, "error", progress="",
+                        error="merge: donor file missing (not on disk, and qB no longer has it)")
+        return
     if not (os.path.exists(en) and os.path.exists(fr)):
         core.set_status(tmdb_id, "error", error="merge: file(s) not found on disk"); return
     ei, fi = probe(en), probe(fr)

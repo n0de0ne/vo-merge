@@ -593,3 +593,84 @@ def test_tv_sync_failure_is_no_longer_terminal_on_the_first_try(app_env):
     e = app_env.get_episode("7:1:1")
     assert e["status"] == "pending" and e["attempts"] == 1
     assert "rel-1" in e["tried"]
+
+
+# ------------------------------------------------------------------ donor stale-path race
+def _stub_qb(monkeypatch, module, *, content_path=None, save_path=None, files=None, gone=False):
+    class QB:
+        def __init__(self, *a, **k): pass
+        def login(self): pass
+        def torrent(self, h):
+            return None if gone else {"hash": h, "content_path": content_path,
+                                      "save_path": save_path}
+        def files(self, h): return files or []
+    monkeypatch.setattr(module, "QBittorrent", QB)
+
+
+def test_donor_path_is_re_resolved_after_qb_moves_the_completed_download(app_env, tmp_path,
+                                                                        monkeypatch):
+    """`en_file` is captured at promote time from the torrent's content_path — then qB MOVES the
+    finished torrent out of its incomplete directory, and the merge (which runs later, off a
+    queue) still holds the pre-move path. The record was marked "merge: missing en_file" while
+    the donor sat on disk perfectly intact under its new name."""
+    from app import pipeline
+    media = tmp_path / "media"
+    inc = media / ".Téléchargements" / "incompleted" / "audio-merge" / "550"
+    comp = media / ".Téléchargements" / "completed" / "audio-merge" / "550"
+    inc.mkdir(parents=True)
+    (inc / "Movie.2019.MULTI.1080p.mkv").write_bytes(b"x" * 5000)
+    cached = str(inc / "Movie.2019.MULTI.1080p.mkv")
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media))
+
+    _stub_qb(monkeypatch, pipeline,
+             content_path="/data/.Téléchargements/completed/audio-merge/550",
+             save_path="/data/.Téléchargements/completed/audio-merge/550")
+    # nothing has moved yet -> the cached path is returned untouched, no qB call needed
+    assert pipeline.resolve_donor_path(cfg, "abc", cached) == cached
+
+    comp.parent.mkdir(parents=True, exist_ok=True)
+    inc.rename(comp)                                   # qB's completion move
+    assert not os.path.exists(cached)                  # the old guard failed exactly here
+    got = pipeline.resolve_donor_path(cfg, "abc", cached)
+    assert got == str(comp / "Movie.2019.MULTI.1080p.mkv") and os.path.exists(got)
+
+
+def test_a_genuinely_missing_donor_still_fails_cleanly(app_env, tmp_path, monkeypatch):
+    """The re-resolve must not paper over a real loss: if qB doesn't have the torrent any more,
+    the caller's existing error path is still the right answer."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, media_mount=str(tmp_path))
+    _stub_qb(monkeypatch, pipeline, gone=True)
+    assert pipeline.resolve_donor_path(cfg, "abc", "/gone/donor.mkv") is None
+    # ...and with no hash recorded there is nothing to ask
+    assert pipeline.resolve_donor_path(cfg, None, "/gone/donor.mkv") is None
+
+
+def test_re_resolve_falls_back_to_the_file_list_and_picks_the_largest_video(app_env, tmp_path,
+                                                                           monkeypatch):
+    """content_path can point at a renamed root. The file list is relative to save_path and
+    survives that, so it is the second source — largest VIDEXT entry, non-video ignored."""
+    from app import pipeline
+    media = tmp_path / "media"
+    save = media / ".Téléchargements" / "completed" / "audio-merge-tv" / "9_S01"
+    (save / "Season 01").mkdir(parents=True)
+    (save / "Season 01" / "ep01.mkv").write_bytes(b"x" * 100)
+    (save / "Season 01" / "ep02.mkv").write_bytes(b"x" * 9000)
+    (save / "readme.nfo").write_text("junk")
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media))
+    _stub_qb(monkeypatch, pipeline,
+             content_path="/data/.Téléchargements/incompleted/renamed-away",
+             save_path="/data/.Téléchargements/completed/audio-merge-tv/9_S01",
+             files=[{"name": "Season 01/ep01.mkv", "size": 100},
+                    {"name": "readme.nfo", "size": 10},
+                    {"name": "Season 01/ep02.mkv", "size": 9000}])
+    got = pipeline.resolve_donor_path(cfg, "h1", "/stale.mkv")
+    assert got == str(save / "Season 01" / "ep02.mkv")
+
+
+def test_the_orphan_sweep_cannot_delete_a_merge_imminent_donor(app_env):
+    """A donor whose owner is queued or actively merging must never be swept. (`grabbed` needs no
+    entry: dl_hash is only written at `downloading`, so the sweep cannot match such a record at
+    all — the 30-minute added_on grace is what covers that window.)"""
+    from app import pipeline
+    assert {"ready", "merging"} <= set(pipeline.KEEP_DONOR_STATES)

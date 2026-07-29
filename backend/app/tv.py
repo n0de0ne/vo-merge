@@ -14,7 +14,8 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
                        CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
-                       run_mux, SearchUnavailable, _sync_fail_reason)
+                       run_mux, SearchUnavailable, _sync_fail_reason,
+                       resolve_donor_path)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -1031,11 +1032,18 @@ def merge_ready_episode(ep_id, cfg=None):
     ep = core.get_episode(ep_id)
     if not ep:
         return
-    en = ep.get("en_file")
-    if not en or not os.path.exists(en):
-        core.set_ep_status(ep_id, "error", progress="", error="merge: donor file missing")
-        return
     h = ep.get("dl_hash")
+    # Same stale-path race as the movie path: qB moves a finished pack out of its incomplete
+    # directory, and the per-episode `en_file` captured at promote time no longer resolves.
+    # See pipeline.resolve_donor_path. For a pack this matters more, not less — one move
+    # invalidates the cached path of every episode in it at once.
+    en = resolve_donor_path(cfg, h, ep.get("en_file"), tag=f" {ep_id}")
+    if en and en != ep.get("en_file"):
+        core.set_ep_status(ep_id, ep["status"], en_file=en)
+    if not en or not os.path.exists(en):
+        core.set_ep_status(ep_id, "error", progress="",
+                           error="merge: donor file missing (not on disk, and qB no longer has it)")
+        return
     res = _merge_episode(ep, en, cfg, hint=_PACK_HINT.get(h))
     if res and res[0] is not None and h:
         _PACK_HINT[h] = res

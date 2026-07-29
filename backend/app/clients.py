@@ -168,6 +168,19 @@ class QBittorrent:
         p = {"category": category} if category else {}
         return self.s.get(f"{self.url}/api/v2/torrents/info", params=p, timeout=30).json()
 
+    def torrent(self, torrent_hash):
+        """One torrent's current info dict, or None. qB answers `hashes=` on the same endpoint,
+        so this costs one small request instead of listing a whole category — and it finds the
+        torrent whatever category it is in, which matters when re-resolving a donor whose path
+        moved."""
+        if not torrent_hash:
+            return None
+        r = self.s.get(f"{self.url}/api/v2/torrents/info",
+                       params={"hashes": str(torrent_hash).lower()}, timeout=30)
+        r.raise_for_status()
+        got = r.json() or []
+        return got[0] if got else None
+
     def stop(self, hashes):
         """Stop (pause) torrents. NEVER cap share limits instead — qB's limit-reached
         action can be 'remove torrent + delete content', destroying an unmerged donor."""
