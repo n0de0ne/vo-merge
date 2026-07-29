@@ -1826,12 +1826,18 @@ def enqueue_merge(kind, ident, **fields):
 
 
 def merge_queue(cfg=None):
-    """Everything waiting to merge, oldest first (FIFO — the old LIFO ordering meant the
-    longest-waiting item was served last). Returns [(kind, id, updated), ...]."""
-    items = [("movie", m["tmdb_id"], m.get("updated") or 0) for m in core.get_movies("ready")]
-    items += [("episode", e["id"], e.get("updated") or 0) for e in core.get_episodes("ready")]
-    items.sort(key=lambda x: x[2])
-    return items
+    """Everything waiting to merge: priority first, then oldest-first (FIFO — the old LIFO
+    ordering meant the longest-waiting item was served last).
+
+    Priority has to apply HERE as well as at search time. Getting a requested title downloaded
+    quickly achieves nothing if it then queues behind thirty season-pack episodes, each of which
+    is a sync detect plus a remux. Returns [(kind, id, updated), ...]."""
+    items = [("movie", m["tmdb_id"], m.get("updated") or 0, -(m.get("priority") or 0))
+             for m in core.get_movies("ready")]
+    items += [("episode", e["id"], e.get("updated") or 0, -(e.get("priority") or 0))
+              for e in core.get_episodes("ready")]
+    items.sort(key=lambda x: (x[3], x[2]))
+    return [(k, i, u) for k, i, u, _ in items]
 
 
 def merge_next(cfg=None):

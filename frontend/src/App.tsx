@@ -810,6 +810,11 @@ function MovieActions({ m, busy, act, onRelease, onTune }:
       {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
       {m.status === "merged" && B("Tune sync", () => onTune(m))}
       {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
+      {/* Someone asked for this one: jump the search sweep AND the merge queue. The backlog is
+          ordered by recency, so a title requested today otherwise sits behind all of it. */}
+      {!["merged", "ignored"].includes(m.status) && (m.priority
+        ? B("★ Un-prioritise", () => act(() => api.priority(m.tmdb_id, 0)))
+        : B("★ Prioritise", () => act(() => api.priority(m.tmdb_id, 1))))}
       {m.status === "ignored" && B("Unignore", () => act(() => api.unignore(m.tmdb_id)))}
       {m.status !== "ignored" && m.status !== "merged" && B("Ignore", () => act(() => api.ignore(m.tmdb_id)))}
     </RowMenu>
@@ -1182,7 +1187,8 @@ function Films() {
                   <tr key={m.tmdb_id}>
                     <td><div className="titlecell">
                       <Poster src={m.poster} alt={m.title} />
-                      <div>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
+                      <div>{m.priority ? <span className="prio" title="Prioritised — ahead of the backlog in both the search sweep and the merge queue">★</span> : null}{m.title}
+                        <div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
                         {m.error && <div className="sub bad">{m.error}</div>}</div>
                     </div></td>
                     <td style={{ minWidth: 150 }}><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&

@@ -283,6 +283,36 @@ codes, not the track list — so a library grafted before this fix needs a **re-
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
 
+## Priority — a requested title must not queue behind the backlog
+
+Both queues are ordered by recency: `stage_search` walks `pending` by `updated`, and the merge
+queue is FIFO. That is right for a backlog nobody is waiting on, and wrong for the one case where
+someone IS: a title just requested, imported French-only, and wanted tonight. With a few thousand
+records ahead of it, a `updated`-ordered queue may never reach it.
+
+`priority` (INTEGER, 0 = normal) is consulted **before** the usual rule in both places —
+`core.get_movies`/`get_episodes` order `COALESCE(priority,0) DESC, updated DESC`, and
+`pipeline.merge_queue` sorts on it first. Both matter: getting a requested film downloaded
+promptly achieves nothing if it then queues behind thirty season-pack episodes, each of which is a
+sync detect plus a remux. Higher levels sort ahead of lower, so `1` is fine for "soon" and a
+larger number for "now".
+
+- **Set by hand**: `POST /movie|episode/{id}/priority {"level": 1}`, `POST /tv/{series_id}/priority`
+  for a whole show (TV is requested per series, not per episode — and it skips
+  `merged`/`ignored`, which have nothing left to do). The Films row menu has ★ Prioritise, and a
+  prioritised row is starred.
+- **Set automatically by the *arr webhook** (`priority_on_import`, default 1). An import event IS
+  someone asking for a title, so the hook that already turns an import into a scanned record now
+  also puts it at the front. Bulk-importing a whole library makes everything priority, which
+  degrades to the old ordering rather than breaking anything — turn it off for the duration if
+  that matters.
+
+`core.set_priority` deliberately touches neither `status` nor `updated`: priority is orthogonal to
+the state machine, and `updated` means "when the state last changed", so moving it here would
+reshuffle the attention panel for something that is not a state change. Priority is **not** cleared
+when a title finishes — if a merged record is later re-opened because its file is still short of
+the profile, something someone asked for is still something someone asked for.
+
 ## Instant pickup — *arr webhooks
 
 The scheduled `_search_job` (every `search_interval_min`, default 60) already re-scans and picks

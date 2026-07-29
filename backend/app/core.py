@@ -47,6 +47,12 @@ DEFAULTS = {
     # LAN address, as was the CLAUDE.md path below.
     "api_url": "",
     "docs_path": "",                               # host path to CLAUDE.md, for the ticket brief
+    # A title arriving via the *arr webhook is one that someone has just ASKED for — that is what
+    # an import event means — so it jumps the queue instead of joining the back of a backlog it
+    # would never reach. Set 0 to disable. If you bulk-import a whole library the hook fires for
+    # everything and priority stops distinguishing anything, which degrades to the old ordering
+    # rather than breaking; turn it off for the duration of an import if that matters.
+    "priority_on_import": 1,
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
@@ -472,6 +478,12 @@ def init_db():
                                    # record re-merged an unrelated release with the old release's
                                    # offset and skipped detection entirely.
                                    "sync_manual": "INTEGER DEFAULT 0",
+                                   # 0 = normal, >0 = jump the queue. A title someone has just
+                                   # ASKED for shouldn't wait behind a thousand-item backlog that
+                                   # nobody is watching — the search sweep and the merge queue
+                                   # both order on this before their usual recency/FIFO rule.
+                                   "priority": "INTEGER DEFAULT 0",
+
                                    # what the FILE actually holds (from mkvmerge, not metadata)
                                    "audio_langs": "TEXT", "sub_langs": "TEXT",
                                    "needs": "TEXT",          # audio | subs | audio+subs
@@ -533,6 +545,7 @@ def init_tv():
                                      "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                      "sync_drift": "REAL",
                                      "sync_manual": "INTEGER DEFAULT 0",   # see movies table
+                                     "priority": "INTEGER DEFAULT 0",   # see movies table
                                      # what the FILE actually holds (see movies table)
                                      "audio_langs": "TEXT", "sub_langs": "TEXT",
                                      "needs": "TEXT", "added_subs": "TEXT",
@@ -718,7 +731,9 @@ def set_ep_status(ep_id, status, expect=None, **fields):
 def get_episodes(status=None):
     with db() as c:
         if status:
-            rows = c.execute("SELECT * FROM episodes WHERE status=? ORDER BY updated DESC", (status,)).fetchall()
+            rows = c.execute("SELECT * FROM episodes WHERE status=? "
+                             "ORDER BY COALESCE(priority,0) DESC, updated DESC",
+                             (status,)).fetchall()
         else:
             rows = c.execute("SELECT * FROM episodes ORDER BY series_title,season,episode").fetchall()
     return [dict(r) for r in rows]
@@ -837,8 +852,11 @@ def claim_episode(ep_id, from_status, to_status, **fields):
 def get_movies(status=None):
     with db() as c:
         if status:
-            rows = c.execute("SELECT * FROM movies WHERE status=? ORDER BY updated DESC",
-                            (status,)).fetchall()
+            # priority first, then the usual recency. A requested title must not sit behind a
+            # backlog it can never overtake on `updated` alone.
+            rows = c.execute("SELECT * FROM movies WHERE status=? "
+                             "ORDER BY COALESCE(priority,0) DESC, updated DESC",
+                             (status,)).fetchall()
         else:
             rows = c.execute("SELECT * FROM movies ORDER BY updated DESC").fetchall()
     return [dict(r) for r in rows]
@@ -848,6 +866,31 @@ def get_movie(tmdb_id):
     with db() as c:
         r = c.execute("SELECT * FROM movies WHERE tmdb_id=?", (tmdb_id,)).fetchone()
     return dict(r) if r else None
+
+
+def set_priority(kind, ident, level):
+    """Set a record's QUEUE priority without touching its pipeline state.
+
+    Priority is orthogonal to status: a record keeps its place in the state machine and only
+    changes where it sits in the search sweep and the merge queue. Deliberately does not move
+    `updated` either — that means "when the state last changed", and bumping it here would
+    reshuffle the attention panel for a change that isn't a state change at all.
+
+    It is NOT cleared when the title finishes. If a merged record is later re-opened because its
+    file is still short of the profile, something someone asked for is still something someone
+    asked for. The cost of being wrong is only ordering."""
+    table, key_col = ("movies", "tmdb_id") if kind == "movie" else ("episodes", "id")
+    with db() as c:
+        cur = c.execute(f"UPDATE {table} SET priority=? WHERE {key_col}=?", (int(level), ident))
+        return cur.rowcount == 1
+
+
+def prioritise_series(series_id, level):
+    """Bump every unfinished episode of a series. TV is requested per SHOW, not per episode."""
+    with db() as c:
+        cur = c.execute("UPDATE episodes SET priority=? WHERE series_id=? "
+                        "AND status NOT IN ('merged','ignored')", (int(level), series_id))
+        return cur.rowcount
 
 
 def status_counts():

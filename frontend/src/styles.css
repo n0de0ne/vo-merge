@@ -412,3 +412,7 @@ button.btn.danger:disabled { opacity: .5; }
 .errbar .btn { flex: none; }
 button.btn.small { padding: 3px 9px; font-size: 11.5px; }
 .err { color: #ff8585; font-size: 13px; }
+
+/* Prioritised: someone asked for this title, so it runs ahead of the backlog in both the
+   search sweep and the merge queue. */
+.prio { color: #ffc857; margin-right: 5px; font-size: 12px; }

@@ -860,6 +860,40 @@ def _hook_after(fn, what):
     threading.Thread(target=_run, daemon=True).start()
 
 
+class PriorityIn(BaseModel):
+    level: int = 1                   # 0 = normal, >0 = jump the queue
+
+
+@api.post("/movie/{tmdb_id}/priority")
+def movie_priority(tmdb_id: int, body: PriorityIn):
+    """Move a film to the front of the search sweep and the merge queue (level 0 = back to
+    normal). This is the answer to "someone asked for this and it is French-only": the backlog is
+    ordered by recency, so without it a title requested today sits behind everything already in
+    it and may never be reached."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    core.set_priority("movie", tmdb_id, body.level)
+    core.log(f"priority movie {tmdb_id} -> {body.level}")
+    return {"ok": True, "priority": body.level}
+
+
+@api.post("/episode/{ep_id}/priority")
+def episode_priority(ep_id: str, body: PriorityIn):
+    if not core.get_episode(ep_id):
+        raise HTTPException(404, "unknown episode")
+    core.set_priority("episode", ep_id, body.level)
+    core.log(f"priority episode {ep_id} -> {body.level}")
+    return {"ok": True, "priority": body.level}
+
+
+@api.post("/tv/{series_id}/priority")
+def series_priority(series_id: int, body: PriorityIn):
+    """Bump a whole show — TV is requested per series, not per episode."""
+    n = core.prioritise_series(series_id, body.level)
+    core.log(f"priority series {series_id} -> {body.level} ({n} episode(s))")
+    return {"ok": True, "priority": body.level, "episodes": n}
+
+
 @api.post("/hook/radarr")
 def hook_radarr(body: dict, token: str | None = None):
     """Radarr Connect -> Webhook. Point it at http://<vo-merge>/api/hook/radarr."""
@@ -884,6 +918,12 @@ def hook_radarr(body: dict, token: str | None = None):
         r = pipeline.ingest_movie(m, cfg, refresh=True)
         core.log(f"hook radarr: {ev} {m.get('title')!r} -> {r}")
         if r == "gap":
+            # An import event means someone just asked for this title, so it goes to the front
+            # rather than the back of a backlog ordered by recency.
+            lvl = int(cfg.get("priority_on_import", 1) or 0)
+            if lvl and m.get("tmdbId"):
+                core.set_priority("movie", m["tmdbId"], lvl)
+                core.log(f"hook radarr: {m.get('title')!r} prioritised ({lvl})")
             _kick_search(cfg, lambda c: pipeline.stage_search(c))
     _hook_after(_run, f"radarr {ev} {mid}")
     return {"ok": True, "event": ev, "movie": mid, "queued": True}
@@ -915,6 +955,12 @@ def hook_sonarr(body: dict, token: str | None = None):
         n = tv.scan(cfg, only_series=sid, refresh=True)
         core.log(f"hook sonarr: {ev} series {sid} -> {n} gap(s)")
         if n:
+            # Someone asked for this show — see hook_radarr. Bumped per SERIES, since that is
+            # the unit a request comes in.
+            lvl = int(cfg.get("priority_on_import", 1) or 0)
+            if lvl:
+                bumped = core.prioritise_series(sid, lvl)
+                core.log(f"hook sonarr: series {sid} prioritised ({lvl}, {bumped} episode(s))")
             _kick_search(cfg, lambda c: tv.stage_search(c))
     _hook_after(_run, f"sonarr {ev} {sid}")
     return {"ok": True, "event": ev, "series": sid, "queued": True}

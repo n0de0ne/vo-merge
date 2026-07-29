@@ -6,6 +6,7 @@ export interface Movie {
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
   error: string | null; updated: number; poster?: string | null; progress?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  priority?: number | null;   // >0 = jumps the search sweep and the merge queue
   // read off the FILE by mkvmerge, not from Radarr/Sonarr metadata
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
@@ -23,6 +24,7 @@ export interface Episode {
   sync_delta: number | null; error: string | null; progress?: string | null;
   dl_hash?: string | null; series_type?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  priority?: number | null;   // see Movie
   aired?: string | null;   // "S04E15" when releases number this episode differently
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
@@ -220,6 +222,16 @@ export const api = {
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
   unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
+  // Move a title to the front of the search sweep AND the merge queue (level 0 = normal).
+  priority: (id: number, level = 1) =>
+    j<{ ok: boolean; priority: number }>(`/api/movie/${id}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
+  epPriority: (id: string, level = 1) =>
+    j<{ ok: boolean; priority: number }>(`/api/episode/${encodeURIComponent(id)}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
+  seriesPriority: (seriesId: number, level = 1) =>
+    j<{ ok: boolean; priority: number; episodes: number }>(`/api/tv/${seriesId}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
     j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),

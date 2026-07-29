@@ -674,3 +674,80 @@ def test_the_orphan_sweep_cannot_delete_a_merge_imminent_donor(app_env):
     all — the 30-minute added_on grace is what covers that window.)"""
     from app import pipeline
     assert {"ready", "merging"} <= set(pipeline.KEEP_DONOR_STATES)
+
+
+# ------------------------------------------------------------------ request priority
+def test_priority_moves_a_title_to_the_front_of_both_queues(app_env):
+    """A title someone has just asked for must not sit behind a backlog ordered by recency —
+    it would never be reached. Priority has to apply to the SEARCH sweep and the MERGE queue
+    both: getting it downloaded first achieves nothing if it then queues behind thirty season
+    pack episodes, each of which is a sync detect plus a remux."""
+    from app import pipeline
+    for i in range(1, 6):
+        app_env.upsert_movie({"tmdb_id": i, "imdb_id": f"tt{i}", "radarr_id": i,
+                              "title": f"Backlog {i}", "original_title": f"B{i}", "year": 2010,
+                              "original_lang": "french", "french_path": f"/b{i}.mkv",
+                              "quality": "1080p"})
+        app_env.set_status(i, "pending", updated=1000 + i)
+    app_env.upsert_movie({"tmdb_id": 99, "imdb_id": "tt99", "radarr_id": 99,
+                          "title": "REQUESTED", "original_title": "R", "year": 2026,
+                          "original_lang": "english", "french_path": "/r.mkv",
+                          "quality": "1080p"})
+    app_env.set_status(99, "pending", updated=500)      # worst possible place in the sweep
+    assert [m["title"] for m in app_env.get_movies("pending")][-1] == "REQUESTED"
+    app_env.set_priority("movie", 99, 1)
+    assert [m["title"] for m in app_env.get_movies("pending")][0] == "REQUESTED"
+
+    # ...and the merge queue, behind a full season pack
+    for i in range(1, 31):
+        eid = f"7:1:{i}"
+        app_env.upsert_episode({"id": eid, "series_id": 7, "series_title": "Pack", "tvdb_id": 1,
+                                "season": 1, "episode": i, "french_path": f"/e{i}.mkv",
+                                "quality": "1080p"})
+        app_env.set_ep_status(eid, "ready", updated=2000 + i)
+    app_env.set_priority("movie", 99, 0)
+    app_env.set_status(99, "ready", updated=9999)       # arrived last
+    assert pipeline.merge_queue()[-1][1] == 99
+    app_env.set_priority("movie", 99, 1)
+    assert pipeline.merge_queue()[0][1] == 99, "the requested film must be merged first"
+
+
+def test_priority_is_reversible_and_ordered_by_level(app_env):
+    from app import pipeline
+    for i in (1, 2):
+        app_env.upsert_movie({"tmdb_id": i, "imdb_id": f"tt{i}", "radarr_id": i, "title": f"M{i}",
+                              "original_title": f"M{i}", "year": 2020, "original_lang": "french",
+                              "french_path": f"/m{i}.mkv", "quality": "1080p"})
+        app_env.set_status(i, "ready", updated=100 + i)
+    app_env.set_priority("movie", 1, 1)
+    app_env.set_priority("movie", 2, 5)
+    assert [i for _, i, _ in pipeline.merge_queue()] == [2, 1], "higher level goes first"
+    app_env.set_priority("movie", 2, 0)
+    assert [i for _, i, _ in pipeline.merge_queue()] == [1, 2]
+
+
+def test_prioritising_a_series_skips_finished_episodes(app_env):
+    """TV is requested per SHOW. Bumping one that is already merged would only pollute the
+    ordering — there is nothing left to do for it."""
+    for i, st in enumerate(("pending", "merged", "ignored", "error"), start=1):
+        eid = f"8:1:{i}"
+        app_env.upsert_episode({"id": eid, "series_id": 8, "series_title": "S", "tvdb_id": 1,
+                                "season": 1, "episode": i, "french_path": f"/e{i}.mkv",
+                                "quality": "1080p"})
+        app_env.set_ep_status(eid, st)
+    assert app_env.prioritise_series(8, 1) == 2         # pending + error only
+    got = {e["id"]: e["priority"] for e in app_env.get_episodes()}
+    assert got["8:1:1"] == 1 and got["8:1:4"] == 1
+    assert not got["8:1:2"] and not got["8:1:3"]
+
+
+def test_setting_priority_does_not_disturb_status_or_updated(app_env):
+    """Priority is orthogonal to the state machine — and `updated` means "when the state last
+    changed", so moving it here would reshuffle the attention panel for a non-event."""
+    app_env.upsert_movie({"tmdb_id": 11, "imdb_id": "tt11", "radarr_id": 11, "title": "T",
+                          "original_title": "T", "year": 2020, "original_lang": "french",
+                          "french_path": "/x.mkv", "quality": "1080p"})
+    app_env.set_status(11, "downloading", updated=4242)
+    app_env.set_priority("movie", 11, 1)
+    mv = app_env.get_movie(11)
+    assert mv["status"] == "downloading" and mv["updated"] == 4242 and mv["priority"] == 1
