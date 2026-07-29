@@ -528,7 +528,7 @@ def _assign_pack(series_id, seasons, h, rid, title, cfg=None):
            and (seasons is None or _release_se(e, cfg)[0] in seasons)]
     for e in eps:
         core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
-                           candidate_title=title, error=None)
+                           candidate_title=title, error=None, transient_fails=0)
     return len(eps)
 
 
@@ -718,11 +718,14 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
             sc, seed, rtitle, link, rid = best
             h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
             if not h:
-                # grab failed -> mark these eps error (NOT a null-hash download, which would
-                # loop grab -> reconcile-to-pending -> re-grab forever)
+                # Grab failed -> retryable, per episode (NOT a null-hash download, which would
+                # loop grab -> reconcile-to-pending -> re-grab forever; and NOT a straight
+                # `error`, which paged the AI for what is usually a fetch timeout or qB blip —
+                # pipeline.transient self-retries and escalates only a consecutive run).
+                from .pipeline import transient
                 for e in eps:
-                    core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
+                    transient("episode", e["id"], "grab: torrent never appeared", cfg)
+                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) queued for retry")
                 return n
             seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
             # `rid` (not None): the identity every retry path blocklists. Passing None meant the
@@ -750,10 +753,11 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
         sc, seed, rtitle, link, rid = best
         h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
         if not h:
-            core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-            core.log(f"tv grab EP '{q}': grab failed -> error")
+            from .pipeline import transient
+            transient("episode", e["id"], "grab: torrent never appeared", cfg)
+            core.log(f"tv grab EP '{q}': grab failed -> queued for retry")
             continue
-        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
+        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid, transient_fails=0,
                            candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
         core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
     return n
@@ -813,11 +817,21 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     from . import sync
     from .clients import Sonarr as _S
     fr = ep["french_path"]
-    if not (os.path.exists(en_file) and os.path.exists(fr)):
-        core.set_ep_status(ep["id"], "error", error="merge: file missing"); return
+    if not os.path.exists(en_file):
+        _reject_and_retry_ep(ep, "donor file vanished before the merge", cfg)
+        return
+    if not os.path.exists(fr):
+        core.set_ep_status(ep["id"], "error", error="merge: library file missing on disk"); return
     ei, fi = probe(en_file), probe(fr)
-    if not ei or not fi:
-        core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
+    if not ei:
+        # unreadable DONOR = defective release -> blocklist it, fetch another (see pipeline)
+        _reject_and_retry_ep(ep, "donor unreadable (probe failed)", cfg)
+        return
+    if not fi:
+        # unreadable BASE is more likely a mount hiccup — self-retry, escalate only a run of them
+        from .pipeline import transient
+        transient("episode", ep["id"], "merge: library file probe failed", cfg, back_to="ready")
+        return
     # The download alone satisfies this episode's audio profile -> remux it directly, but ONLY
     # if its video isn't worse than the library file; otherwise keep the library video and graft
     # what's missing (below). Asked of the probed file against the profile, not of a literal
@@ -852,7 +866,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             except Exception: pass
             _plex_ep_refresh(ep, cfg)
         else:
-            core.set_ep_status(ep["id"], "error", error=f"multi remux: {mux_err}")
+            # a release mkvmerge can't remux is a defective download — fetch another
+            _reject_and_retry_ep(ep, f"multi remux failed: {mux_err}", cfg, final="error")
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     # Only a DELIBERATELY set offset skips detection — see pipeline._merge_movie_impl. A stored
@@ -889,9 +904,10 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         # reject a donor carrying exactly the language the record needed.
         still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg, ep.get("orig_lang"))
         if still_a or still_s:
-            core.set_ep_status(ep["id"], "error", progress="",
-                               error="merge: release carries none of the missing languages "
-                                     f"(still needs {'+'.join(still_a + still_s)})")
+            # Wrong release, not a dead end: blocklist it and go back for another — the movie
+            # path has always done this, TV parked it as `error` for an agent to /retry.
+            _reject_and_retry_ep(ep, "release carries none of the missing languages "
+                                     f"(still needs {'+'.join(still_a + still_s)})", cfg, delta)
             return
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None,
                            added_langs="", merge_kind="already")
@@ -911,12 +927,24 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
-            # Spend the automatic budget on ANOTHER release before settling — see
-            # pipeline.reject_and_retry. This used to be terminal on the first attempt.
-            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
-            _reject_and_retry_ep(ep, why, cfg, delta,
-                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
-            return
+            # On the budget-spending attempt, run the pipeline's own wide probe before parking
+            # — see pipeline.wide_probe_rescue. Otherwise spend the automatic budget on ANOTHER
+            # release first (this used to be terminal on the first attempt).
+            from .pipeline import wide_probe_rescue
+            rescue = None
+            if (ep.get("attempts") or 0) + 1 >= cfg.get("max_sync_retries", 4):
+                rescue = wide_probe_rescue(base, donor, 0, (daidx[ids[0]] if ids else 0),
+                                           min(ei["dur"] or 0, fi["dur"] or 0), fps_diff, cfg,
+                                           tag=f" {ep['id']}",
+                                           on_progress=lambda msg: _beat("episode", ep["id"], msg),
+                                           base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+                                           base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+            if rescue is None:
+                why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+                _reject_and_retry_ep(ep, why, cfg, delta,
+                                     final="review" if cfg.get("sync_review", True) else "sync_fail")
+                return
+            m, conf, method, drift = rescue
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
@@ -929,7 +957,9 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
     ok_mux, mux_err = run_mux(cmd, out, cfg)
     if not ok_mux:
-        core.set_ep_status(ep["id"], "error", progress="", error=mux_err); return
+        # almost always the donor's container — blocklist it and fetch another (see pipeline)
+        _reject_and_retry_ep(ep, f"mux failed: {mux_err}", cfg, delta, final="error")
+        return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)
@@ -1041,8 +1071,10 @@ def merge_ready_episode(ep_id, cfg=None):
     if en and en != ep.get("en_file"):
         core.set_ep_status(ep_id, ep["status"], en_file=en)
     if not en or not os.path.exists(en):
-        core.set_ep_status(ep_id, "error", progress="",
-                           error="merge: donor file missing (not on disk, and qB no longer has it)")
+        # Genuinely gone (qB confirmed). The autonomous answer is another release — same
+        # reasoning as the movie path; parking it as `error` handed the AI a /retry.
+        _reject_and_retry_ep(ep, "donor file vanished before the merge "
+                                 "(not on disk, and qB no longer has it)", cfg)
         return
     res = _merge_episode(ep, en, cfg, hint=_PACK_HINT.get(h))
     if res and res[0] is not None and h:

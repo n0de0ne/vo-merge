@@ -151,6 +151,19 @@ DEFAULTS = {
     "sync_ratio_test": True,               # test known transfer rate ratios (PAL 25fps vs 23.976
                                            # etc). Fixes the "framerates differ but no reliable
                                            # drift could be measured" dead-end.
+    "sync_wide_probe": True,               # before PARKING a sync failure (review/sync_fail),
+                                           # re-run detection once at ±sync_probe_lag_s. This is
+                                           # the first line of the AI runbook ("call /sync_probe
+                                           # FIRST") executed by the pipeline itself: a large
+                                           # constant offset (sponsor card, 'previously on')
+                                           # reads as "different cut" inside ±sync_max_lag_s and
+                                           # is trivially fixable further out.
+    "sync_probe_lag_s": 300,               # how far the parking-rescue probe searches
+    "transient_max": 5,                    # consecutive infrastructure failures (grab hiccup,
+                                           # unreadable base, qB blip) a record retries by
+                                           # itself before it becomes a real `error` and pages
+                                           # the AI. Retrying is cheaper than an agent run for
+                                           # everything a retry can fix.
     "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
     "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
     "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
@@ -556,7 +569,11 @@ def init_db():
                                    # WHY this record is 'merged': grafted (we added tracks) |
                                    # replaced (we used the download as the file) | already (it
                                    # met its profile on its own — we did nothing). NULL = legacy.
-                                   "merge_kind": "TEXT"})
+                                   "merge_kind": "TEXT",
+                                   # consecutive infrastructure failures (see pipeline.transient)
+                                   # — routes retryable failures through self-retry instead of
+                                   # minting an `error` that pages the AI for a network blip
+                                   "transient_fails": "INTEGER DEFAULT 0"})
 
 
 def _ensure_indexes(c):
@@ -616,7 +633,8 @@ def init_tv():
                                      # series' original language — the merge needs the same
                                      # inputs the scan used, or the two pick different profiles
                                      "orig_lang": "TEXT",
-                                     "merge_kind": "TEXT"})   # see movies table
+                                     "merge_kind": "TEXT",                    # see movies table
+                                     "transient_fails": "INTEGER DEFAULT 0"})  # see movies table
 
 
 def init_indexes():

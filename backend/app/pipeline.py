@@ -289,8 +289,10 @@ def reopen_status(prev, updated, cfg):
 # forgotten: each retry path cleared the download fields inline and left `sync_offset_ms` behind, so
 # the next donor was muxed with the previous donor's offset and detection was skipped entirely.
 # Anything donor-specific added later belongs here, not in the individual call sites.
+# `transient_fails` rides along: a record sent back for a fresh run gets a fresh
+# infrastructure-failure budget too (see `transient`), same reasoning as `attempts=0` on re-open.
 DONOR_RESET = dict(dl_hash=None, dl_id=None, en_file=None,
-                   sync_offset_ms=0, sync_drift=None, sync_manual=0)
+                   sync_offset_ms=0, sync_drift=None, sync_manual=0, transient_fails=0)
 
 # The AI's verdict describes the attempt that FAILED. Once a record is re-queued for a fresh one
 # it is void, and leaving it behind is what kept retried records sitting in the Review tab flagged
@@ -303,6 +305,36 @@ AI_RESET = dict(ai_status=None, ai_verdict=None, ai_at=None)
 # ...but a record whose status still IS a problem keeps its verdict, and so does `ignored`: that
 # is a deliberate give-up (usually the AI's own /unfixable), and the reason is the point of it.
 AI_KEEP_STATES = ("error", "review", "sync_fail", "ignored")
+
+
+def transient(kind, ident, reason, cfg=None, back_to="pending", **extra):
+    """Route a failure a RETRY can fix back for another automatic attempt, instead of minting an
+    `error` record. An `error` pages the AI within 3 minutes — and a momentary qB outage, an NFS
+    hiccup on a probe, or a torrent fetch that timed out once are all things the next sweep fixes
+    for free. Burning an agent run (or, with the dispatcher down, a human's attention) on those
+    is the single biggest source of avoidable escalations.
+
+    Bounded, because "transient" is a hypothesis: after `transient_max` CONSECUTIVE failures the
+    condition is evidently not transient (qB is misconfigured, the mount is gone) and the record
+    becomes a real `error` carrying the count. The counter lives in `transient_fails` and resets
+    with DONOR_RESET — a fresh run gets a fresh budget — so only an unbroken run of
+    infrastructure failures can exhaust it.
+
+    Returns True while retrying, False once it gave up into `error`."""
+    cfg = cfg or core.load_config()
+    get = core.get_movie if kind == "movie" else core.get_episode
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    rec = get(ident) or {}
+    n = (rec.get("transient_fails") or 0) + 1
+    cap = max(1, int(cfg.get("transient_max", 5)))
+    if n >= cap:
+        setter(ident, "error", error=f"{reason} — {n} consecutive attempts", progress="",
+               transient_fails=n, **extra)
+        core.log(f"transient {kind} {ident}: {reason} -> error after {n} attempts")
+        return False
+    setter(ident, back_to, error=reason, progress="", transient_fails=n, **extra)
+    core.log(f"transient {kind} {ident}: {reason} -> will retry ({n}/{cap})")
+    return True
 
 
 def _beat(kind, ident, progress):
@@ -733,10 +765,13 @@ def grab(tmdb_id, link, cfg=None):
         h = qb_grab(qb, link, cfg["qb_category"], savepath)
         if not h:
             raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
-        core.set_status(tmdb_id, "downloading", dl_hash=h)
+        core.set_status(tmdb_id, "downloading", dl_hash=h, error=None, transient_fails=0)
         core.log(f"grab tmdb={tmdb_id}: added to qB ({savepath}) hash={h}")
     except Exception as e:
-        core.set_status(tmdb_id, "error", error=f"grab: {e}")
+        # A grab failure is usually a fetch timeout, a dead tracker link or a qB blip — things
+        # the next sweep retries for free. Minting an `error` here paged the AI for a network
+        # hiccup; `transient` self-retries and only escalates a run of consecutive failures.
+        transient("movie", tmdb_id, f"grab: {e}", cfg)
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
 
 
@@ -949,9 +984,13 @@ def ai_health_check(cfg=None):
             stale_m = [dict(r) for r in c.execute(
                 "SELECT tmdb_id, status FROM movies WHERE ai_status='pending' AND ai_at < ? "
                 "AND status IN ('error','review','sync_fail')", (stale_cut,))]
+            # 'review' belongs in this list for episodes exactly as it does for movies above:
+            # episodes reach `review` too (tv sync failures with sync_review on), and omitting
+            # it here left an episode whose ticket was consumed-but-unanswered showing "AI
+            # working" forever instead of flipping to needs_human.
             stale_e = [dict(r) for r in c.execute(
                 "SELECT id, status FROM episodes WHERE ai_status='pending' AND ai_at < ? "
-                "AND status IN ('error','sync_fail')", (stale_cut,))]
+                "AND status IN ('error','review','sync_fail')", (stale_cut,))]
         stale_m = [m for m in stale_m if f"movie:{m['tmdb_id']}" not in queued]
         stale_e = [e for e in stale_e if f"episode:{e['id']}" not in queued]
         for m in stale_m:
@@ -1193,6 +1232,69 @@ def _sync_fail_reason(m, fps_diff, drift, base_fps, donor_fps):
                     f"(POST /set_sync {{\"drift\": {k:.7f}}} to apply it)")
         return "framerates differ but no reliable drift could be measured"
     return "low-confidence sync"
+
+
+def wide_probe_rescue(base, donor, base_ai, donor_ai, dur, fps_diff, cfg, tag="",
+                      on_progress=None, **fps_kw):
+    """The first line of the AI runbook, executed by the pipeline itself: before a sync failure
+    is PARKED for an actor, re-run detection once at ±`sync_probe_lag_s`.
+
+    Both ticket templates tell the agent "on any couldn't-sync, call /sync_probe FIRST, because
+    the merge path only searches ±sync_max_lag_s and a consistent offset beyond that reads as a
+    different cut". That instruction is deterministic — there is no judgement in it — so making
+    an agent (or, with the dispatcher down, a human) execute it was pure overhead. Run only on
+    the attempt that would spend the retry budget: earlier failures are cheaper to answer with a
+    different release, which needs no detection at all.
+
+    Returns (offset_ms, conf, method, drift) when the wider search resolves the pair — the
+    caller merges with it instead of parking — else None, and the parking verdict now really
+    does mean "windows disagree even at ±300s", i.e. a genuinely different cut."""
+    if not cfg.get("sync_wide_probe", True):
+        return None
+    lag = int(cfg.get("sync_probe_lag_s", 300))
+    if lag <= int(cfg.get("sync_max_lag_s", 120)):
+        return None                       # nothing wider to try than what already failed
+    wide = dict(cfg, sync_max_lag_s=lag)
+    core.log(f"sync{tag}: parking rescue — re-searching at ±{lag}s before giving this pair up")
+    if on_progress:
+        on_progress(f"sync: wide probe ±{lag}s")
+    m, conf, method, drift = sync.detect(base, donor, base_ai, donor_ai, dur, wide,
+                                         tag=f"{tag} wide", on_progress=on_progress, **fps_kw)
+    if m is None or (fps_diff and not drift):
+        return None
+    core.log(f"sync{tag}: wide probe resolved {int(m):+d}ms ({method} conf {conf:.2f}) "
+             f"-> merging with it")
+    return int(round(m)), conf, method, drift
+
+
+# How long a movie may sit in a mid-transition state before it is presumed crashed. These two
+# states had NO reader at all: stage_search walks only `pending`, stage_finish reconciles only
+# `downloading` and `merging` — so a crash between claiming pending->searching and writing the
+# outcome, or between the `grabbed` write and qB accepting the add, stranded the record forever
+# (the orphan sweep can't even see a `grabbed` one: dl_hash isn't written until `downloading`).
+STUCK_LIMITS = {"searching": 900, "grabbed": 1800}
+
+
+def sweep_stuck(cfg=None):
+    """Recover movie records stranded in `searching`/`grabbed` by a crash mid-transition.
+
+    Deliberately does NOT blocklist: the release may never have been grabbed at all, and burning
+    a healthy release because the process died is how a title loses its best candidate. In
+    approval mode `grabbed` is the waiting room for a human decision, so it is exempt there.
+    `expect=` guards the write, so a record that moved on between read and write is left alone.
+    (Episodes never pass through these states — the TV search writes downloading directly.)"""
+    cfg = cfg or core.load_config()
+    now = time.time()
+    for st, limit in STUCK_LIMITS.items():
+        if st == "grabbed" and cfg.get("grab_mode") != "auto":
+            continue
+        for mv in core.get_movies(st):
+            age = now - (mv.get("updated") or 0)
+            if age < limit:
+                continue
+            if core.set_status(mv["tmdb_id"], "pending", expect=st, progress=""):
+                core.log(f"stuck {mv['tmdb_id']}: in `{st}` for {int(age / 60)}min with no "
+                         f"outcome (crash mid-transition?) -> back to pending")
 
 
 def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
@@ -1507,7 +1609,10 @@ def _place_multi(en, mv, cfg, tmdb_id):
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     ok, err = run_mux(["mkvmerge", "-o", out, en], out, cfg)
     if not ok:
-        core.set_status(tmdb_id, "error", error=f"multi remux: {err}"); return
+        # A release mkvmerge can't remux is a defective download — fetch another (see the
+        # graft-path mux failure for the reasoning).
+        reject_and_retry(tmdb_id, f"multi remux failed: {err}", cfg, final="error")
+        return
     core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
                     merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
@@ -1572,15 +1677,26 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if en and en != mv.get("en_file"):
         core.set_status(tmdb_id, mv["status"], en_file=en)
     fr = mv["french_path"]
-    if not en:
-        core.set_status(tmdb_id, "error", progress="",
-                        error="merge: donor file missing (not on disk, and qB no longer has it)")
+    if not en or not os.path.exists(en):
+        # The donor is genuinely gone (qB confirmed). Nothing will bring THIS file back, but the
+        # record still has its gap and the autonomous answer is simply another release — the
+        # exact thing reject_and_retry does. Parking it as `error` made an agent perform the
+        # /retry a state transition could have performed.
+        reject_and_retry(tmdb_id, "donor file vanished before the merge "
+                                  "(not on disk, and qB no longer has it)", cfg)
         return
-    if not (os.path.exists(en) and os.path.exists(fr)):
-        core.set_status(tmdb_id, "error", error="merge: file(s) not found on disk"); return
+    if not os.path.exists(fr):
+        core.set_status(tmdb_id, "error", error="merge: library file missing on disk"); return
     ei, fi = probe(en), probe(fr)
-    if not ei or not fi:
-        core.set_status(tmdb_id, "error", error="merge: probe failed"); return
+    if not ei:
+        # An unreadable DONOR is a defective release: blocklist it and fetch another.
+        reject_and_retry(tmdb_id, "donor unreadable (probe failed)", cfg)
+        return
+    if not fi:
+        # An unreadable BASE is more likely a mount hiccup than corruption — the same file was
+        # probed fine at scan time. Re-queue and retry; a run of failures becomes a real error.
+        transient("movie", tmdb_id, "merge: library file probe failed", cfg, back_to="ready")
+        return
     # The "wanted" foreign track is English; if this title's original language isn't English
     # and no English exists, the original-language VO is the fallback (e.g. Norwegian Kraken).
     orig_codes = _orig_codes(mv.get("original_lang"))
@@ -1679,17 +1795,31 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             # m is None  -> inconsistent/low-confidence sync.
             # fps_diff & no drift -> framerates differ but only a constant offset was found
             #   (e.g. audio fallback); a constant can't correct frame drift, so don't risk it.
-            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
-            # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit here
-            # on the very first failure, so `max_sync_retries` — the budget that exists to try
-            # four DIFFERENT releases — was never spent, and every sync failure became a manual
-            # "pick another release" that nothing in the pipeline would ever do for you. A
-            # different release is by far the likeliest fix (one at the library's own framerate
-            # simply works), it is fully automatic, and it costs a download slot. Review is what
-            # happens when that budget is GONE, not instead of it.
-            reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
-                             final="review" if cfg.get("sync_review", True) else "sync_fail")
-            return
+            # On the attempt that would SPEND the retry budget, the pipeline makes its own last
+            # call — the wide probe — before parking the record for an actor (see
+            # wide_probe_rescue). Earlier failures are cheaper to answer with a different
+            # release, which needs no detection at all.
+            rescue = None
+            if (mv.get("attempts") or 0) + 1 >= cfg.get("max_sync_retries", 4):
+                rescue = wide_probe_rescue(base, donor, 0, (daidx[ids[0]] if ids else 0),
+                                           min(ei["dur"] or 0, fi["dur"] or 0), fps_diff, cfg,
+                                           tag=f" {tmdb_id}",
+                                           on_progress=lambda msg: _beat("movie", tmdb_id, msg),
+                                           base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+                                           base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+            if rescue is None:
+                why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+                # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit
+                # here on the very first failure, so `max_sync_retries` — the budget that exists
+                # to try four DIFFERENT releases — was never spent, and every sync failure became
+                # a manual "pick another release" that nothing in the pipeline would ever do for
+                # you. A different release is by far the likeliest fix (one at the library's own
+                # framerate simply works), it is fully automatic, and it costs a download slot.
+                # Review is what happens when that budget is GONE, not instead of it.
+                reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+                return
+            m, conf, method, drift = rescue
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"merge {tmdb_id}: sync {offset:+d}ms"
@@ -1708,7 +1838,11 @@ def _merge_movie_impl(tmdb_id, cfg=None):
           _donor_opts(ids, langs, subs, offset, drift) + [donor]
     ok, err = run_mux(cmd, out, cfg)
     if not ok:
-        core.set_status(tmdb_id, "error", progress="", error=err)
+        # A failed mux is almost always the DONOR — a container mkvmerge can't parse, a
+        # truncated download — and another release is the automatic fix. This used to park as
+        # `error` and hand the AI a /retry it could have been a state transition.
+        # final="error" keeps the escalation honest once the budget is spent.
+        reject_and_retry(tmdb_id, f"mux failed: {err}", cfg, delta, final="error")
         return
     # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single
     # /set_sync keep skipping detection for every future donor this record ever gets — the same

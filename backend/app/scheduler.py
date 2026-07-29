@@ -111,8 +111,12 @@ def _stall_job():
         cfg = core.load_config()
         pipeline.no_seed_public(cfg)
         pipeline.sweep_orphan_donors(cfg)
+        pipeline.sweep_stuck(cfg)        # recover records stranded mid-transition by a crash
         pipeline.ai_health_check(cfg)
         pipeline.watchdogs(cfg)          # is the automation ITSELF healthy? (alarms out-of-band)
+        # A worker thread that died hard (OOM, interpreter error) used to stay dead until a
+        # settings change — with max_parallel_merges=1 that is ALL merging, silently.
+        ensure_merge_workers()
         if cfg.get("scope_films", True):
             pipeline.sweep_stalled(cfg)
         if cfg.get("scope_series"):

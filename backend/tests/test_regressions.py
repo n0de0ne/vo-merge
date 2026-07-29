@@ -88,10 +88,12 @@ def test_a_deliberate_offset_survives_and_is_marked_manual(app_env):
 
 
 def test_donor_reset_covers_every_donor_field(app_env):
-    """Kept as one constant because the sync fields were exactly the ones each retry path forgot."""
+    """Kept as one constant because the sync fields were exactly the ones each retry path forgot.
+    `transient_fails` rides along: a fresh run gets a fresh infrastructure-failure budget."""
     from app import pipeline
     assert set(pipeline.DONOR_RESET) == {"dl_hash", "dl_id", "en_file",
-                                         "sync_offset_ms", "sync_drift", "sync_manual"}
+                                         "sync_offset_ms", "sync_drift", "sync_manual",
+                                         "transient_fails"}
 
 
 # ------------------------------------------------------------------ finding 03 / 13
@@ -962,3 +964,113 @@ def test_broken_config_pages_the_dispatcher(app_env):
     assert cfg["enabled"] is False
     from app import agent
     assert os.path.exists(os.path.join(agent.TICKET_DIR, "config-broken.json"))
+
+
+# ------------------------------------------------------------------ autonomy phase 2
+# Failures a retry can fix must not page the AI; failures a crash caused must not strand a
+# record; the pipeline runs the AI runbook's deterministic first line itself.
+
+def test_transient_failures_self_retry_then_become_a_real_error(app_env):
+    """A momentary qB outage minted an `error` record, which paged the AI for something the next
+    sweep fixes for free. transient() self-retries, bounded — an unbroken run of failures IS an
+    error (the mount is gone, qB is misconfigured) and escalates with the count attached."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "grabbed")
+    cfg = dict(app_env.DEFAULTS, transient_max=3)
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is True
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "pending" and mv["transient_fails"] == 1
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is True
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is False
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "error" and "3 consecutive" in mv["error"]
+
+
+def test_donor_reset_refreshes_the_transient_budget(app_env):
+    """A record sent back for a fresh run gets a fresh infrastructure-failure budget, same as
+    attempts=0 — otherwise three grab hiccups in March count against a different donor in June."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "pending", transient_fails=4)
+    app_env.set_status(1, "pending", **pipeline.DONOR_RESET)
+    assert app_env.get_movie(1)["transient_fails"] == 0
+
+
+def _age_record(core, tmdb, seconds):
+    import time as _t
+    with core.db() as c:
+        c.execute("UPDATE movies SET updated=? WHERE tmdb_id=?", (_t.time() - seconds, tmdb))
+
+
+def test_stuck_searching_and_grabbed_are_recovered(app_env):
+    """Nothing ever read `searching` or `grabbed` back out: stage_search walks only `pending`,
+    stage_finish reconciles only `downloading`/`merging`, and a `grabbed` record has no dl_hash
+    yet so even the orphan sweep can't see it. A crash mid-transition stranded them forever."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, grab_mode="auto")
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "searching")
+    _age_record(app_env, 1, 3600)
+    _seed_error_movie(app_env, 2, "B2")
+    app_env.set_status(2, "grabbed")
+    _age_record(app_env, 2, 3600)
+    _seed_error_movie(app_env, 3, "B3")
+    app_env.set_status(3, "searching")                  # fresh — a live search, leave it alone
+    pipeline.sweep_stuck(cfg)
+    assert app_env.get_movie(1)["status"] == "pending"
+    assert app_env.get_movie(2)["status"] == "pending"
+    assert app_env.get_movie(3)["status"] == "searching"
+    # the release was never blocklisted — it may never have been grabbed at all
+    assert not json.loads(app_env.get_movie(2).get("tried") or "[]")
+
+
+def test_approval_mode_grabbed_is_a_waiting_room_not_a_stuck_state(app_env):
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "grabbed")
+    _age_record(app_env, 1, 86400)
+    pipeline.sweep_stuck(dict(app_env.DEFAULTS, grab_mode="approval"))
+    assert app_env.get_movie(1)["status"] == "grabbed", \
+        "in approval mode a human is deciding — that is not a crash"
+
+
+def test_episode_in_review_flips_needs_human_when_the_ai_is_silent(app_env, monkeypatch):
+    """The staleness sweep covered movies in ('error','review','sync_fail') but episodes only in
+    ('error','sync_fail') — an episode in `review` whose ticket was consumed and never answered
+    showed 'AI working' forever."""
+    import time as _t
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    monkeypatch.setattr(agent, "undispatched", lambda: set())
+    cfg = dict(app_env.DEFAULTS, ai_stale_min=1)
+    app_env.upsert_episode({"id": "9:1:5", "series_id": 9, "series_title": "Show",
+                            "tvdb_id": 9, "season": 1, "episode": 5,
+                            "french_path": "/media/Series/Show/S01E05.mkv", "quality": "1080p"})
+    app_env.set_ep_status("9:1:5", "review", ai_status="pending", ai_at=_t.time() - 3600)
+    with open(os.path.join(str(app_env.CONFIG_DIR), "ai_seen_records.json"), "w") as f:
+        json.dump(["episode:9:1:5:review"], f)          # paged by an earlier sweep
+    pipeline.ai_health_check(cfg)
+    assert app_env.get_episode("9:1:5")["ai_status"] == "needs_human"
+
+
+def test_wide_probe_rescue_gates(app_env, monkeypatch):
+    """The rescue merges only on a result the merge path itself would accept: a real offset, and
+    never a constant offset across differing framerates. Off means off."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: (-40000, 0.89, "video x4", None))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False, cfg) == \
+        (-40000, 0.89, "video x4", None)
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, True, cfg) is None, \
+        "a constant offset cannot correct frame drift, however far out it was found"
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: (None, 0.1, None, None))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False, cfg) is None
+    called = []
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: called.append(1))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False,
+                                      dict(cfg, sync_wide_probe=False)) is None
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False,
+                                      dict(cfg, sync_probe_lag_s=60)) is None, \
+        "no point re-searching NARROWER than the pass that already failed"
+    assert not called
