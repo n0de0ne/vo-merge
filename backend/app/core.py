@@ -56,6 +56,34 @@ DEFAULTS = {
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
+    "ai_max_tickets": 50,                          # cap on QUEUED (undispatched) per-record
+                                                   # tickets. One bad season pack is 400 episodes;
+                                                   # filing all 400 at once buries the queue for
+                                                   # hours. Records beyond the cap stay unpaged
+                                                   # (and unstamped — the staleness timer must not
+                                                   # run on a page that was never sent) and are
+                                                   # picked up as the queue drains.
+    "ai_dispatcher_alarm_min": 120,                # alarm when the OLDEST queued ticket has waited
+                                                   # this long and the dispatcher heartbeat is
+                                                   # absent/stale. Generous by default so a legacy
+                                                   # hourly host cron (which keeps no heartbeat)
+                                                   # doesn't false-alarm.
+    # ---- the out-of-band alarm channel (notify.py) -----------------------------------------
+    # Empty = off. A Discord/Slack webhook URL gets their JSON envelope; anything else gets an
+    # ntfy-style plain POST with a Title header. This is for the automation's OWN failures —
+    # dead dispatcher, broken config, full disk, prolonged dependency outage, records needing a
+    # human — not per-merge chatter.
+    "notify_url": "",
+    "notify_repeat_h": 24,                         # one alarm per kind per this many hours; a
+                                                   # condition observed healthy again re-arms
+                                                   # immediately
+    "dep_down_alarm_min": 60,                      # a dependency (Prowlarr/qB/*arr) continuously
+                                                   # unreachable this long raises an alarm. Every
+                                                   # sweep already logs-and-returns per cycle;
+                                                   # this is the part that remembers DURATION.
+    "disk_floor_gb": 10,                           # alarm (and, see merge gate, hold merges) when
+                                                   # free space under media_mount or /config
+                                                   # drops below this
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -194,8 +222,14 @@ _lock = threading.Lock()
 # (mtime, size), i.e. once per edit.
 _CONFIG_BROKEN = {"at": 0.0, "reported": None}
 
+# The last config that parsed, kept so the broken-config alarm can still reach the notify URL
+# that is trapped inside the file it cannot read. In-memory only: after a restart into a broken
+# config the alarm degrades to ticket + log, which is still infinitely better than silence.
+_LAST_GOOD_CFG = None
+
 
 def load_config():
+    global _LAST_GOOD_CFG
     cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_FILE) as f:
@@ -211,6 +245,10 @@ def load_config():
         try:
             cfg.update(json.loads(raw))
             _CONFIG_BROKEN.update(at=0.0, reported=None)
+            # Remember the last config that PARSED. When the file breaks, the broken copy holds
+            # the notify URL we would use to say so — the one credential the failure itself
+            # hides — so the alarm below reads it from here instead.
+            _LAST_GOOD_CFG = dict(cfg)
         except Exception as e:
             # Silently falling back to DEFAULTS is how a truncated config.json erased an install:
             # every URL and key reads as empty, `enabled` flips to False, and the next save_config
@@ -225,6 +263,31 @@ def load_config():
                 _CONFIG_BROKEN["reported"] = fingerprint
                 log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
                     f"REFUSING to overwrite it. Fix or remove the file.")
+                # A broken config doesn't just degrade — with `enabled` defaulting False it
+                # STOPS the whole pipeline, and until now the only trace was the log line
+                # above. Page the dispatcher (it has host access and can usually repair a
+                # truncated JSON file itself) and raise the out-of-band alarm. Both are
+                # per-fingerprint, i.e. once per distinct broken state; both must never be the
+                # thing that breaks config loading.
+                try:
+                    ticket("config-broken",
+                           f"config.json could not be parsed ({e}) — the pipeline is STOPPED "
+                           f"(running on defaults, enabled=False)",
+                           {"file": CONFIG_FILE, "error": str(e),
+                            "hint": "fix the JSON in place (nightly copies are in "
+                                    "/config/backup/config-*.json) or remove the file; "
+                                    "vo-merge refuses to save over it while it is broken"},
+                           key=str(fingerprint))
+                except Exception:
+                    pass
+                try:
+                    from . import notify as _notify
+                    _notify.send("config", "config.json unparseable — pipeline stopped",
+                                 f"{CONFIG_FILE}: {e}. Running on defaults with enabled=False "
+                                 f"until the file is fixed or removed.",
+                                 cfg=_LAST_GOOD_CFG or cfg)
+                except Exception:
+                    pass
             _CONFIG_BROKEN["at"] = _CONFIG_BROKEN["at"] or time.time()
     # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
     # every job calls this constantly, and a redact() running inside the clear-to-update window

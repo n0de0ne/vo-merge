@@ -126,6 +126,10 @@ def status():
     return {"enabled": cfg["enabled"], "grab_mode": cfg["grab_mode"],
             "paused": bool(cfg.get("paused")), "hold": pipeline.hold_reason(cfg),
             "merging_now": len(pipeline._merging_now()),
+            # the watchdogs' memory: which dependencies are down and for how long, and whether
+            # the disk floor is holding merges — so the UI can say it instead of looking idle
+            "deps_down": {k: int(time.time() - v) for k, v in pipeline.DEP_DOWN.items()},
+            "disk": dict(pipeline.DISK_STATE),
             "counts": core.status_counts(), "states": core.STATES}
 
 
@@ -1346,6 +1350,8 @@ def movie_ai_result(tmdb_id: int, body: AiResultIn):
     core.set_status(tmdb_id, mv["status"], ai_status=body.status,
                     ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
     core.log(f"ai_result movie {tmdb_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    if body.status in ("failed", "needs_human"):
+        pipeline.notify_needs_human()      # the AI handing back IS the event a human must hear
     return {"ok": True}
 
 
@@ -1360,6 +1366,8 @@ def episode_ai_result(ep_id: str, body: AiResultIn):
     core.set_ep_status(ep_id, e["status"], ai_status=body.status,
                        ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
     core.log(f"ai_result episode {ep_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    if body.status in ("failed", "needs_human"):
+        pipeline.notify_needs_human()
     return {"ok": True}
 
 

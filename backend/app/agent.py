@@ -153,14 +153,43 @@ def episode_context(e):
 
 
 TICKET_DIR = os.path.join(core.CONFIG_DIR, "ai-tickets")
+# The dispatcher's take/ack protocol, shared with deploy/dispatcher/dispatcher.py:
+#   - a ticket in TICKET_DIR is QUEUED — vo-merge wrote it, nothing has looked at it;
+#   - the dispatcher CLAIMS one by renaming it into claimed/ (that is the "the AI took it"
+#     moment the `ai_stale_min` timer should measure from), works it, and DELETES it on the
+#     callback; a claimed ticket left behind is a crashed run, which the dispatcher's own
+#     requeue pass retries and eventually moves to dead/;
+#   - it touches HEARTBEAT every cycle whether or not there was work. That one mtime is what
+#     lets `status()` tell a dead dispatcher from a merely slow one DIRECTLY, instead of
+#     inferring it from ticket age — the inference the old design was reduced to, and the
+#     reason a stopped host cron looked exactly like an agent that examined everything.
+CLAIMED_DIR = os.path.join(TICKET_DIR, "claimed")
+DEAD_DIR = os.path.join(TICKET_DIR, "dead")
+HEARTBEAT = os.path.join(TICKET_DIR, ".heartbeat")
 
 
-def _ticket_files():
+def _ticket_files(root=None):
     try:
-        return [os.path.join(TICKET_DIR, n) for n in os.listdir(TICKET_DIR)
-                if n.endswith(".json")]
+        d = root or TICKET_DIR
+        return [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".json")]
     except OSError:
         return []                # no ticket has ever been filed; the dir is created lazily
+
+
+def remove(kind):
+    """Withdraw a QUEUED ticket (root dir only — a claimed one is already being worked and the
+    dispatcher owns its lifecycle). Called when the record a ticket describes has left its
+    problem state on its own: the ticket is now about a solved problem, and since `core.ticket`
+    refuses to overwrite a same-kind file, leaving it there would also block the NEXT page for
+    that record."""
+    try:
+        p = os.path.join(TICKET_DIR, f"{kind}.json")
+        if os.path.exists(p):
+            os.remove(p)
+            return True
+    except OSError as e:
+        core.log(f"ticket withdraw {kind}: {e}")
+    return False
 
 
 def undispatched():
@@ -193,13 +222,14 @@ def undispatched():
 
 
 def status(cfg=None):
-    """Is the host dispatcher consuming what we write?
+    """Is the dispatcher consuming what we write?
 
     `core.ticket` will not overwrite a ticket of the same kind — "already awaiting dispatch" —
-    so the dispatcher is expected to remove each file once it has picked it up. A ticket sitting
-    there for hours is therefore the most direct evidence available from inside the container
-    that nothing on the host is reading them. It is evidence, not proof (a dispatcher could be
-    running and leaving the files), so the UI pairs it with `last_callback`, which is."""
+    so the dispatcher is expected to remove (claim, then delete) each file once it has picked it
+    up. A ticket sitting there for hours is evidence that nothing is reading them; the
+    `heartbeat_age` is proof either way, when the dispatcher is one that maintains it (the
+    sidecar does; a legacy host cron doesn't, and reports None). The UI pairs all of this with
+    `last_callback`."""
     cfg = cfg or core.load_config()
     waiting, oldest = 0, None
     try:
@@ -212,5 +242,12 @@ def status(cfg=None):
             oldest = age if oldest is None else max(oldest, age)
     except OSError:
         pass                     # no tickets have ever been filed — the directory is created lazily
+    try:
+        hb = time.time() - os.path.getmtime(HEARTBEAT)
+    except OSError:
+        hb = None                # no heartbeat file = a dispatcher that doesn't keep one (or none)
     return {"enabled": enabled(cfg), "dir": TICKET_DIR,
-            "waiting": waiting, "oldest_age": oldest}
+            "waiting": waiting, "oldest_age": oldest,
+            "claimed": len(_ticket_files(CLAIMED_DIR)),
+            "dead": len(_ticket_files(DEAD_DIR)),
+            "heartbeat_age": hb}

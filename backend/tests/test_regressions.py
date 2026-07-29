@@ -434,7 +434,9 @@ def test_a_broken_config_logs_once_not_once_per_request(app_env):
     before = len(app_env.tail_log(9999))
     for _ in range(20):
         app_env.load_config()
-    assert len(app_env.tail_log(9999)) - before == 1
+    # Once per DISTINCT broken state, never per request: the complaint plus its dispatcher page
+    # (a broken config stops the whole pipeline, so it files a config-broken ticket too).
+    assert len(app_env.tail_log(9999)) - before == 2
 
 
 def test_removing_a_broken_config_lets_saves_work_again(app_env):
@@ -832,3 +834,131 @@ def test_forecast_needs_a_probed_library(app_env):
     from app import main
     f = main.forecast(90.0)
     assert f["eta_days"] is None and "probed" in f["reason"]
+
+
+# ------------------------------------------------------------------ autonomy phase 1
+# The fixer must not be able to die silently, and its queue must have real per-record units.
+
+def _seed_error_movie(core, tmdb, title="Broken"):
+    core.upsert_movie({"tmdb_id": tmdb, "imdb_id": f"tt{tmdb}", "radarr_id": tmdb,
+                       "title": title, "original_title": title, "year": 2020,
+                       "original_lang": "french", "french_path": f"/media/Films/{title}/f.mkv",
+                       "quality": "1080p"})
+    core.set_status(tmdb, "error", error="merge: something broke")
+
+
+def test_ai_health_check_files_one_ticket_per_record(app_env, monkeypatch):
+    """The errors-review batch had queue semantics that fought the dispatcher: while one batch
+    sat unconsumed, every later failure was refused a ticket. Per-record files are the take/ack
+    units the dispatcher actually works in."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    _seed_error_movie(app_env, 2, "Broken2")
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m2.json"))
+    assert app_env.get_movie(1)["ai_status"] == "pending"
+    # a second sweep re-pages nothing: the seen-set marks them, the tickets still sit queued
+    before = app_env.get_movie(1)["ai_at"]
+    pipeline.ai_health_check(cfg)
+    assert app_env.get_movie(1)["ai_at"] == before
+
+
+def test_ticket_queue_cap_leaves_overflow_unstamped(app_env, monkeypatch):
+    """One bad season pack is 400 failures at once. Beyond ai_max_tickets, records must stay
+    UNSTAMPED — stamping ai_status='pending' with no ticket on disk is exactly the bug that made
+    the staleness sweep report 'the AI did not respond' about pages that were never sent."""
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS, ai_max_tickets=1)
+    _seed_error_movie(app_env, 1)
+    _seed_error_movie(app_env, 2, "Broken2")
+    pipeline.ai_health_check(cfg)
+    stamped = [app_env.get_movie(i)["ai_status"] for i in (1, 2)]
+    assert stamped.count("pending") == 1 and stamped.count(None) == 1
+    # the queue drains (dispatcher consumed the ticket) -> the overflow record is paged next
+    from app import agent
+    for n in os.listdir(agent.TICKET_DIR):
+        if n.endswith(".json"):
+            os.remove(os.path.join(agent.TICKET_DIR, n))
+    pipeline.ai_health_check(cfg)
+    assert [app_env.get_movie(i)["ai_status"] for i in (1, 2)].count("pending") == 2
+
+
+def test_obsolete_ticket_is_withdrawn_when_the_record_recovers(app_env, monkeypatch):
+    """A record that leaves its problem state on its own strands its queued ticket: the
+    dispatcher wastes a run on a solved problem, and — since core.ticket refuses a same-kind
+    overwrite — the stale file blocks that record's NEXT page indefinitely."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    pipeline.ai_health_check(cfg)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m1.json")
+    assert os.path.exists(tpath)
+    app_env.set_status(1, "merged", ai_status=None)      # something fixed it
+    pipeline.ai_health_check(cfg)
+    assert not os.path.exists(tpath), "queued ticket for a recovered record must be withdrawn"
+    # ...and a LATER failure of the same record pages again
+    app_env.set_status(1, "error", error="fails differently")
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(tpath)
+
+
+def test_notify_rate_limits_per_kind_and_rearms_on_clear(app_env, monkeypatch):
+    """A standing condition re-fires every 3-minute sweep; a channel that repeats itself all day
+    gets muted by its human, which is worse than no channel. One alarm per kind per window —
+    re-armed the moment the condition is observed healthy."""
+    from app import notify
+    sent = []
+    class _R:
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(notify.requests, "post", lambda *a, **k: sent.append(a) or _R())
+    cfg = dict(app_env.DEFAULTS, notify_url="https://ntfy.example/vo")
+    assert notify.send("disk", "low", "10GB", cfg=cfg) is True
+    assert notify.send("disk", "low", "9GB", cfg=cfg) is False, "same kind inside the window"
+    assert notify.send("dispatcher", "dead", "x", cfg=cfg) is True, "kinds are independent"
+    notify.clear("disk")
+    assert notify.send("disk", "low again", "8GB", cfg=cfg) is True
+    assert len(sent) == 3
+    assert notify.send("anything", "x", "y", cfg=dict(app_env.DEFAULTS)) is False, \
+        "empty notify_url means the channel is off"
+
+
+def test_dispatcher_alarm_requires_stale_queue_AND_no_live_heartbeat(app_env, monkeypatch):
+    """A live sidecar with a deep queue is slow, not dead; a legacy hourly cron keeps no
+    heartbeat but drains the queue. The alarm must need both signals bad."""
+    import time as _t
+    from app import pipeline, agent, notify
+    calls = []
+    monkeypatch.setattr(notify, "send", lambda k, t, b, cfg=None, force=False: calls.append(k))
+    monkeypatch.setattr(notify, "clear", lambda k: None)
+    cfg = dict(app_env.DEFAULTS, ai_dispatcher_alarm_min=1)
+    os.makedirs(agent.TICKET_DIR, exist_ok=True)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m9.json")
+    with open(tpath, "w") as f:
+        f.write("{}")
+    old = _t.time() - 3600
+    os.utime(tpath, (old, old))
+    pipeline.check_dispatcher(cfg)                      # stale queue, no heartbeat -> alarm
+    assert calls == ["dispatcher"]
+    with open(agent.HEARTBEAT, "w"):
+        pass                                            # fresh heartbeat -> alive, just slow
+    pipeline.check_dispatcher(cfg)
+    assert calls == ["dispatcher"], "a live heartbeat must suppress the alarm"
+    st = agent.status(cfg)
+    assert st["heartbeat_age"] is not None and st["waiting"] == 1
+
+
+def test_broken_config_pages_the_dispatcher(app_env):
+    """An unparseable config.json doesn't just degrade — with `enabled` defaulting False it
+    STOPS the pipeline, and the only trace used to be one log line."""
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"enabled": true, TRUNCATED')
+    cfg = app_env.load_config()
+    assert cfg["enabled"] is False
+    from app import agent
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "config-broken.json"))

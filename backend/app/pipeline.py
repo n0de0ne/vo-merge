@@ -860,97 +860,77 @@ def ai_health_check(cfg=None):
             _WEDGE_SINCE["ts"] = time.time()
     else:
         _WEDGE_SINCE["ts"] = None
-    # (b) new error / review / sync_fail records — per-record seen-set so only NEW ones page,
-    # and a standing backlog never re-pages when one more record errors. Each newly-paged record
-    # is stamped ai_status='pending' so the UI shows "AI working" until the agent reports back.
+    # (b) records newly landed in error / review / sync_fail — one ticket PER RECORD, capped.
+    # The old single errors-review.json batch had queue semantics that fought the dispatcher:
+    # while one batch sat unconsumed every later failure was refused a ticket, and a batch is
+    # all-or-nothing for a consumer that handles a couple of records per run. Per-record files
+    # give the dispatcher real take/ack units (see agent.CLAIMED_DIR), the same shape the
+    # operator's Send-to-AI button already writes. The cap keeps one bad season pack (400
+    # episodes) from burying the queue: records beyond it stay unpaged AND unstamped — the
+    # staleness timer must never run on a page that was never sent — and are picked up as the
+    # queue drains. The per-record seen-set still guarantees only NEW failures page.
     now = time.time()
     seen_path = os.path.join(core.CONFIG_DIR, "ai_seen_records.json")
     try:
         seen = set(json.load(open(seen_path)))
     except Exception:
         seen = set()
-    news, live = [], set()
+    room = max(0, int(cfg.get("ai_max_tickets", 50)) - len(agent.undispatched()))
+    paged, backlog, live = 0, 0, set()
     for st in ("error", "review", "sync_fail"):
         for m in core.get_movies(st):
             rk = f"movie:{m['tmdb_id']}:{st}"
             live.add(rk)
-            if rk in seen: continue
-            seen.add(rk)
-            core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
-            news.append({"type": "movie", "status": st, "id": m["tmdb_id"],
-                         "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.movie_context(m)
+            # once=False: the seen-set above is the dedup; the (kind,key) guard would refuse a
+            # record that fails again months after being fixed. The "same kind already awaiting
+            # dispatch" guard stays — an unconsumed ticket for this record means don't re-file.
+            if core.ticket(f"review-m{m['tmdb_id']}", summary, ctx, once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
         for e in core.get_episodes(st):
             rk = f"episode:{e['id']}:{st}"
             live.add(rk)
-            if rk in seen: continue
-            seen.add(rk)
-            core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
-            news.append({"type": "episode", "status": st, "id": e["id"],
-                         "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
-                         "error": (e.get("error") or "")[:200]})
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.episode_context(e)
+            if core.ticket(f"review-e{e['id']}", summary, ctx, once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
     # Forget records that are no longer in a problem state. The set only ever grew before, so a
     # title the AI FIXED stayed "already seen" forever — when it failed again months later for an
     # unrelated reason it was silently never escalated, breaking the contract that every failure
-    # reaches the AI within 3 minutes. It also grew without bound, while its sibling
-    # ai_tickets_filed.json is capped at 3000. Newly-paged keys are in `live` by construction, so
-    # intersecting keeps them.
+    # reaches the AI within 3 minutes. Withdraw their still-QUEUED tickets too: the ticket now
+    # describes a solved problem, wastes a dispatcher run, and — since core.ticket refuses a
+    # same-kind overwrite — would block this record's NEXT page for as long as it sat there.
     stale = seen - live
-    filed = True
-    if news:
-        key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
-        # once=False: the per-record dedup above already decided these are NEW pages, and the
-        # (kind,key) guard would refuse the identical record-set a second time — see core.ticket.
-        filed = core.ticket("errors-review",
-                    f"{len(news)} NEW record(s) in error/review/sync_fail",
-                    {"records": news[:60], "total_new": len(news),
-                     "api": agent._api_hint(),
-                     "report_back": (
-                         "After handling each record, POST its outcome so it leaves the operator's "
-                         "manual-review queue: movies -> /movie/{id}/ai_result, episodes -> "
-                         "/episode/{id}/ai_result, body {\"status\":\"resolved|failed|needs_human\","
-                         "\"verdict\":\"one line\",\"action_taken\":\"what you did\"}. "
-                         "Use needs_human when a person must decide."),
-                     "diagnose_first": (
-                         "GET /movie/{id}/context or /episode/{id}/context — the record, a probe "
-                         "of both files (fps/duration/audio tracks), the log lines for it, and for "
-                         "episodes every donor file with the (season,episode) the parser read plus "
-                         "the series' episode list. Read this before acting; it usually IS the "
-                         "diagnosis and saves shelling into the container. The episode context also "
-                         "carries a `numbering` block (library S/E vs the release's S/E and absolute "
-                         "number): vo-merge now translates aired<->absolute itself from Sonarr, so "
-                         "`translated: true` means the search and the donor mapping already use the "
-                         "aired numbering and a plain /retry is the right move."),
-                     "actions": [
-                         "GET  /movie|episode/{id}/candidates — scored releases (incl. already-tried)",
-                         "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
-                         "POST /movie|episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — "
-                         "apply a KNOWN offset and/or rate stretch with no detection. drift is the "
-                         "donor->base ratio = donor_fps/base_fps (25/23.976=1.0427083 film->PAL, "
-                         "23.976/25=0.9590410 PAL->film). Use when fps are known but detection failed.",
-                         "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map ONE donor file "
-                         "to this episode and queue the merge. Aired-vs-absolute numbering is now "
-                         "handled automatically (Sonarr's absoluteEpisodeNumber), so reach for this "
-                         "only when the automatic mapping can't apply — Sonarr has no absolute "
-                         "numbers for the series, or the pack numbers its files some third way. "
-                         "Read /context, work out the mapping, call this per episode.",
-                         "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query, returns "
-                         "links. For titles the built-in query never matches, try the original / "
-                         "romaji / English / alternate-transliteration name, or drop the year. Then "
-                         "act on a result with POST /movie|episode/{id}/grab {\"link\":...}.",
-                         "POST /movie|episode/{id}/another | /research | /retry | /ignore",
-                         "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
-                    key=key, once=False)
-    if stale or (news and filed):
-        # Only remember records whose ticket actually reached the directory. Marking them seen
-        # when the write was refused (a previous errors-review.json still awaiting dispatch)
-        # meant they were never paged again once it was consumed.
+    for rk in stale:
+        parts = rk.split(":")                       # movie:<tmdb>:<st> / episode:<s:i:d>:<st>
+        ident = ":".join(parts[1:-1])
+        agent.remove(f"review-{'m' if parts[0] == 'movie' else 'e'}{ident}")
+    if stale or paged:
         seen &= live
         with open(seen_path, "w") as f:
             json.dump(sorted(seen), f)
         if stale:
             core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
-    elif news and not filed:
-        core.log(f"ai: {len(news)} record(s) not paged yet (a ticket is still awaiting dispatch)")
+    if paged:
+        core.log(f"ai: paged {paged} record(s)")
+    if backlog:
+        core.log(f"ai: {backlog} record(s) waiting for ticket-queue room "
+                 f"(cap {cfg.get('ai_max_tickets', 50)})")
 
     # Staleness: a record the dispatcher took and never reported on within ai_stale_min, still in
     # a problem state -> it crashed or failed silently. Flag it for a human.
@@ -980,10 +960,166 @@ def ai_health_check(cfg=None):
             core.set_ep_status(e["id"], e["status"], ai_status="needs_human", ai_verdict=verdict)
         if stale_m or stale_e:
             core.log(f"ai staleness: {len(stale_m) + len(stale_e)} record(s) had no AI callback -> needs_human")
+            notify_needs_human(cfg)
         if queued:
             core.log(f"ai staleness: {len(queued)} record(s) still awaiting dispatch -> left pending")
     except Exception as ex:
         core.log(f"ai staleness check failed: {ex}")
+
+
+def notify_needs_human(cfg=None):
+    """One out-of-band digest for records the automation has HANDED BACK — the AI failed, or
+    never answered. This is the terminal rung of the escalation ladder: at that point the only
+    remaining actor is a person, and a pull-based panel is not how you reach one on an
+    unattended install. Rate-limited by notify's own per-kind limiter (a digest per day, not a
+    page per record); called on the staleness flip and on a failed/needs_human callback."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    rows = []
+    with core.db() as c:
+        for r in c.execute("SELECT title AS t, year AS s FROM movies "
+                           "WHERE ai_status IN ('failed','needs_human') ORDER BY ai_at DESC"):
+            rows.append(f"{r['t']} ({r['s']})")
+        for r in c.execute("SELECT series_title t, season s, episode e FROM episodes "
+                           "WHERE ai_status IN ('failed','needs_human') ORDER BY ai_at DESC"):
+            rows.append(f"{r['t']} S{r['s']:02d}E{r['e']:02d}")
+    if not rows:
+        notify.clear("needs_human")
+        return
+    body = f"{len(rows)} record(s) need a human decision:\n" + "\n".join(rows[:8])
+    if len(rows) > 8:
+        body += f"\n… and {len(rows) - 8} more (Review tab)"
+    notify.send("needs_human", f"{len(rows)} record(s) need you", body, cfg=cfg)
+
+
+# name -> when it was first seen unreachable (None entries are pruned on recovery). This is the
+# piece the per-cycle "qB error, returning" logs cannot provide: DURATION. Every stage already
+# degrades correctly for one cycle; nothing knew that cycle had been repeating for three days.
+DEP_DOWN = {}
+
+
+def _dep_targets(cfg):
+    """(name, probe) pairs for every dependency this install is configured to use. Probes use
+    their own short timeout — this runs inside the 3-minute sweep, and four unreachable services
+    at the clients' 60s default would eat the whole interval."""
+    import requests as _rq
+
+    def _arr(url, key, api):
+        return lambda: _rq.get(f"{url.rstrip('/')}/api/{api}/system/status",
+                               headers={"X-Api-Key": key}, timeout=10).raise_for_status()
+
+    out = [("prowlarr", _arr(cfg["prowlarr_url"], cfg["prowlarr_key"], "v1")),
+           ("radarr", _arr(cfg["radarr_url"], cfg["radarr_key"], "v3")),
+           ("qbittorrent", lambda: _rq.post(f"{cfg['qb_url'].rstrip('/')}/api/v2/auth/login",
+                                            data={"username": cfg["qb_user"],
+                                                  "password": cfg["qb_pass"]},
+                                            timeout=10).raise_for_status())]
+    if cfg.get("scope_series"):
+        out.append(("sonarr", _arr(cfg["sonarr_url"], cfg["sonarr_key"], "v3")))
+    return out
+
+
+def check_deps(cfg=None):
+    """Track how long each dependency has been continuously unreachable, and alarm past
+    `dep_down_alarm_min`. Recovery clears the alarm's limiter so the next outage pages again."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    grace = max(1, int(cfg.get("dep_down_alarm_min", 60))) * 60
+    now = time.time()
+    for name, probe in _dep_targets(cfg):
+        try:
+            probe()
+        except Exception as e:
+            since = DEP_DOWN.setdefault(name, now)
+            if now - since >= grace:
+                mins = int((now - since) / 60)
+                notify.send(f"dep-{name}", f"{name} unreachable for {mins}min",
+                            f"{name} has been continuously unreachable since "
+                            f"{time.strftime('%H:%M', time.localtime(since))} ({e}). The "
+                            f"pipeline degrades safely meanwhile (nothing is mis-recorded), "
+                            f"but no new work that needs it can proceed.", cfg=cfg)
+            continue
+        if name in DEP_DOWN:
+            core.log(f"deps: {name} reachable again "
+                     f"(was down {int((now - DEP_DOWN[name]) / 60)}min)")
+            DEP_DOWN.pop(name, None)
+            notify.clear(f"dep-{name}")
+
+
+# Set by check_disk, read by the merge admission gate: while the floor is breached no new mux
+# starts (a mux is the one thing here that WRITES gigabytes, and rc≥2 half-writes compound the
+# very disk-full that causes them).
+DISK_STATE = {"low": False, "free_gb": None}
+
+
+def check_disk(cfg=None):
+    """Alarm when free space under the library mount or /config drops below `disk_floor_gb`,
+    and flip the flag the merge gate honours. Restores itself when space frees."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    floor = max(0.0, float(cfg.get("disk_floor_gb", 10)))
+    worst = None
+    for path in (cfg.get("media_mount", "/media"), core.CONFIG_DIR):
+        try:
+            free = shutil.disk_usage(path).free / 1e9
+        except OSError:
+            continue                      # an absent mount is the prune guard's problem, not ours
+        worst = free if worst is None else min(worst, free)
+    DISK_STATE["free_gb"] = worst
+    if worst is None:
+        return
+    if floor and worst < floor:
+        if not DISK_STATE["low"]:
+            core.log(f"disk: {worst:.1f} GB free < floor {floor} GB -> holding new merges")
+        DISK_STATE["low"] = True
+        notify.send("disk", f"low disk: {worst:.1f} GB free",
+                    f"Free space is below the {floor} GB floor. New merges are held (a mux "
+                    f"writes the whole output before the swap); downloads and scans continue. "
+                    f"Merging resumes on its own once space frees.", cfg=cfg)
+    elif DISK_STATE["low"]:
+        core.log(f"disk: {worst:.1f} GB free — merges resume")
+        DISK_STATE["low"] = False
+        notify.clear("disk")
+        MERGE_WAKE.set()
+
+
+def check_dispatcher(cfg=None):
+    """Alarm when tickets are queuing and the dispatcher shows no sign of life.
+
+    Two independent signals, because two kinds of dispatcher exist: the sidecar keeps a
+    heartbeat (proof), a legacy host cron does not (only the queue drains). So the alarm needs
+    BOTH the oldest queued ticket to have waited past `ai_dispatcher_alarm_min` AND the
+    heartbeat to be absent or older than that — a live sidecar with a deep queue is slow, not
+    dead, and a working hourly cron never lets a ticket age past a couple of hours."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    st = agent.status(cfg)
+    if not st["enabled"]:
+        return
+    limit = max(1, int(cfg.get("ai_dispatcher_alarm_min", 120))) * 60
+    hb = st.get("heartbeat_age")
+    queue_stuck = st["waiting"] > 0 and (st["oldest_age"] or 0) > limit
+    if queue_stuck and (hb is None or hb > limit):
+        seen = ("no heartbeat has ever been written" if hb is None
+                else f"last heartbeat {int(hb / 60)}min ago")
+        notify.send("dispatcher", "AI dispatcher is not consuming tickets",
+                    f"{st['waiting']} ticket(s) queued, oldest {int((st['oldest_age'] or 0) / 60)}"
+                    f"min; {seen}. Failures are piling up unexamined — every record will "
+                    f"eventually flip to needs_human. Check the dispatcher (sidecar container "
+                    f"or host user script).", cfg=cfg)
+    elif not queue_stuck and (hb is None or hb <= limit):
+        notify.clear("dispatcher")
+
+
+def watchdogs(cfg=None):
+    """The self-monitoring pass: is the automation ITSELF healthy? Runs from the 3-minute sweep,
+    each check isolated so one failing probe can't hide the others."""
+    cfg = cfg or core.load_config()
+    for fn in (check_dispatcher, check_disk, check_deps):
+        try:
+            fn(cfg)
+        except Exception as e:
+            core.log(f"watchdog {fn.__name__} error: {e}")
 
 
 def no_seed_public(cfg=None):

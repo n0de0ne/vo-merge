@@ -112,6 +112,7 @@ def _stall_job():
         pipeline.no_seed_public(cfg)
         pipeline.sweep_orphan_donors(cfg)
         pipeline.ai_health_check(cfg)
+        pipeline.watchdogs(cfg)          # is the automation ITSELF healthy? (alarms out-of-band)
         if cfg.get("scope_films", True):
             pipeline.sweep_stalled(cfg)
         if cfg.get("scope_series"):
