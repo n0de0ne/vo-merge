@@ -1,5 +1,5 @@
 """Config persistence + SQLite state + the per-movie pipeline state machine."""
-import json, os, re, sqlite3, threading, time
+import json, os, re, shutil, sqlite3, threading, time
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get("VO_CONFIG", "/config")
@@ -195,6 +195,21 @@ DEFAULTS = {
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
+    "tried_ttl_days": 30,                  # a blocklisted release becomes eligible again after
+                                           # this many days. The blocklist only ever grew, so a
+                                           # release that stalled ONCE (0 seeds on a bad day) was
+                                           # burned forever — for some titles that is the only
+                                           # release that exists. 0/negative = never expire.
+    "no_release_escalate_rounds": 3,       # a no_release record whose built-in query has come
+                                           # back empty this many separate rounds is paged to
+                                           # the AI once with a compose-a-better-query brief —
+                                           # /search_releases exists for exactly these, but
+                                           # no_release was never escalated. 0 = off.
+    "donor_keep_days": 14,                 # donors kept for parked failure states (review/
+                                           # sync_fail/error — kept so /assign and /set_sync can
+                                           # still use them) are freed after this long. With a
+                                           # dead or ignoring actor they otherwise pin gigabytes
+                                           # forever. 0 = keep forever (old behaviour).
     "no_release_retry_h": 24,              # a record that found nothing is re-searched after this
                                            # many hours. Indexers gain releases constantly, so
                                            # "nothing existed when we looked" must not be
@@ -590,7 +605,10 @@ def init_db():
                                    # consecutive infrastructure failures (see pipeline.transient)
                                    # — routes retryable failures through self-retry instead of
                                    # minting an `error` that pages the AI for a network blip
-                                   "transient_fails": "INTEGER DEFAULT 0"})
+                                   "transient_fails": "INTEGER DEFAULT 0",
+                                   # how many separate search rounds ended in no_release —
+                                   # drives the query ladder and the one-shot AI escalation
+                                   "search_rounds": "INTEGER DEFAULT 0"})
 
 
 def _ensure_indexes(c):
@@ -651,7 +669,8 @@ def init_tv():
                                      # inputs the scan used, or the two pick different profiles
                                      "orig_lang": "TEXT",
                                      "merge_kind": "TEXT",                    # see movies table
-                                     "transient_fails": "INTEGER DEFAULT 0"})  # see movies table
+                                     "transient_fails": "INTEGER DEFAULT 0",  # see movies table
+                                     "search_rounds": "INTEGER DEFAULT 0"})   # see movies table
 
 
 def init_indexes():
@@ -794,6 +813,93 @@ def backup_db(keep=7):
         except OSError:
             pass
     log(f"backup: {dest} ({os.path.getsize(dest) // 1024} KB), keeping {keep}")
+    return dest
+
+
+def verify_or_restore_db():
+    """Startup integrity gate: quick_check the DB, and on corruption restore the newest nightly
+    snapshot AUTOMATICALLY instead of limping on a broken file.
+
+    The nightly `VACUUM INTO` backups existed but nothing ever read one — so the recovery path
+    was a human noticing weird behaviour, diagnosing SQLite corruption, and hand-copying a file
+    into place. The DB is the app's entire memory (probe inventory + every record's state);
+    losing up to a day of it to the snapshot is strictly better than every query silently
+    misbehaving. The corrupt file is quarantined beside the live one (with its -wal/-shm), never
+    deleted, so a human can still attempt a finer-grained recovery later.
+
+    Returns one of: "ok" | "absent" | "restored" | "fresh" | "corrupt-unrecovered"."""
+    if not os.path.exists(DB_FILE):
+        return "absent"
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+        if row and str(row[0]).lower() == "ok":
+            return "ok"
+        problem = str(row[0]) if row else "quick_check returned nothing"
+    except Exception as e:
+        problem = str(e)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    quarantine = f"{DB_FILE}.corrupt-{stamp}"
+    try:
+        os.replace(DB_FILE, quarantine)
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(DB_FILE + ext):
+                os.replace(DB_FILE + ext, quarantine + ext)
+    except OSError as e:
+        log(f"db: CORRUPT ({problem}) and could not be quarantined ({e}) — continuing on it")
+        return "corrupt-unrecovered"
+    backups = sorted(f for f in (os.listdir(BACKUP_DIR) if os.path.isdir(BACKUP_DIR) else [])
+                     if f.startswith("vo-merge-") and f.endswith(".db"))
+    if backups:
+        src = os.path.join(BACKUP_DIR, backups[-1])
+        shutil.copyfile(src, DB_FILE)
+        log(f"db: CORRUPT ({problem}) — quarantined to {os.path.basename(quarantine)} and "
+            f"restored {backups[-1]}")
+        outcome, detail = "restored", f"restored last night's snapshot {backups[-1]}"
+    else:
+        log(f"db: CORRUPT ({problem}) — quarantined to {os.path.basename(quarantine)}; no "
+            f"backup exists, starting fresh (a library re-read rebuilds the inventory)")
+        outcome, detail = "fresh", "no backup existed — started fresh"
+    try:
+        ticket("db-restored", f"database was corrupt ({problem[:120]}) — {detail}",
+               {"quarantined": quarantine, "outcome": outcome,
+                "note": "records changed since the snapshot re-derive from the next scan; "
+                        "the quarantined file is kept for manual recovery"}, key=stamp)
+    except Exception:
+        pass
+    try:
+        from . import notify as _notify
+        _notify.send("db", f"database {outcome} after corruption",
+                     f"{problem[:200]} — {detail}. Quarantined: {quarantine}")
+    except Exception:
+        pass
+    return outcome
+
+
+def backup_config(keep=7):
+    """Nightly copy of config.json beside the DB snapshots. The config's atomic write protects
+    against crashes mid-save, not against a bad-but-parseable save — and the broken-config
+    ticket points the fixer at these copies. Skipped while the live file is unparseable: copying
+    it then would overwrite the day's good snapshot with the very bytes that broke."""
+    if _CONFIG_BROKEN["at"] or not os.path.exists(CONFIG_FILE):
+        return None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"config-{time.strftime('%Y%m%d')}.json")
+    try:
+        shutil.copyfile(CONFIG_FILE, dest)
+    except OSError as e:
+        log(f"config backup failed: {e}")
+        return None
+    old = sorted(f for f in os.listdir(BACKUP_DIR)
+                 if f.startswith("config-") and f.endswith(".json"))
+    for f in old[:-keep] if keep > 0 else []:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, f))
+        except OSError:
+            pass
     return dest
 
 

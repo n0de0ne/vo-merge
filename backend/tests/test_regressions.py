@@ -567,7 +567,8 @@ def test_a_sync_failure_tries_other_releases_before_asking_a_human(app_env):
     assert seen[3] == "review", "only the exhausted budget reaches a human"
     mv = app_env.get_movie(40)
     assert mv["attempts"] == 4
-    assert json.loads(mv["tried"]) == [f"rel-{i}" for i in range(1, 5)]
+    # entries are [rid, ts] since the blocklist learned to age — the identities are what matter
+    assert [e[0] for e in json.loads(mv["tried"])] == [f"rel-{i}" for i in range(1, 5)]
     assert mv["dl_hash"] == "h4", "review keeps the donor — /set_sync needs the file"
 
 
@@ -1135,3 +1136,124 @@ def test_recycle_disabled_falls_back_to_the_old_destructive_path(app_env, tmp_pa
     cfg = dict(app_env.DEFAULTS, media_mount=str(tmp_path / "media"), recycle_keep_days=0)
     assert pipeline.recycle(str(f), cfg) is None
     assert f.exists(), "recycle off must not touch the file — the caller overwrites/deletes it"
+
+
+# ------------------------------------------------------------------ autonomy phase 4
+# Nothing loops forever, nothing fills the disk, state survives corruption.
+
+def test_blocklist_entries_age_out_but_legacy_strings_hold_until_rewritten(app_env):
+    """The blocklist only ever grew: a release that stalled ONCE (0 seeds on a bad day) was
+    burned forever — for some titles that is the only release that exists. Timestamped entries
+    age out after tried_ttl_days; legacy plain strings stay blocked (safe) until a rewrite
+    stamps them, so an upgrade doesn't un-blocklist years of known-bad releases at once."""
+    import time as _t
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    old = _t.time() - 40 * 86400
+    app_env.set_status(1, "pending", dl_id="rid-new",
+                       tried=json.dumps([["rid-aged", old], ["rid-fresh", _t.time()], "rid-legacy"]))
+    mv = app_env.get_movie(1)
+    cfg = dict(app_env.DEFAULTS, tried_ttl_days=30)
+    active = pipeline.tried_active(mv, cfg)
+    assert active == {"rid-fresh", "rid-legacy"}, "aged entry eligible again; legacy still held"
+    assert pipeline.tried_active(mv, dict(cfg, tried_ttl_days=0)) == \
+        {"rid-aged", "rid-fresh", "rid-legacy"}, "TTL<=0 preserves never-expire"
+    # a rewrite stamps the legacy entry (ages from the upgrade) and appends the current release
+    stamped = json.loads(pipeline.blocklist(mv))
+    assert all(isinstance(e, list) and len(e) == 2 for e in stamped)
+    assert {e[0] for e in stamped} == {"rid-aged", "rid-fresh", "rid-legacy", "rid-new"}
+    legacy_ts = next(ts for rid, ts in stamped if rid == "rid-legacy")
+    assert _t.time() - legacy_ts < 60
+
+
+def test_exhausted_no_release_is_paged_once(app_env, monkeypatch):
+    """no_release was NEVER escalated — records whose query can't match their title re-searched
+    the same wrong query every cooldown forever, while /search_releases (built for exactly this)
+    waited for someone to think of it. One page per exhaustion, not one per cooldown cycle."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS, no_release_escalate_rounds=3)
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "no_release", search_rounds=2, error=None)
+    pipeline.ai_health_check(cfg)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m1.json")
+    assert not os.path.exists(tpath), "below the rounds gate -> not paged"
+    app_env.set_status(1, "no_release", search_rounds=3)
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(tpath) and app_env.get_movie(1)["ai_status"] == "pending"
+    with open(tpath) as f:
+        assert "search_releases" in f.read()
+    # the dispatcher consumed it and resolved -> later cooldown cycles must NOT re-page
+    os.remove(tpath)
+    app_env.set_status(1, "no_release", ai_status="resolved")
+    pipeline.ai_health_check(cfg)
+    assert not os.path.exists(tpath), "one-shot: a delivered verdict is durable"
+
+
+def test_withdrawn_page_clears_the_pending_stamp(app_env, monkeypatch):
+    """A record that recovers while its ticket still QUEUES gets the ticket withdrawn — and the
+    stamp must go with it, or the next problem state flips to needs_human claiming 'the AI did
+    not respond' about a page nobody was ever given."""
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    pipeline.ai_health_check(cfg)                       # pages, stamps pending
+    assert app_env.get_movie(1)["ai_status"] == "pending"
+    app_env.set_status(1, "pending")                    # recovered before dispatch
+    pipeline.ai_health_check(cfg)                       # withdraws the queued ticket
+    assert app_env.get_movie(1)["ai_status"] is None
+
+
+def test_disk_gate_holds_the_worker_and_requeues_the_pair(app_env, monkeypatch, tmp_path):
+    """rc>=2 half-writes compound the very disk-full that causes them, once per retry. A pair
+    that can't fit re-queues un-penalised and the worker cools off instead of re-probing the
+    same pair every ten seconds."""
+    import time as _t
+    from app import pipeline, notify
+    monkeypatch.setattr(notify, "send", lambda *a, **k: True)
+    a = tmp_path / "a.bin"; a.write_bytes(b"x" * 1000)
+    ok, free, need = pipeline.disk_headroom_ok([str(a)], str(tmp_path),
+                                               dict(app_env.DEFAULTS, disk_floor_gb=0))
+    assert ok is True and free > 0
+    ok, free, need = pipeline.disk_headroom_ok([str(a)], str(tmp_path),
+                                               dict(app_env.DEFAULTS, disk_floor_gb=10 ** 6))
+    assert ok is False, "an absurd floor cannot be satisfied"
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "merging")
+    pipeline.DISK_STATE["hold_until"] = 0
+    pipeline.hold_for_disk("movie", 1, free, need, dict(app_env.DEFAULTS))
+    assert app_env.get_movie(1)["status"] == "ready"
+    assert pipeline.DISK_STATE["hold_until"] > _t.time()
+    assert pipeline.merge_next(dict(app_env.DEFAULTS)) is False, "worker holds while cooling off"
+    pipeline.DISK_STATE["hold_until"] = 0
+
+
+def test_corrupt_db_restores_from_the_nightly_snapshot(app_env):
+    """The nightly VACUUM INTO backups existed but nothing ever read one — recovery was a human
+    hand-copying a file. Corruption now quarantines the bad DB and restores the snapshot."""
+    from app import core as c2
+    _seed_error_movie(app_env, 1)
+    assert c2.backup_db(keep=3)
+    with open(app_env.DB_FILE, "r+b") as f:             # clobber the header -> unreadable DB
+        f.write(b"CORRUPT!" * 16)
+    for ext in ("-wal", "-shm"):
+        p = app_env.DB_FILE + ext
+        if os.path.exists(p):
+            os.remove(p)
+    assert c2.verify_or_restore_db() == "restored"
+    assert app_env.get_movie(1)["title"] == "Broken", "state came back from the snapshot"
+    assert any(f.startswith("vo-merge.db.corrupt-") for f in os.listdir(str(app_env.CONFIG_DIR))), \
+        "the corrupt file is quarantined, never deleted"
+    assert c2.verify_or_restore_db() == "ok"
+
+
+def test_config_backup_skips_while_the_live_file_is_broken(app_env):
+    """Copying an unparseable config.json would overwrite the day's good snapshot with the very
+    bytes that broke it."""
+    app_env.save_config({"min_seeders": 7})
+    assert app_env.backup_config(keep=3)
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"broken": TRUNCA')
+    app_env.load_config()
+    assert app_env.backup_config(keep=3) is None

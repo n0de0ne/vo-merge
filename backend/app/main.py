@@ -15,6 +15,7 @@ async def _lifespan(_app):
     """Migrations, then the scheduler. `@app.on_event("startup")` is deprecated and slated for
     removal, and it swallowed the distinction between 'the app failed to start' and 'a startup
     step raised' — a lifespan failure stops the app cleanly instead."""
+    core.verify_or_restore_db()     # a corrupt DB restores from last night's snapshot, not a human
     core.init_db()
     core.init_tv()
     core.init_indexes()
@@ -1267,19 +1268,15 @@ def research(tmdb_id: int):
 def another(tmdb_id: int):
     """Pick another version: blocklist the current release, drop its download, grab the
     next-best candidate."""
-    import json as _json
     cfg = core.load_config()
     mv = core.get_movie(tmdb_id) or {}
-    tried = _json.loads(mv.get("tried") or "[]")
-    if mv.get("dl_id") and mv["dl_id"] not in tried:
-        tried.append(mv["dl_id"])
     try:
         qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
         if mv.get("dl_hash"):
             qb.delete([mv["dl_hash"]], delete_files=True)
     except Exception:
         pass
-    core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
+    core.set_status(tmdb_id, "pending", error=None, tried=pipeline.blocklist(mv),
                     **pipeline.DONOR_RESET, **pipeline.AI_RESET)
     try:
         pipeline.search_movie(tmdb_id)

@@ -128,7 +128,9 @@ def _stall_job():
 def _backup_job():
     try:
         cfg = core.load_config()
-        core.backup_db(keep=int(cfg.get("db_backup_keep", 7)))
+        keep = int(cfg.get("db_backup_keep", 7))
+        core.backup_db(keep=keep)
+        core.backup_config(keep=keep)   # the config deserves the same nightly copy as the DB
     except Exception as e:
         core.log(f"backup_job error: {e}")
 
