@@ -137,10 +137,19 @@ def _backup_job():
 
 def _housekeeping_job():
     """Daily slow-cadence upkeep, always registered (unlike the backup job, which the operator
-    can turn off): purge expired recycled originals."""
+    can turn off): purge expired recycled originals, re-examine long-ignored records, and — when
+    the operator has opted in — run the audio-less repair pass."""
     try:
         cfg = core.load_config()
         pipeline.purge_recycle(cfg)
+        pipeline.revisit_ignored(cfg)
+        if cfg.get("auto_repair"):
+            with core.db() as c:
+                paths = [r["path"] for r in c.execute(
+                    "SELECT path FROM probes WHERE err=? ORDER BY path LIMIT 500",
+                    (pipeline.BROKEN_ERR,))]
+            if paths and pipeline.start_repair(paths, cfg):
+                core.log(f"auto_repair: verifying {len(paths)} audio-less candidate(s)")
     except Exception as e:
         core.log(f"housekeeping error: {e}")
 

@@ -205,6 +205,18 @@ DEFAULTS = {
                                            # the AI once with a compose-a-better-query brief —
                                            # /search_releases exists for exactly these, but
                                            # no_release was never escalated. 0 = off.
+    "ignored_revisit_days": 90,            # a record `ignored` this long is re-examined with ONE
+                                           # cheap search: "no release exists" decays as truth,
+                                           # and without a revisit the verdict is permanent by
+                                           # accident. Finds something usable -> re-opened;
+                                           # still nothing -> sleeps another cycle. 0 = never.
+    "ignored_revisit_per_day": 10,         # cap on revisits per housekeeping day, so a large
+                                           # ignored backlog doesn't hammer the indexers
+    "auto_repair": False,                  # run the audio-less repair pass (delete via the *arr
+                                           # + re-search) on the daily housekeeping schedule.
+                                           # Off by default: it deletes media. Its guards are the
+                                           # strong ones either way — cache-bypassed re-probe,
+                                           # BROKEN_ERR only, *arr-known files only.
     "donor_keep_days": 14,                 # donors kept for parked failure states (review/
                                            # sync_fail/error — kept so /assign and /set_sync can
                                            # still use them) are freed after this long. With a
@@ -608,7 +620,9 @@ def init_db():
                                    "transient_fails": "INTEGER DEFAULT 0",
                                    # how many separate search rounds ended in no_release —
                                    # drives the query ladder and the one-shot AI escalation
-                                   "search_rounds": "INTEGER DEFAULT 0"})
+                                   "search_rounds": "INTEGER DEFAULT 0",
+                                   # when an `ignored` record was last re-examined (revisit_ignored)
+                                   "revisit_at": "REAL"})
 
 
 def _ensure_indexes(c):
@@ -670,7 +684,8 @@ def init_tv():
                                      "orig_lang": "TEXT",
                                      "merge_kind": "TEXT",                    # see movies table
                                      "transient_fails": "INTEGER DEFAULT 0",  # see movies table
-                                     "search_rounds": "INTEGER DEFAULT 0"})   # see movies table
+                                     "search_rounds": "INTEGER DEFAULT 0",    # see movies table
+                                     "revisit_at": "REAL"})                   # see movies table
 
 
 def init_indexes():

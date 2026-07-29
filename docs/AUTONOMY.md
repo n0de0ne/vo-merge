@@ -1,7 +1,19 @@
 # Full autonomy — gap analysis
 
-What separates vo-merge today from "100% autonomous, failures solved by itself, no human
-intervention". Written against the July 2026 codebase; file references are to `backend/app/`.
+> **Status: IMPLEMENTED, all five phases** (July 2026). This document is kept as the reasoning
+> behind the work; the living description of the machinery is CLAUDE.md's "Autonomy & failure
+> management" and "The dispatcher is a supervised component" sections. Phase → what landed:
+>
+> | Phase | Landed as |
+> |---|---|
+> | 1 | `deploy/dispatcher/` sidecar (heartbeat, claim/ack, dead-letter), per-record capped ticket queue with withdrawal, `notify.py` + five watchdog alarms (`pipeline.check_dispatcher/check_disk/check_deps`, needs-human digest, config-broken page) |
+> | 2 | `pipeline.wide_probe_rescue`, `pipeline.transient` + reject-path reroutes, `pipeline.sweep_stuck`, episode-review staleness fix, worker respawn from the sweep |
+> | 3 | `pipeline.qc_grafted_audio` before every swap, `pipeline.recycle`/`purge_recycle` + daily housekeeping job |
+> | 4 | `_movie_queries`/`_alt_titles` ladder + `search_rounds`, one-shot `no_release` escalation, `tried_active` blocklist aging, `disk_headroom_ok`/`hold_for_disk` gate, parked-donor TTL, `core.verify_or_restore_db` + `backup_config` |
+> | 5 | `pipeline.revisit_ignored`, `pipeline.run_repair`/`start_repair` shared with the `auto_repair` schedule |
+
+What separated vo-merge from "100% autonomous, failures solved by itself, no human
+intervention" when this was written. File references are to `backend/app/` as of the analysis.
 
 The system is already unusually self-healing for this class of tool: stalled and dead torrents
 are dropped, blocklisted and replaced; sync failures spend a budget of *different releases*

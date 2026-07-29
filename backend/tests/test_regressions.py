@@ -1257,3 +1257,67 @@ def test_config_backup_skips_while_the_live_file_is_broken(app_env):
         f.write('{"broken": TRUNCA')
     app_env.load_config()
     assert app_env.backup_config(keep=3) is None
+
+
+# ------------------------------------------------------------------ autonomy phase 5
+# Terminal verdicts stay honest: a give-up is re-examined as indexers change.
+
+def test_long_ignored_records_get_one_cheap_revisit(app_env, monkeypatch):
+    """`ignored` rightly survives every rescan — but its usual reason, 'no release exists',
+    decays as truth. A slow revisit re-opens the record the day a usable release appears and
+    re-stamps the sleepers, instead of making the give-up permanent by accident."""
+    import time as _t
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, enabled=True, ignored_revisit_days=90, min_seeders=5)
+    _seed_error_movie(app_env, 1, "NowFindable")
+    app_env.set_status(1, "ignored", ai_verdict="nothing exists (2025)")
+    _seed_error_movie(app_env, 2, "StillNothing")
+    app_env.set_status(2, "ignored")
+    with app_env.db() as c:                          # both ignored long ago
+        c.execute("UPDATE movies SET updated=?", (_t.time() - 120 * 86400,))
+    good = [{"score": 200, "seeders": 30, "title": "NowFindable 2020 MULTI", "tried": False}]
+    monkeypatch.setattr(pipeline, "candidates",
+                        lambda tid, cfg=None, include_tried=False: good if tid == 1 else [])
+    assert pipeline.revisit_ignored(cfg) == 1
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "pending" and mv["attempts"] == 0
+    assert mv["ai_verdict"] is None, "the give-up is over — its verdict goes with it"
+    mv2 = app_env.get_movie(2)
+    assert mv2["status"] == "ignored" and mv2["revisit_at"], \
+        "still nothing -> stays ignored, re-stamped to sleep another cycle"
+    assert pipeline.revisit_ignored(cfg) == 0, "freshly re-stamped records are not due again"
+
+
+def test_revisit_is_capped_and_gated(app_env, monkeypatch):
+    import time as _t
+    from app import pipeline
+    for i in range(1, 6):
+        _seed_error_movie(app_env, i, f"T{i}")
+        app_env.set_status(i, "ignored")
+    with app_env.db() as c:
+        c.execute("UPDATE movies SET updated=?", (_t.time() - 120 * 86400,))
+    calls = []
+    monkeypatch.setattr(pipeline, "candidates",
+                        lambda tid, cfg=None, include_tried=False: calls.append(tid) or [])
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=True, ignored_revisit_per_day=2))
+    assert len(calls) == 2, "per-day cap keeps a big ignored backlog off the indexers"
+    calls.clear()
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=True, ignored_revisit_days=0))
+    assert not calls, "0 = the old never-revisit behaviour"
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=False))
+    assert not calls, "a disabled pipeline must not search"
+
+
+def test_repair_pass_is_shared_and_lock_guarded(app_env):
+    """The endpoint and auto_repair run the SAME pass (pipeline.run_repair) so they can never
+    apply different guards; start_repair refuses while a scan holds the lock."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS)
+    assert pipeline.SCAN_LOCK.acquire(blocking=False)
+    try:
+        assert pipeline.start_repair([], cfg) is False
+    finally:
+        pipeline.SCAN_LOCK.release()
+    pipeline.run_repair([], cfg)                     # empty pass: verifies nothing, deletes nothing
+    assert pipeline.REPAIR_STATE["phase"] == "done"
+    assert pipeline.REPAIR_STATE["deleted"] == 0

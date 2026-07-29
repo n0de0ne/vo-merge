@@ -7,7 +7,7 @@ import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
 from . import agent, core, sync, media
-from .clients import Prowlarr, Radarr, QBittorrent, Plex
+from .clients import Prowlarr, Radarr, Sonarr, QBittorrent, Plex
 
 class _MergeGate:
     """Admission control for concurrent merges (sync-detect + mux), covering every trigger:
@@ -1623,6 +1623,206 @@ def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, 
     core.log(f"recheck({scope}): {st['reopened']} of {st['total']} settled record(s) re-opened, "
              f"{st['complete']} genuinely complete{bad}{gone}")
     return st
+
+
+# ---------------------------------------------------------------- REPAIR (audio-less files)
+# The one probe error that describes the FILE rather than our tools: mkvmerge read the container
+# and found no audio, and ffprobe independently agreed. Nothing else may authorise a deletion —
+# "unsupported container" and "audio mkvmerge can't read" mean the file is probably fine and we
+# simply can't mux it, and "unreadable" means we know nothing at all.
+BROKEN_ERR = "no audio track"
+
+
+def _owner_index(cfg, paths):
+    """Map each /media path to the *arr record that owns it.
+
+    Radarr answers in one call (`movieFile` is embedded in the movie). Sonarr has no
+    library-wide file endpoint, so only the series whose folder actually contains one of `paths`
+    is queried — a repair of 30 files costs a handful of calls, not one per series."""
+    out, want = {}, set(paths)
+    try:
+        for m in Radarr(cfg["radarr_url"], cfg["radarr_key"]).movies() or []:
+            mf = m.get("movieFile") or {}
+            p = media.to_media(mf.get("path"), cfg) if mf.get("path") else None
+            if p in want:
+                out[p] = {"arr": "radarr", "kind": "movie", "id": m["id"],
+                          "file_id": mf["id"], "title": m.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Radarr lookup failed: {e}")
+    rest = [p for p in want if p not in out]
+    if not rest:
+        return out
+    try:
+        s = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        folders = []
+        for se in s.series() or []:
+            sp = media.to_media(se.get("path"), cfg)
+            if sp:
+                folders.append((sp.rstrip("/") + "/", se))
+        cache = {}
+        for p in rest:
+            se = next((x for pre, x in folders if p.startswith(pre)), None)
+            if not se:
+                continue
+            sid = se["id"]
+            if sid not in cache:
+                efs = {}
+                for ef in s.episode_files(sid) or []:
+                    mp = media.to_media(ef.get("path"), cfg)
+                    if mp:
+                        efs[mp] = ef["id"]
+                eps = {}
+                for e in s.episodes(sid) or []:
+                    if e.get("episodeFileId"):
+                        eps.setdefault(e["episodeFileId"], []).append(e["id"])
+                cache[sid] = (efs, eps)
+            efs, eps = cache[sid]
+            fid = efs.get(p)
+            if fid:
+                out[p] = {"arr": "sonarr", "kind": "episode", "id": sid, "file_id": fid,
+                          "episode_ids": eps.get(fid, []), "title": se.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Sonarr lookup failed: {e}")
+    return out
+
+
+def run_repair(paths, cfg):
+    """The REAL audio-less repair pass — every guard the endpoint documents, callable by the
+    schedule too: re-probe with the cache bypassed, only BROKEN_ERR qualifies, deletion goes
+    through the owning *arr (so a replacement is searched), unknown files are skipped. The
+    caller holds SCAN_LOCK; progress lands in REPAIR_STATE either way."""
+    st = REPAIR_STATE
+    st.update(running=True, started=time.time(), finished=0, phase="verifying",
+              checked=0, total=len(paths), deleted=0, searched=0,
+              skipped=[], done=[], error=None)
+    try:
+        radarr = Radarr(cfg["radarr_url"], cfg["radarr_key"])
+        sonarr = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        confirmed = []
+        for p in paths:
+            st["checked"] += 1
+            if not os.path.exists(p):
+                st["skipped"].append({"path": p, "reason": "already gone"})
+                continue
+            _, _, err = media.audit(p, refresh=True)    # never trust the cache for a delete
+            if err != BROKEN_ERR:
+                st["skipped"].append({"path": p,
+                                      "reason": f"re-probe says: {err or 'the file is fine'}"})
+                continue
+            confirmed.append(p)
+        st["phase"] = "matching to Radarr/Sonarr"
+        owners = _owner_index(cfg, confirmed) if confirmed else {}
+        st["phase"] = "deleting"
+        for p in confirmed:
+            o = owners.get(p)
+            if not o:
+                st["skipped"].append({"path": p, "reason":
+                    "not in Radarr/Sonarr — deleting it would just lose the title"})
+                continue
+            try:
+                if o["arr"] == "radarr":
+                    radarr.delete_movie_file(o["file_id"])
+                    radarr.search([o["id"]])
+                else:
+                    sonarr.delete_episode_file(o["file_id"])
+                    if o["episode_ids"]:
+                        sonarr.search(o["episode_ids"])
+                    else:                  # no episode row points at it — re-scan instead
+                        sonarr.rescan(o["id"])
+                core.forget_probe(p)
+                st["deleted"] += 1
+                st["searched"] += 1
+                st["done"].append({"path": p, "title": o["title"], "kind": o["kind"]})
+                core.log(f"repair: deleted audio-less {o['kind']} "
+                         f"{o['title'] or os.path.basename(p)} and asked "
+                         f"{o['arr'].title()} to search again")
+            except Exception as e:
+                st["skipped"].append({"path": p, "reason": f"delete failed: {e}"})
+        core.prune_missing_records()
+        st["phase"] = "done"
+        core.log(f"repair: {st['deleted']} file(s) deleted and re-searched, "
+                 f"{len(st['skipped'])} skipped")
+    except Exception as e:
+        st["error"] = str(e)
+        st["phase"] = "error"
+        core.log(f"repair error: {e}")
+    finally:
+        st.update(running=False, finished=time.time())
+
+
+def start_repair(paths, cfg):
+    """Run the real repair pass on a worker thread under SCAN_LOCK (it re-probes every
+    candidate, so it is minutes-long like a scan — one heavy file pass at a time). Returns False
+    when a scan or repair is already running. Shared by the endpoint and `auto_repair`."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            run_repair(paths, cfg)
+        finally:
+            SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
+def revisit_ignored(cfg=None):
+    """Re-examine long-`ignored` records: one cheap candidates query each, capped per day.
+
+    `ignored` is a deliberate give-up and rightly survives every rescan — but its usual reason,
+    "no release exists", decays as truth: indexers gain releases constantly. Without a revisit
+    the verdict is permanent by accident. A record whose search NOW finds a usable candidate
+    re-opens (fresh budgets, verdict cleared — the give-up is over); one that still finds
+    nothing is re-stamped and sleeps another `ignored_revisit_days`. The daily cap keeps a large
+    ignored backlog from turning the housekeeping hour into an indexer hammering."""
+    cfg = cfg or core.load_config()
+    days = float(cfg.get("ignored_revisit_days", 90))
+    if days <= 0 or not cfg.get("enabled"):
+        return 0
+    cap = max(1, int(cfg.get("ignored_revisit_per_day", 10)))
+    cut = time.time() - days * 86400
+    with core.db() as c:
+        movies = [dict(r) for r in c.execute(
+            "SELECT * FROM movies WHERE status='ignored' AND COALESCE(revisit_at, updated, 0) < ? "
+            "ORDER BY COALESCE(revisit_at, updated) LIMIT ?", (cut, cap))]
+        eps = [dict(r) for r in c.execute(
+            "SELECT * FROM episodes WHERE status='ignored' AND COALESCE(revisit_at, updated, 0) < ? "
+            "ORDER BY COALESCE(revisit_at, updated) LIMIT ?", (cut, max(0, cap - len(movies))))]
+    reopened = 0
+    for mv in movies:
+        try:
+            cand = candidates(mv["tmdb_id"], cfg)
+        except SearchUnavailable:
+            core.log("revisit: indexer unavailable -> abandoning this pass")
+            return reopened
+        if cand and cand[0]["score"] >= cfg["score_threshold"] \
+                and cand[0]["seeders"] >= cfg["min_seeders"]:
+            core.set_status(mv["tmdb_id"], "pending", expect="ignored", attempts=0, error=None,
+                            progress="", revisit_at=time.time(), **DONOR_RESET, **AI_RESET)
+            reopened += 1
+            core.log(f"revisit: {mv.get('title')} — a usable release now exists -> re-opened")
+        else:
+            core.set_status(mv["tmdb_id"], "ignored", revisit_at=time.time())
+    from . import tv as _tv
+    for e in eps:
+        try:
+            cand = _tv.episode_candidates(e["id"], cfg)
+        except SearchUnavailable:
+            core.log("revisit: indexer unavailable -> abandoning this pass")
+            return reopened
+        if any(x["seeders"] >= cfg["min_seeders"] and not x["tried"] for x in cand):
+            core.set_ep_status(e["id"], "pending", expect="ignored", attempts=0, error=None,
+                               progress="", revisit_at=time.time(), **DONOR_RESET, **AI_RESET)
+            reopened += 1
+            core.log(f"revisit: {e.get('series_title')} "
+                     f"S{e['season']:02d}E{e['episode']:02d} -> re-opened")
+        else:
+            core.set_ep_status(e["id"], "ignored", revisit_at=time.time())
+    if movies or eps:
+        core.log(f"revisit: checked {len(movies) + len(eps)} ignored record(s), "
+                 f"{reopened} re-opened")
+    return reopened
 
 
 # ---------------------------------------------------------------- MUX (mkvmerge)
