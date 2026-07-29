@@ -133,6 +133,16 @@ def _backup_job():
         core.log(f"backup_job error: {e}")
 
 
+def _housekeeping_job():
+    """Daily slow-cadence upkeep, always registered (unlike the backup job, which the operator
+    can turn off): purge expired recycled originals."""
+    try:
+        cfg = core.load_config()
+        pipeline.purge_recycle(cfg)
+    except Exception as e:
+        core.log(f"housekeeping error: {e}")
+
+
 def start():
     cfg = core.load_config()
     _sched.add_job(_search_job, "interval", minutes=cfg["search_interval_min"],
@@ -148,6 +158,8 @@ def start():
     if int(cfg.get("db_backup_keep", 7)) > 0:
         _sched.add_job(_backup_job, "cron", hour=4, minute=0,
                        id="backup", replace_existing=True)
+    _sched.add_job(_housekeeping_job, "cron", hour=4, minute=30,
+                   id="housekeeping", replace_existing=True)
     _sched.start()
     ensure_merge_workers()          # background merger(s) draining the 'ready' queue
     core.log("scheduler started")

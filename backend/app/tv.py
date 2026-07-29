@@ -15,7 +15,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
                        CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
                        run_mux, SearchUnavailable, _sync_fail_reason,
-                       resolve_donor_path)
+                       resolve_donor_path, qc_grafted_audio, _unlink, recycle)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -851,6 +851,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         os.makedirs(os.path.dirname(out), exist_ok=True)
         ok_mux, mux_err = run_mux(["mkvmerge", "-o", out, en_file], out, cfg)
         if ok_mux:
+            # the library file's content is being DISCARDED — recycle it (see pipeline.recycle)
+            recycle(fr, cfg)
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
@@ -960,6 +962,18 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         # almost always the donor's container — blocklist it and fetch another (see pipeline)
         _reject_and_retry_ep(ep, f"mux failed: {mux_err}", cfg, delta, final="error")
         return
+    # verify BEFORE the in-place swap — see pipeline.qc_grafted_audio (audio grafts only)
+    if ids:
+        _beat("episode", ep["id"], "verifying sync of the merged file…")
+        ok_qc, qres, qconf = qc_grafted_audio(out, len(bi["auds"]),
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg,
+                                              tag=f" {ep['id']}")
+        if not ok_qc:
+            _unlink(out)
+            _reject_and_retry_ep(ep, f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
+                                     f"(conf {qconf:.2f})", cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)

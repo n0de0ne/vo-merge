@@ -1583,6 +1583,110 @@ def resolve_donor_path(cfg, dl_hash, cached, tag=""):
 
 
 # ---------------------------------------------------------------- MERGE + FINISH
+def qc_grafted_audio(out, n_base_auds, dur, cfg, tag=""):
+    """Verify the mux we just wrote, before it replaces the library file: cross-correlate the
+    FIRST grafted audio track against the base's own track inside the single output file.
+
+    A confident-but-wrong sync is the one failure nothing downstream can ever detect. The gap
+    decision sees the language as present, the record closes as merged, the donor is deleted,
+    the original was replaced in place — and a re-merge can't fix it, because a new donor
+    "contributes nothing" for a language that reads as covered. The only detector left was a
+    human watching the film. This check is the machine version of that viewing: mkvmerge orders
+    output tracks by input, so the base's audio occupies indexes 0..n_base_auds-1 and the first
+    grafted track sits at n_base_auds; if the applied offset was right, the residual between
+    them is ~0 (different languages correlate through music and effects — the same signal
+    `resync_movie` has always used to repair these by hand).
+
+    Asymmetric on purpose: rejection requires CONFIDENT evidence of misalignment (conf ≥
+    qc_min_conf AND |residual| > qc_max_offset_ms). An inconclusive measurement — dialogue-free
+    windows, wildly different mixes — accepts the merge, because burning the retry budget on
+    absent evidence would reject good merges of quiet films. A wrong constant offset is caught
+    reliably; a wrong drift shows up as windows that disagree, which lands in the inconclusive
+    bucket — narrower coverage, stated honestly.
+
+    Returns (ok, residual_ms|None, conf)."""
+    if not cfg.get("postmerge_qc", True) or n_base_auds < 1:
+        return True, None, 0.0
+    try:
+        m, c = sync.audio_consensus(out, 0, n_base_auds, dur, cfg, tag=f"{tag} qc")
+    except Exception as e:
+        core.log(f"qc{tag}: consensus failed ({e}) — inconclusive, accepting")
+        return True, None, 0.0
+    if m is None or c < float(cfg.get("qc_min_conf", 0.35)):
+        core.log(f"qc{tag}: inconclusive (conf {c:.2f}) — accepting")
+        return True, (None if m is None else int(round(m))), c
+    if abs(m) > int(cfg.get("qc_max_offset_ms", 1500)):
+        core.log(f"qc{tag}: grafted audio is OFF by {int(m):+d}ms (conf {c:.2f}) — rejecting "
+                 f"the merge before it reaches the library")
+        return False, int(round(m)), c
+    core.log(f"qc{tag}: grafted audio aligned ({int(m):+d}ms residual, conf {c:.2f})")
+    return True, int(round(m)), c
+
+
+RECYCLE_DIRNAME = ".vo-merge-recycle"
+
+
+def recycle(path, cfg=None):
+    """Move a library file whose CONTENT is about to be discarded into the recycle area, keyed
+    by its library-relative path, instead of deleting it.
+
+    Only the replacement outcomes need this (`_place_multi`, the TV direct remux): there the
+    download *becomes* the library file and the original's video is genuinely gone. A graft
+    output carries every track the base had, so recycling those would double the disk cost of
+    every merge for nothing. The dot-name keeps Plex from indexing the area; the mtime is
+    re-stamped so the TTL counts from recycling, not from when the film was ripped years ago.
+
+    Returns the recycled path, or None when recycling is off/impossible — callers then fall
+    back to the old destructive behaviour rather than blocking the pipeline."""
+    cfg = cfg or core.load_config()
+    if float(cfg.get("recycle_keep_days", 7)) <= 0:
+        return None
+    mount = cfg.get("media_mount", "/media")
+    try:
+        rel = os.path.relpath(path, mount)
+        if rel.startswith(".."):
+            rel = os.path.basename(path)
+        dest = os.path.join(mount, RECYCLE_DIRNAME, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.exists(dest):
+            dest += f".{int(time.time())}"
+        shutil.move(path, dest)
+        os.utime(dest, None)
+        core.log(f"recycle: kept {rel} for {int(float(cfg.get('recycle_keep_days', 7)))}d")
+        return dest
+    except Exception as e:
+        core.log(f"recycle: {path} failed ({e}) — falling back to the old delete")
+        return None
+
+
+def purge_recycle(cfg=None):
+    """Drop recycled originals older than `recycle_keep_days` and prune emptied folders.
+    Runs from the daily housekeeping job. Returns how many files were purged."""
+    cfg = cfg or core.load_config()
+    root = os.path.join(cfg.get("media_mount", "/media"), RECYCLE_DIRNAME)
+    if not os.path.isdir(root):
+        return 0
+    keep_s = max(0.0, float(cfg.get("recycle_keep_days", 7))) * 86400
+    now, n = time.time(), 0
+    for r, _dirs, files in os.walk(root, topdown=False):
+        for f in files:
+            p = os.path.join(r, f)
+            try:
+                if now - os.path.getmtime(p) > keep_s:
+                    os.remove(p)
+                    n += 1
+            except OSError:
+                pass
+        if r != root:
+            try:
+                os.rmdir(r)
+            except OSError:
+                pass
+    if n:
+        core.log(f"recycle: purged {n} expired original(s)")
+    return n
+
+
 def _video_quality(path, dur):
     """(height, video_bitrate) — to pick the better-looking source. mkv often omits
     per-stream bitrate, so fall back to filesize/duration."""
@@ -1844,6 +1948,20 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         # final="error" keeps the escalation honest once the budget is spent.
         reject_and_retry(tmdb_id, f"mux failed: {err}", cfg, delta, final="error")
         return
+    # Verify before the swap. Only audio grafts are checkable (a subtitle has no waveform);
+    # a rejected output is unlinked and the donor blocklisted like any other failed sync.
+    if ids:
+        _beat("movie", tmdb_id, "verifying sync of the merged file…")
+        ok_qc, qres, qconf = qc_grafted_audio(out, len(bi["auds"]),
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg,
+                                              tag=f" {tmdb_id}")
+        if not ok_qc:
+            _unlink(out)
+            reject_and_retry(tmdb_id,
+                             f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
+                             f"(conf {qconf:.2f})", cfg, delta,
+                             final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
     # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single
     # /set_sync keep skipping detection for every future donor this record ever gets — the same
     # replay bug the flag exists to prevent, just gated behind one manual fix. The offset itself
@@ -1977,6 +2095,13 @@ def finish_movie(tmdb_id, cfg=None):
     dest = os.path.join(libdir, os.path.basename(merged))
     mergedir = os.path.dirname(merged)
     try:
+        # A REPLACED file's content is genuinely discarded — the download became the library
+        # file, the original's video is gone. Recycle it so a bad replacement is reversible by
+        # machine for recycle_keep_days. A grafted output carries every track the base had, so
+        # the graft path keeps the old (cheap) delete/overwrite below. When the paths are EQUAL
+        # this must happen before the move, which would otherwise silently overwrite.
+        if mv.get("merge_kind") == "replaced" and os.path.exists(donor):
+            recycle(donor, cfg)          # None (off/failed) -> the old destructive path below
         shutil.move(merged, dest)
         # remove the old FR-only library file (its seed copy, if any, is a separate path)
         if os.path.exists(donor) and os.path.abspath(donor) != os.path.abspath(dest):

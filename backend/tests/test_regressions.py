@@ -1074,3 +1074,64 @@ def test_wide_probe_rescue_gates(app_env, monkeypatch):
                                       dict(cfg, sync_probe_lag_s=60)) is None, \
         "no point re-searching NARROWER than the pass that already failed"
     assert not called
+
+
+# ------------------------------------------------------------------ autonomy phase 3
+# At full autonomy nobody watches the output, so the pipeline verifies its own work — and what
+# a replacement discards stays reversible by machine.
+
+def test_qc_rejects_only_on_confident_misalignment(app_env, monkeypatch):
+    """A confident-but-wrong sync was the one failure nothing downstream could detect: the
+    language reads as present, the record closes, the donor is deleted. QC must catch exactly
+    that — and must NOT reject good merges of quiet films on absent evidence."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (3800, 0.8))
+    ok, res, conf = pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)
+    assert ok is False and res == 3800, "confident large residual must reject"
+    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (120, 0.9))
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (3800, 0.1))
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True, \
+        "low confidence = inconclusive = accept (absence of evidence)"
+    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: (None, 0.0))
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    called = []
+    monkeypatch.setattr(sync, "audio_consensus", lambda *a, **k: called.append(1) or (0, 1.0))
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000,
+                                     dict(cfg, postmerge_qc=False))[0] is True
+    assert not called, "postmerge_qc off must not decode anything"
+
+
+def test_recycle_keeps_replaced_originals_and_purges_on_ttl(app_env, tmp_path):
+    """_place_multi and the TV direct remux DISCARD the library file outright — the only merge
+    outcomes that destroy content. The recycle bin makes a bad replacement reversible by machine
+    for recycle_keep_days; the mtime is re-stamped so a years-old rip doesn't expire at once."""
+    import time as _t
+    from app import pipeline
+    media_root = tmp_path / "media"
+    lib = media_root / "Films" / "Movie (2003)"
+    lib.mkdir(parents=True)
+    f = lib / "Movie (2003).mkv"
+    f.write_text("original video")
+    old = _t.time() - 10 * 86400
+    os.utime(f, (old, old))                             # ripped long ago
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media_root), recycle_keep_days=7)
+    dest = pipeline.recycle(str(f), cfg)
+    assert dest and os.path.exists(dest) and not f.exists()
+    assert pipeline.RECYCLE_DIRNAME in dest and dest.endswith("Movie (2003).mkv")
+    assert pipeline.purge_recycle(cfg) == 0, "freshly recycled must survive the purge (mtime restamped)"
+    os.utime(dest, (old, old))                          # now it HAS sat there past the TTL
+    assert pipeline.purge_recycle(cfg) == 1
+    assert not os.path.exists(dest)
+    assert not os.path.exists(os.path.dirname(dest)), "emptied recycle folders are pruned"
+
+
+def test_recycle_disabled_falls_back_to_the_old_destructive_path(app_env, tmp_path):
+    from app import pipeline
+    f = tmp_path / "media" / "Films" / "x.mkv"
+    f.parent.mkdir(parents=True)
+    f.write_text("v")
+    cfg = dict(app_env.DEFAULTS, media_mount=str(tmp_path / "media"), recycle_keep_days=0)
+    assert pipeline.recycle(str(f), cfg) is None
+    assert f.exists(), "recycle off must not touch the file — the caller overwrites/deletes it"

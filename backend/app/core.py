@@ -167,6 +167,23 @@ DEFAULTS = {
     "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
     "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
     "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
+    "postmerge_qc": True,                  # after a graft, cross-correlate the grafted audio
+                                           # against the base's own track IN THE OUTPUT before
+                                           # the library swap. A confident-but-wrong sync is the
+                                           # one failure nothing downstream can ever detect: the
+                                           # language reads as present, the record closes, the
+                                           # donor is deleted. Costs seconds per merge.
+    "qc_min_conf": 0.35,                   # below this the QC verdict is 'inconclusive' and the
+                                           # merge is ACCEPTED — absence of evidence is not
+                                           # evidence of misalignment
+    "qc_max_offset_ms": 1500,              # a confident residual offset beyond this rejects the
+                                           # merge (blocklist donor, try another release)
+    "recycle_keep_days": 7,                # originals DISCARDED by a replacement (_place_multi /
+                                           # TV direct remux) go to <media>/.vo-merge-recycle for
+                                           # this many days instead of being destroyed, so a bad
+                                           # replacement is reversible by machine. 0 = old
+                                           # destructive behaviour. Grafts don't recycle: their
+                                           # output carries every track the original had.
     "mux_timeout_min": 240,                # kill an mkvmerge that runs longer than this. It is a
                                            # deadlock guard, not a tuning knob — a wedged mux (a
                                            # stalled /mnt/user read, a hung iGPU decode) held the
