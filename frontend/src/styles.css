@@ -416,3 +416,13 @@ button.btn.small { padding: 3px 9px; font-size: 11.5px; }
 /* Prioritised: someone asked for this title, so it runs ahead of the backlog in both the
    search sweep and the merge queue. */
 .prio { color: #ffc857; margin-right: 5px; font-size: 12px; }
+
+/* ---- completion forecast ----
+   Shows the working, not just a date: how many files are left and at what measured rate. The
+   "none" variant is used when the backend declines to give a date (no rate, or a blocked
+   remainder) — an absent estimate has to look different from a confident one. */
+.fc-hero { font-size: 22px; font-weight: 600; letter-spacing: -0.2px; }
+.fc-hero .muted { font-size: 13px; font-weight: 400; }
+.fc-hero.ok { color: #5ee9a0; }
+.fc-hero.none { color: #ffb3b3; font-size: 17px; }
+button.btn.sec.active { background: #2b6cb0; border-color: #3182ce; color: #fff; }

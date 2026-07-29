@@ -283,6 +283,29 @@ codes, not the track list — so a library grafted before this fix needs a **re-
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
 
+## "When will the library be at 90%?" (`GET /api/forecast?target=`)
+
+Answerable from what is already kept, and worth wiring up precisely because the intuitive answer
+is wrong: the coverage percentage moves slowly enough that eyeballing it tells you nothing.
+
+- **Denominator**: the `probes` inventory, via `_inventory` — the same classifier `/coverage` and
+  `/library` use, so the forecast can't disagree with the chart above it about what "complete"
+  means.
+- **Rate**: real completions only, using the module-level `DID_WORK` predicate that also drives
+  Recently merged and the 24h/7d counters (hoisted out of the dashboard for exactly this reason).
+  Divided by the span actually OBSERVED, not the nominal window — a 30-day rate on a three-day-old
+  install must not divide by 30. The `+1` in that span is not a fudge: a merge two days ago means
+  activity across three days, so first-to-now understates it by one.
+- **`blocked`** is the honest part. The remaining incomplete files are not uniformly reachable —
+  `no_release` has nothing to find, `ignored` is a deliberate give-up, and an unreadable file is
+  not a language problem at all. When those alone put the target out of reach the ETA is
+  **withheld** and the reason says what needs unblocking, rather than emitting a confident date
+  the pipeline cannot deliver. Same when nothing has completed in 30 days: no rate, no date.
+
+The Overview panel shows the working (files left, measured rate) rather than just a date, and
+renders the no-date case differently, because an absent estimate must not look like a confident
+one. It is a straight-line projection and says so.
+
 ## Priority — a requested title must not queue behind the backlog
 
 Both queues are ordered by recency: `stage_search` walks `pending` by `updated`, and the merge

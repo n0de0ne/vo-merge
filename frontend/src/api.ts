@@ -98,6 +98,17 @@ export interface CoverageLib {
   audio_of?: Record<string, number>; subs_of?: Record<string, number>;
   targets: { audio: string[]; subs: string[] };
 }
+// When the library reaches a target %, at the rate it is actually going. `eta_days` is null
+// when there is no rate to project from, or when the remaining files are blocked rather than
+// merely pending — `reason` says which, so the panel never shows a date it can't stand behind.
+export interface Forecast {
+  target: number; total: number; complete: number; unreadable: number;
+  pct: number | null; needed: number;
+  rate: Record<string, number>; rate_used: number;
+  blocked: { no_release: number; ignored: number; unreadable: number };
+  eta_days: number | null; eta_ts?: number; reason: string; now: number;
+  libraries: { name: string; total: number; complete: number; pct: number }[];
+}
 export interface Coverage {
   libraries: CoverageLib[]; total: number; complete: number; unreadable: number; probed: number;
 }
@@ -256,6 +267,7 @@ export const api = {
     j<RescanStart>(`/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   coverage: () => j<Coverage>("/api/coverage"),
+  forecast: (target = 90) => j<Forecast>(`/api/forecast?target=${target}`),
   // re-probe everything in a settled state (merged / no_release) and re-open what's below target
   recheck: (scope: "all" | "films" | "tv" | "anime" | "series" = "all") =>
     j<{ ok: boolean; started: boolean; note?: string }>(

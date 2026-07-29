@@ -751,3 +751,84 @@ def test_setting_priority_does_not_disturb_status_or_updated(app_env):
     app_env.set_priority("movie", 11, 1)
     mv = app_env.get_movie(11)
     assert mv["status"] == "downloading" and mv["updated"] == 4242 and mv["priority"] == 1
+
+
+# ------------------------------------------------------------------ completion forecast
+def _seed_library(core_, complete, incomplete, merged_per_day=10, days=60):
+    import time as _t
+    now = _t.time()
+    for i in range(complete + incomplete):
+        core_.put_probe(f"/media/Films/F{i}/f{i}.mkv",
+                        auds="fre,eng" if i < complete else "fre",
+                        subs="fre,eng" if i < complete else "fre")
+    for i in range(merged_per_day * days):
+        core_.upsert_movie({"tmdb_id": 10000 + i, "imdb_id": f"t{i}", "radarr_id": i,
+                            "title": f"M{i}", "original_title": f"M{i}", "year": 2020,
+                            "original_lang": "french", "french_path": f"/media/Films/F{i}/f{i}.mkv",
+                            "quality": "1080p"})
+        core_.set_status(10000 + i, "merged", added_langs="eng", merge_kind="grafted",
+                         merged_at=now - (i // merged_per_day) * 86400)
+    return now
+
+
+def test_forecast_projects_from_the_measured_completion_rate(app_env):
+    """700/1000 complete, 10 real merges a day -> 200 more files for 90%, so 20 days. The rate
+    must come from the SAME predicate as Recently merged, or the headline number and the list
+    under it would tell different stories."""
+    from app import main
+    app_env.save_config({"media_mount": "/media"})
+    _seed_library(app_env, complete=700, incomplete=300)
+    f = main.forecast(90.0)
+    assert (f["total"], f["complete"], f["needed"]) == (1000, 700, 200)
+    assert f["rate_used"] == 10.0
+    assert f["eta_days"] == 20.0
+
+
+def test_forecast_gives_no_date_when_the_remainder_is_blocked(app_env):
+    """The remaining files are not uniformly reachable: `no_release` has nothing to find and
+    `ignored` is a deliberate give-up. Extrapolating the current rate across those would produce
+    a confident date the pipeline cannot deliver."""
+    from app import main
+    app_env.save_config({"media_mount": "/media"})
+    _seed_library(app_env, complete=700, incomplete=300)
+    for n, i in enumerate(range(20000, 20280)):
+        app_env.upsert_movie({"tmdb_id": i, "imdb_id": f"b{i}", "radarr_id": i, "title": f"B{i}",
+                              "original_title": f"B{i}", "year": 2020, "original_lang": "french",
+                              "french_path": f"/media/Films/F{700 + n}/f{700 + n}.mkv",
+                              "quality": "1080p"})
+        app_env.set_status(i, "no_release" if n < 200 else "ignored")
+    f = main.forecast(90.0)
+    assert f["eta_days"] is None
+    assert f["blocked"]["no_release"] == 200 and f["blocked"]["ignored"] == 80
+    assert "unblocked" in f["reason"]
+
+
+def test_forecast_gives_no_date_with_no_completions_to_project_from(app_env):
+    from app import main
+    app_env.save_config({"media_mount": "/media"})
+    _seed_library(app_env, complete=10, incomplete=90, merged_per_day=0, days=0)
+    f = main.forecast(90.0)
+    assert f["eta_days"] is None and "no rate" in f["reason"]
+
+
+def test_forecast_does_not_understate_the_rate_on_a_young_install(app_env):
+    """A 30-day window on an install that is three days old must divide by the span actually
+    observed, not by 30 — otherwise a busy new setup reports a tenth of its real throughput."""
+    from app import main
+    app_env.save_config({"media_mount": "/media"})
+    _seed_library(app_env, complete=700, incomplete=300, merged_per_day=10, days=3)
+    assert main.forecast(90.0)["rate"]["30d"] == 10.0
+
+
+def test_forecast_reports_target_already_met(app_env):
+    from app import main
+    app_env.save_config({"media_mount": "/media"})
+    _seed_library(app_env, complete=950, incomplete=50)
+    f = main.forecast(90.0)
+    assert f["needed"] == 0 and f["eta_days"] == 0 and "already at" in f["reason"]
+
+
+def test_forecast_needs_a_probed_library(app_env):
+    from app import main
+    f = main.forecast(90.0)
+    assert f["eta_days"] is None and "probed" in f["reason"]

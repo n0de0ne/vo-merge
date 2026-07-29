@@ -1,5 +1,5 @@
 """FastAPI app: REST API + serves the built React SPA."""
-import hmac, os, subprocess, time
+import hmac, math, os, subprocess, time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
@@ -430,6 +430,16 @@ def do_rescan(forget: bool = False, scope: str = "all"):
 BROKEN_ERR = "no audio track"
 
 
+# What counts as vo-merge having actually CHANGED a file. `replaced` legitimately records no
+# added languages (the download became the file), so it can only be recognised by its kind; a
+# `grafted` row that recorded nothing added says nothing about what the app did, and `already`
+# (a scan closing out a file that was correct on its own) is not work at all. Recently-merged,
+# the 24h/7d counters and the completion forecast all read this, so they cannot disagree about
+# what a completion is.
+DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
+            "OR COALESCE(added_subs,'') != '')")
+
+
 def _inventory(cfg, cols="path, auds, subs, err"):
     """Every probed library file, classified against the profile its library targets.
 
@@ -473,6 +483,108 @@ def _inventory(cfg, cols="path, auds, subs, err"):
         have_s = {x for x in (r["subs"] or "").split(",") if x}
         yield (r, top, kind, want_a, want_s, have_a, have_s,
                [k for k in want_a if k not in have_a], [k for k in want_s if k not in have_s])
+
+
+@api.get("/forecast")
+def forecast(target: float = 90.0):
+    """When the library reaches `target`% complete, at the rate it is actually going.
+
+    Every input is measured, not assumed: the denominator is the probe inventory (the only
+    complete list of files), a "completion" is the same DID_WORK predicate that drives Recently
+    merged, and the rate is divided by the observed span rather than the nominal window — an
+    install three days old must not have its 30-day rate divided by 30.
+
+    The honest part is `blocked`. The remaining incomplete files are not uniformly reachable: a
+    record in `no_release` has nothing to find, `ignored` is a deliberate give-up, and an
+    unreadable file is not a language problem at all. Extrapolating the current rate straight
+    across those would produce a confident date the pipeline cannot deliver, so they are counted
+    and reported, and when they alone put the target out of reach the ETA is withheld rather than
+    guessed."""
+    if not 0 < target <= 100:
+        raise HTTPException(422, "target must be a percentage in (0, 100]")
+    cfg = core.load_config()
+    total = complete = unreadable = 0
+    incomplete_paths = []
+    per_lib = {}
+    for row, top, kind, wa, ws, ha, hs, ma, ms in _inventory(cfg):
+        lib = per_lib.setdefault(top, {"name": top, "total": 0, "complete": 0})
+        total += 1; lib["total"] += 1
+        if row["err"]:
+            unreadable += 1
+        elif not ma and not ms:
+            complete += 1; lib["complete"] += 1
+        else:
+            incomplete_paths.append(row["path"])
+    if not total:
+        return {"target": target, "total": 0, "complete": 0, "pct": None, "eta_days": None,
+                "reason": "nothing has been probed yet — run a library re-read first"}
+
+    pct = 100.0 * complete / total
+    need = max(0, math.ceil(total * target / 100.0) - complete)
+
+    # How many of the incomplete files cannot move on their own.
+    blocked = {"no_release": 0, "ignored": 0, "unreadable": unreadable}
+    if incomplete_paths:
+        with core.db() as c:
+            stat = {}
+            for t in ("movies", "episodes"):
+                for r in c.execute(f"SELECT french_path p, status s FROM {t} "
+                                   f"WHERE french_path IS NOT NULL"):
+                    stat[r["p"]] = r["s"]
+        for p in incomplete_paths:
+            st = stat.get(p)
+            if st in ("no_release", "ignored"):
+                blocked[st] += 1
+
+    # Rate, from real completions, over the span actually observed.
+    now = time.time()
+    rates = {}
+    with core.db() as c:
+        first = min((r["t"] for r in c.execute(
+            f"SELECT MIN(COALESCE(merged_at, updated)) t FROM movies WHERE status='merged' "
+            f"AND {DID_WORK} UNION ALL SELECT MIN(COALESCE(merged_at, updated)) t FROM episodes "
+            f"WHERE status='merged' AND {DID_WORK}") if r["t"]), default=None)
+        for label, days in (("7d", 7), ("30d", 30)):
+            since = now - days * 86400
+            n = sum(c.execute(
+                f"SELECT COUNT(*) n FROM {t} WHERE status='merged' AND {DID_WORK} "
+                "AND COALESCE(merged_at, updated) >= ?", (since,)).fetchone()["n"]
+                for t in ("movies", "episodes"))
+            # Divide by the span actually observed, so a young install isn't understated — a
+            # 30-day window on a 3-day-old install must not divide by 30. The +1 is not a fudge:
+            # a merge that happened 2 days ago means activity across 3 days (that day, and the
+            # two since), so first-to-now understates the span by exactly one day.
+            span = days if first is None else max(1.0, min(days, (now - first) / 86400.0 + 1.0))
+            rates[label] = round(n / span, 2)
+
+    # Prefer the longer window (steadier); fall back to the short one while young.
+    rate = rates["30d"] or rates["7d"]
+    out = {"target": target, "total": total, "complete": complete, "unreadable": unreadable,
+           "pct": round(pct, 1), "needed": need, "rate": rates, "rate_used": rate,
+           "blocked": blocked, "now": now,
+           "libraries": [dict(v, pct=round(100.0 * v["complete"] / v["total"], 1))
+                         for v in per_lib.values() if v["total"]]}
+    if need == 0:
+        out["eta_days"] = 0
+        out["reason"] = f"already at {pct:.1f}%"
+        return out
+    if not rate:
+        out["eta_days"] = None
+        out["reason"] = ("nothing has completed in the last 30 days, so there is no rate to "
+                         "project from")
+        return out
+    reachable = len(incomplete_paths) - blocked["no_release"] - blocked["ignored"]
+    if reachable < need:
+        out["eta_days"] = None
+        out["reason"] = (f"{need} more file(s) needed but only {max(0, reachable)} are reachable — "
+                         f"{blocked['no_release']} have no release and {blocked['ignored']} were "
+                         f"given up on. The target needs those unblocked, not more time.")
+        return out
+    days = need / rate
+    out["eta_days"] = round(days, 1)
+    out["eta_ts"] = now + days * 86400
+    out["reason"] = f"{need} file(s) at {rate}/day"
+    return out
 
 
 @api.get("/coverage")
@@ -1734,8 +1846,7 @@ def dashboard():
         # A 'grafted' row with nothing recorded as added is a contradiction — it adds no
         # information about what the app did, so it stays out. `already` (the scan closing out a
         # file that was correct on its own) is excluded by both clauses, which is the point.
-        DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
-                    "OR COALESCE(added_subs,'') != '')")
+        # (module-level DID_WORK — the forecast has to count the same thing)
         recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],
                    "subs": r["added_subs"], "how": r["merge_kind"] or "grafted",
                    "poster": r["poster"], "ts": r["merged_at"] or r["updated"]}

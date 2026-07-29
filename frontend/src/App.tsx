@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
-  CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
+  CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState,
+  Forecast } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -496,6 +497,60 @@ function LibBar({ l }: { l: CoverageLib }) {
   );
 }
 
+// "When does the library hit 90%?" — answerable from data we already keep: the probe inventory
+// is the denominator, and Recently-merged's own DID_WORK predicate is the rate. Deliberately
+// shows the working (how many left, at what rate) rather than just a date, and shows NO date when
+// the backend says the remainder is blocked rather than merely pending.
+function ForecastPanel() {
+  const [f, setF] = useState<Forecast | null>(null);
+  const [err, setErr] = useState("");
+  const [target, setTarget] = useState(() => {
+    const v = Number(localStorage.getItem("vo.forecastTarget")); return v > 0 && v <= 100 ? v : 90;
+  });
+  usePoll(() => api.forecast(target).then(x => { setF(x); setErr(""); })
+    .catch(e => setErr(e.message || "forecast unavailable")), 300000, [target]);
+  const pick = (v: number) => { setTarget(v); localStorage.setItem("vo.forecastTarget", String(v)); };
+  if (err) return null;                       // coverage already reports a dead backend
+  if (!f || !f.total) return null;
+  const eta = f.eta_days != null && f.eta_ts
+    ? new Date(f.eta_ts * 1000).toLocaleDateString(undefined,
+        { year: "numeric", month: "short", day: "numeric" })
+    : null;
+  const blocked = f.blocked.no_release + f.blocked.ignored;
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 8 }}>
+        <b>Forecast</b>
+        <span className="muted">at {f.pct}% now · {f.rate_used}/day over the last 30d</span>
+        <div className="spacer" />
+        {[80, 90, 95, 100].map(v =>
+          <button key={v} className={"btn sec" + (v === target ? " active" : "")}
+                  onClick={() => pick(v)}>{v}%</button>)}
+      </div>
+      {f.needed === 0
+        ? <div className="fc-hero ok">Already at {f.pct}% — target met 🎉</div>
+        : eta
+          ? <div className="fc-hero">~{eta}
+              <span className="muted"> · {f.eta_days} days · {f.needed.toLocaleString()} file(s) to go</span>
+            </div>
+          : <div className="fc-hero none">No date yet
+              <span className="muted"> · {f.reason}</span>
+            </div>}
+      {blocked > 0 && f.needed > 0 &&
+        <div className="sub" style={{ marginTop: 6 }}>
+          {blocked.toLocaleString()} of the remaining files can’t move on their own:{" "}
+          {f.blocked.no_release.toLocaleString()} found no release,{" "}
+          {f.blocked.ignored.toLocaleString()} were given up on
+          {f.blocked.unreadable > 0 && <> · {f.blocked.unreadable.toLocaleString()} unreadable</>}.
+        </div>}
+      <div className="sub muted" style={{ marginTop: 6 }}>
+        Straight-line from the last 30 days ({f.rate["7d"]}/day over 7d). It assumes the rate holds
+        and that what’s left is as findable as what’s done — neither is guaranteed.
+      </div>
+    </div>
+  );
+}
+
 function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
   const [c, setC] = useState<Coverage | null>(null);
   const [err, setErr] = useState("");
@@ -984,6 +1039,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       </div>
 
       <CoveragePanel goto={goto} />
+      <ForecastPanel />
 
       <div className="dash-cols">
         <div className="panel">
