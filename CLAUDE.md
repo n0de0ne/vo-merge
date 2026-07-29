@@ -932,12 +932,18 @@ and its outcome is written back so failures surface for a human:
 
 vo-merge writes **one ticket per record** into `/config/ai-tickets/` (`review-m{id}` /
 `review-e{id}` — the same shape for an auto-page and the operator's Send-to-AI button). The
-consumer is ideally the **sidecar dispatcher** (`deploy/dispatcher/`): a container running the
-Claude Code CLI in a loop, supervised by the platform (`restart` + healthcheck), speaking a
-take/ack protocol — claim a ticket by renaming it into `claimed/`, delete it on the callback,
-retry a crashed run and dead-letter it into `dead/` after `MAX_ATTEMPTS`, and **touch
-`.heartbeat` every cycle**. The legacy Unraid user-script cron still works (per-record tickets
-are what it already handled); it just never writes a heartbeat.
+consumer is the **resident dispatcher** (`deploy/dispatcher/`), which speaks a take/ack
+protocol — claim a ticket by renaming it into `claimed/`, delete it on the callback, retry a
+crashed run and dead-letter it into `dead/` after `MAX_ATTEMPTS`, and **touch `.heartbeat`
+every cycle**. Two editions, same protocol:
+
+- **`dispatcher.sh` on the Unraid host (the deployed one)** — a User Scripts loop ("At First
+  Array Start Only", or hourly with `ONESHOT=1`) running the host's already-logged-in `claude`
+  CLI, i.e. the operator's **Claude subscription, not API-key billing**. This replaces the
+  legacy ticket cron: same tickets directory, but the legacy script never wrote a heartbeat or
+  claimed/dead-lettered, so a dead cron was indistinguishable from a slow one.
+- **`dispatcher.py` in a container** — for non-Unraid hosts; auths by mounting the host's
+  `~/.claude` login (subscription) or an `ANTHROPIC_API_KEY`.
 
 Why this shape — the previous one failed silently: the host cron died, tickets piled up, every
 record aged past `ai_stale_min`, and the whole backlog flipped to "AI did not respond", which
@@ -1131,8 +1137,9 @@ channel), `dep_down_alarm_min`, `disk_floor_gb`, `transient_max`, `sync_wide_pro
 `ignored_revisit_per_day`, `auto_repair`. All are validated like every other key; the newer ones
 are edited via `config.json` / `POST /api/settings` until the Settings page grows fields for
 them. **The autonomous posture** is: `enabled: true`, `grab_mode: "auto"`, `ai_tickets: true`, a
-running dispatcher (sidecar preferred), and a `notify_url` — `sync_review: true` is then safe,
-because `review` parks records for an actor that actually exists.
+running dispatcher (`deploy/dispatcher/dispatcher.sh` on the Unraid host — the CLI's
+subscription auth, no API key), and a `notify_url` — `sync_review: true` is then safe, because
+`review` parks records for an actor that actually exists.
 Most of these are editable in the UI under **Settings → Queues & limits**.
 
 **Settings are validated** (`main._validate_settings`): each value is coerced to the type of its
