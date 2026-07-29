@@ -21,6 +21,12 @@ RATE_RATIOS = (
 )
 
 
+def _decode_timeout(cfg):
+    """Seconds after which one decode pass is killed. Each pass reads a bounded window, so a
+    run past this is wedged, not slow — and an unbounded one holds the merge worker forever."""
+    return max(60, int(cfg.get("sync_decode_timeout_min", 30)) * 60)
+
+
 def fps_close(a, b, tol=0.03):
     """True if framerates are close enough that a constant offset still works.
     23.976 vs 24.0 (0.1%) -> ok; 25 vs 23.976 (4%) -> not (PAL speedup, would drift)."""
@@ -74,7 +80,8 @@ def ratio_detect(base, donor, dur, cfg, base_fps=None, donor_fps=None,
         res = ratio_scan(base, donor, ratios, start=int(start), dur=int(span),
                          threads=cfg.get("sync_ffmpeg_threads", 4),
                          hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-                         device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+                         device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"),
+                         timeout=_decode_timeout(cfg))
     except Exception as e:
         core.log(f"sync{tag}: rate-ratio scan failed: {e}")
         return None
@@ -118,7 +125,8 @@ def audio_consensus(path, ref_ai, shift_ai, dur, cfg, tag=""):
     res = []
     for (s, d) in wins:
         try:
-            m, c = detect_offset_ms(path, ref_ai, path, shift_ai, start=int(s), dur=int(d))
+            m, c = detect_offset_ms(path, ref_ai, path, shift_ai, start=int(s), dur=int(d),
+                                    timeout=_decode_timeout(cfg))
             if m is not None:
                 res.append((m, c))
         except Exception:
@@ -160,7 +168,8 @@ def verify_hint(base, donor, dur, hint, cfg, tag=""):
             res = ratio_scan(base, donor, [hd], start=int(s), dur=int(d),
                              threads=cfg.get("sync_ffmpeg_threads", 4),
                              hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-                             device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+                             device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"),
+                             timeout=_decode_timeout(cfg))
         except Exception:
             return None
         if res and res[0][2] >= cfg.get("sync_ratio_min_conf", 0.35):
@@ -175,7 +184,8 @@ def verify_hint(base, donor, dur, hint, cfg, tag=""):
             base, donor, start=int(s), dur=int(cfg.get("sync_window_dur", 480)),
             threads=cfg.get("sync_ffmpeg_threads", 4),
             hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-            device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+            device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"),
+            timeout=_decode_timeout(cfg))
     except Exception:
         return None
     if m is not None and c >= 0.5 and abs(m - ho) <= 150:
@@ -227,7 +237,8 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
                 max_lag_s=cfg.get("sync_max_lag_s", 120),
                 threads=cfg.get("sync_ffmpeg_threads", 4),
                 hwaccel=cfg.get("sync_hwaccel", "vaapi"),
-                device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"))
+                device=cfg.get("sync_hwaccel_device", "/dev/dri/renderD128"),
+                timeout=_decode_timeout(cfg))
         except Exception as e:
             core.log(f"sync{tag}: video window {int(s)}s error: {e}"); m, c = None, 0.0
         if m is not None and c >= 0.3:
@@ -277,7 +288,8 @@ def detect(base, donor, base_ai, donor_ai, dur, cfg, tag="", on_progress=None, h
     s, d = wins[len(wins) // 2]
     try:
         am, ac = detect_offset_ms(base, base_ai, donor, donor_ai, start=int(s), dur=int(d),
-                                  max_lag_s=cfg.get("sync_max_lag_s", 120))
+                                  max_lag_s=cfg.get("sync_max_lag_s", 120),
+                                  timeout=_decode_timeout(cfg))
     except Exception:
         am, ac = None, 0.0
     if am is not None and ac >= max(amin, 0.35):

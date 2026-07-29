@@ -33,6 +33,21 @@ def enabled(cfg):
 # The ticket payload. Built here rather than in main.py so an operator escalation and the
 # automatic sweep hand the dispatcher byte-for-byte the same brief.
 
+def _api_hint():
+    """How the dispatcher should reach this API. The host URL was hard-coded to one install's LAN
+    address; `api_url` overrides it, and the in-container address is always correct."""
+    cfg = core.load_config()
+    host = (cfg.get("api_url") or "").strip()
+    inside = "http://localhost:8080/api (in-container)"
+    return f"{host.rstrip('/')}/api (host) / {inside}" if host else inside
+
+
+def _docs_hint():
+    """Where CLAUDE.md lives on the host, if the operator has said. Was hard-coded to one
+    machine's /mnt/nvme path, which is meaningless anywhere else."""
+    return (core.load_config().get("docs_path") or "").strip() or "CLAUDE.md in the repo"
+
+
 def movie_context(mv):
     """(summary, context) describing ONE movie record and every action that can fix it."""
     record = {k: mv.get(k) for k in
@@ -47,7 +62,7 @@ def movie_context(mv):
         summary += f": {mv['error']}"
     ctx = {
         "record": record,
-        "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+        "api": _api_hint(),
         "read_this_first": f"GET /movie/{tmdb_id}/context — the record, a probe of BOTH files "
                            "(fps/duration/audio tracks) and the matching log lines. Comparing "
                            "the two probes is the diagnosis for most sync and 'nothing to add' "
@@ -83,7 +98,7 @@ def movie_context(mv):
             "(needs_human = a person must decide). This callback is the ONLY signal vo-merge has "
             "that the dispatcher ran at all — a record with no callback is flagged for a human "
             "after ai_stale_min minutes, indistinguishable from one you examined and gave up on."),
-        "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md",
+        "docs": _docs_hint(),
     }
     return summary, ctx
 
@@ -101,7 +116,7 @@ def episode_context(e):
         summary += f": {e['error']}"
     ctx = {
         "record": record,
-        "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+        "api": _api_hint(),
         "read_this_first": f"GET /episode/{ep_id}/context — the record, a probe of both files, "
                            "the matching log lines, EVERY donor file with the (season, episode) "
                            "parsed from it, the series' episode list, and a `numbering` block "
@@ -132,7 +147,7 @@ def episode_context(e):
             "{\"status\":\"resolved|failed|needs_human\",\"verdict\":\"one line\","
             "\"action_taken\":\"what you did\"} so this leaves the operator's manual-review queue. "
             "This callback is the ONLY signal vo-merge has that the dispatcher ran at all."),
-        "docs": "/mnt/nvme/AIWorkspace/vo-merge/dev/vo-merge/CLAUDE.md",
+        "docs": _docs_hint(),
     }
     return summary, ctx
 

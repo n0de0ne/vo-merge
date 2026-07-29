@@ -12,25 +12,32 @@ import numpy as np
 def audio_langs(path):
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
                         "-show_entries", "stream_tags=language", "-of", "json", path],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=120)
     out = []
     for s in json.loads(r.stdout or '{"streams":[]}').get("streams", []):
         out.append((s.get("tags") or {}).get("language", "und"))
     return out
 
 
-def _pcm(path, ai, start, dur, sr):
-    p = subprocess.run(["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2",
-                        "-ss", str(start), "-t", str(dur),
-                        "-i", path, "-map", f"0:a:{ai}", "-ac", "1", "-ar", str(sr),
-                        "-f", "f32le", "-"], capture_output=True)
+def _pcm(path, ai, start, dur, sr, timeout=None):
+    """Decoded mono PCM for one window, or an empty array if the decode failed or hung.
+
+    An empty array leaves the caller below its minimum-samples gate, so a wedged ffmpeg degrades
+    to "no audio answer" instead of blocking the merge worker forever."""
+    try:
+        p = subprocess.run(["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2",
+                            "-ss", str(start), "-t", str(dur),
+                            "-i", path, "-map", f"0:a:{ai}", "-ac", "1", "-ar", str(sr),
+                            "-f", "f32le", "-"], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return np.array([], dtype=np.float64)
     return np.frombuffer(p.stdout, dtype=np.float32).astype(np.float64)
 
 
 def detect_offset_ms(ref_file, ref_ai, shift_file, shift_ai,
-                     sr=8000, start=300, dur=240, max_lag_s=120):
-    a = _pcm(ref_file, ref_ai, start, dur, sr)
-    b = _pcm(shift_file, shift_ai, start, dur, sr)
+                     sr=8000, start=300, dur=240, max_lag_s=120, timeout=None):
+    a = _pcm(ref_file, ref_ai, start, dur, sr, timeout)
+    b = _pcm(shift_file, shift_ai, start, dur, sr, timeout)
     n = min(len(a), len(b))
     if n < sr * 20:                       # need a decent window
         return None, 0.0

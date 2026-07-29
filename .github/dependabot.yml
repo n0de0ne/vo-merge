@@ -1,0 +1,25 @@
+# Pinning without anything that moves the pins is how requests sat on a known CVE for a year and
+# every other dependency drifted 19 months out of date. Monthly, grouped, so it is one PR to
+# review rather than six.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: monthly
+    groups:
+      frontend:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

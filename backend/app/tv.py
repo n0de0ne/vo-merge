@@ -5,7 +5,7 @@ audio onto each French episode (best video kept), in place.
 
 Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scope_series.
 """
-import os, re, subprocess, shutil, time, threading
+import os, re, shutil, time, threading
 from collections import defaultdict
 from . import core, media
 from .clients import Sonarr, Prowlarr, QBittorrent
@@ -13,7 +13,9 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
-                       CLOSEABLE)
+                       CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
+                       run_mux, SearchUnavailable, _sync_fail_reason,
+                       resolve_donor_path)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -276,13 +278,19 @@ def scan(cfg=None, kinds=None, only_series=None, refresh=False):
                 # is a dead end, because stage_search only looks at `pending`.
                 prev = (cur or {}).get("status")
                 st_ = reopen_status(prev, (cur or {}).get("updated"), cfg)
+                extra = {}
                 if st_ != prev and prev:
                     core.log(f"tv scan: {ep_id} is marked {prev} but still needs "
                              f"{'+'.join(miss_a + miss_s)} -> re-opening")
-                core.set_ep_status(ep_id, st_,
+                    # fresh run at the gap: fresh budget, and drop the donor whose offset would
+                    # otherwise be replayed onto the next one (see pipeline)
+                    extra.update(attempts=0, **DONOR_RESET)
+                # expect=prev: never drag a record the merge worker just claimed back to a queued
+                # state (see core._set_row).
+                core.set_ep_status(ep_id, st_, expect=prev,
                                    audio_langs=alangs, sub_langs=slangs, needs=need,
                                    need_audio=",".join(miss_a), need_subs=",".join(miss_s),
-                                   orig_lang=orig_name)
+                                   orig_lang=orig_name, **extra)
             n += 1
     what = "/".join(kinds) if kinds else ("series+anime" if only_series is None
                                           else f"series {only_series}")
@@ -342,8 +350,13 @@ def _size_bonus(r):
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=(),
-            need_subs=()):
-    """Return best (score, seeders, title, link) for a usable release, or None.
+            need_subs=(), tried=()):
+    """Return best (score, seeders, title, link, rid) for a usable release, or None.
+
+    `tried` is the set of release identities this record has already burned. Without it the
+    blocklist every retry path maintains was decorative on the TV side: the search re-ran, scored
+    the same candidates the same way, and re-picked the identical release — the grab -> stall ->
+    blocklist -> re-grab-the-same-thing loop.
     `absn` = this episode's absolute number, so an anime release that numbers absolutely
     ('Title - 51') still matches a search for its aired S04E15.
     `need` = languages still missing; a French-dub-only release is only worth grabbing when
@@ -354,7 +367,11 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     try:
         results = pro.search(query, cfg["en_indexer_ids"])
     except Exception as e:
-        core.log(f"tv search '{query}': {e}"); return None
+        # Unreachable indexer, not "no such release" — see pipeline.SearchUnavailable. Returning
+        # None here made the caller write `no_release` and sit out a 24-hour cooldown on a verdict
+        # nobody reached.
+        core.log(f"tv search '{query}': {e}")
+        raise SearchUnavailable(str(e)) from e
     qt = _toks(query.rsplit(" S", 1)[0] if " S" in query else query)
     best = None
     for r in results:
@@ -379,12 +396,42 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
         sc = min(int(r.get("seeders") or 0), 100)
         if subs_only:      sc += _size_bonus(r)      # harvesting text: smaller is better
         elif RES.search(t): sc += 20
-        if re.search(r'\bMULTI\b', t, re.I): sc += 20
+        # MULTI carries several natively-synced dubs and is what the whole design prefers — the
+        # movie scorer, season_candidates and episode_candidates all weight it +200. This one path
+        # (the AUTOMATIC episode picker) used +20, so the one place the preference decides
+        # something unattended barely expressed it. Subtitle-only keeps the small +40: there the
+        # bonus competes with a size preference, and at +200 a 38 GB pack beat a 2 GB one.
+        if re.search(r'\bMULTI\b', t, re.I): sc += 40 if subs_only else 200
         sc += 60 * media.lang_hits(t, lang_need, query)  # names a language this episode is missing
         link = _pick_link(r)
+        rid = _hash_from_magnet(link) or r.get("guid") or t
+        if rid in tried:
+            continue                     # already grabbed and rejected for this record
         if best is None or sc > best[0]:
-            best = (sc, r.get("seeders") or 0, t, link)
+            best = (sc, r.get("seeders") or 0, t, link, rid)
     return best
+
+
+def _usable(best, cfg):
+    """Is `_search`'s winner worth grabbing? `_search` returns (score, seeders, title, link).
+
+    The bug this fixes was `best[0] < cfg["min_seeders"]` — comparing the SCORE against the seeder
+    minimum. The score starts at min(seeders, 100) and then collects a MULTI bonus and +60 per
+    matching language, so a zero-seed release cleared a floor of 5 comfortably, and the
+    season-pack branch had no floor whatsoever: a dead pack was grabbed, stalled for
+    stall_timeout_min, was blocklisted, and the cycle repeated through every dead pack the indexer
+    listed, burning a grab slot and a 12-hour dl_max_age window each time.
+
+    Only the SEEDER floor is applied, deliberately. `score_threshold` is calibrated against
+    `pipeline.score_release`, which awards bonuses this scorer does not have (+60 resolution
+    match, +30 source match, +80 id match) — so the same number is a far higher bar here. At the
+    default 60 it would demand ~40 seeders of any release that is neither MULTI nor advertises a
+    missing language, which is exactly the shape of an ordinary English release (English is
+    unmarked, so `lang_hits` is 0 for the common case). Rejecting those is worse than the bug."""
+    if not best:
+        return False
+    _score, seeders = best[0], best[1]
+    return seeders >= cfg["min_seeders"]
 
 
 def season_candidates(series_id, season, cfg=None):
@@ -412,7 +459,9 @@ def season_candidates(series_id, season, cfg=None):
     try:
         results = pro.search(query, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
-        core.log(f"season_candidates: {e}"); return []
+        # See pipeline.SearchUnavailable — [] means "no such release", which this is not.
+        core.log(f"season_candidates: {e}")
+        raise SearchUnavailable(str(e)) from e
     qt = _toks(title); out = []
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
@@ -518,7 +567,9 @@ def episode_candidates(ep_id, cfg=None):
         results = pro.search(f"{title} S{season:02d}E{ep:02d}",
                              cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as ex:
-        core.log(f"episode_candidates: {ex}"); return []
+        # See pipeline.SearchUnavailable — [] means "no such release", which this is not.
+        core.log(f"episode_candidates: {ex}")
+        raise SearchUnavailable(str(ex)) from ex
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
@@ -577,7 +628,7 @@ def retry_episode(ep_id, cfg=None):
     # attempts is reset because an operator asking for a retry means "try again": a sync_fail
     # record has already spent its budget and would otherwise fail straight back to sync_fail.
     core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
-                       dl_hash=None, dl_id=None, en_file=None, progress="")
+                       **DONOR_RESET, **AI_RESET, progress="")
     return True
 
 
@@ -634,56 +685,107 @@ def stage_search(cfg=None):
     for (sid, title, season), eps in sorted(by_season.items(), key=_order):
         if n >= cap:
             break
-        if len(eps) >= cfg["tv_pack_threshold"]:
-            q = f"{title} S{season:02d}"
-            best = _search(q, cfg, want_pack=True, season=season,
-                           need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
-                           need_subs={x for e in eps
-                                      for x in (e.get("need_subs") or "").split(",") if x})
-            if best:
-                sc, seed, rtitle, link = best
-                h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
-                if not h:
-                    # grab failed -> mark these eps error (NOT a null-hash download, which would
-                    # loop grab -> reconcile-to-pending -> re-grab forever)
-                    for e in eps:
-                        core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                    core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
-                    n += 1
-                    continue
-                seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
-                claimed = _assign_pack(sid, seasons, h, None, rtitle, cfg)
-                core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
-                         f"(seasons {sorted(seasons) if seasons else 'ALL'})")
-                n += 1
-                continue
-            # no pack -> fall through to per-episode
-        for e in eps:
-            if n >= cap:
-                break
-            rs, rn = rel[e["id"]]
-            q = f"{title} S{rs:02d}E{rn:02d}"
-            best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                           need={x for x in (e.get("need_audio") or "").split(",") if x},
-                           need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
-            if not best or best[0] < cfg["min_seeders"]:
-                core.set_ep_status(e["id"], "no_release",
-                                   candidate_title=(best[2] if best else None))
-                continue
-            sc, seed, rtitle, link = best
-            h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
+        try:
+            n = _search_season(sid, title, season, eps, rel, cfg, n, cap)
+        except SearchUnavailable:
+            # The indexer is down, so every remaining query this cycle would fail the same way.
+            # Abandon the sweep with the records untouched — the next one retries — rather than
+            # marking hundreds of episodes `no_release` and sitting out a 24-hour cooldown each.
+            core.log("tv search: indexer unavailable -> abandoning this sweep, records left as-is")
+            return
+
+
+def _search_season(sid, title, season, eps, rel, cfg, n, cap):
+    """Search one season group — a pack when enough episodes are missing, else per episode —
+    and return the updated search counter.
+
+    `n` counts SEARCHES, not grabs. Counting only grabs made the `no_release` path free, so when
+    `no_release_retry_h` expired for a large backlog at once, a single cycle ran one Prowlarr query
+    per episode across hundreds of episodes — exactly the hammering `max_search_per_run` exists to
+    prevent, and re-run by the finish refill every 10 minutes."""
+    import json as _json
+    if len(eps) >= cfg["tv_pack_threshold"]:
+        q = f"{title} S{season:02d}"
+        # A pack has to clear every member's blocklist: one episode having burned this release is
+        # reason enough not to grab it again for the whole season.
+        pack_tried = {x for e in eps for x in _json.loads(e.get("tried") or "[]")}
+        best = _search(q, cfg, want_pack=True, season=season, tried=pack_tried,
+                       need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
+                       need_subs={x for e in eps
+                                  for x in (e.get("need_subs") or "").split(",") if x})
+        n += 1
+        if _usable(best, cfg):
+            sc, seed, rtitle, link, rid = best
+            h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
             if not h:
-                core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                core.log(f"tv grab EP '{q}': grab failed -> error")
-                n += 1
-                continue
-            core.set_ep_status(e["id"], "downloading", dl_hash=h,
-                               candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
-            core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
-            n += 1
+                # grab failed -> mark these eps error (NOT a null-hash download, which would
+                # loop grab -> reconcile-to-pending -> re-grab forever)
+                for e in eps:
+                    core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
+                return n
+            seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
+            # `rid` (not None): the identity every retry path blocklists. Passing None meant the
+            # blocklist those paths maintain had nothing to record, so a dropped pack was
+            # re-picked by the very next search — the loop this is all meant to break.
+            claimed = _assign_pack(sid, seasons, h, rid, rtitle, cfg)
+            core.log(f"tv grab PACK '{q}': [{sc}] {seed}s {rtitle} -> {claimed} eps "
+                     f"(seasons {sorted(seasons) if seasons else 'ALL'})")
+            return n
+        # no usable pack -> fall through to per-episode
+    for e in eps:
+        if n >= cap:
+            break
+        rs, rn = rel[e["id"]]
+        q = f"{title} S{rs:02d}E{rn:02d}"
+        best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
+                       tried=set(_json.loads(e.get("tried") or "[]")),
+                       need={x for x in (e.get("need_audio") or "").split(",") if x},
+                       need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
+        n += 1
+        if not _usable(best, cfg):
+            core.set_ep_status(e["id"], "no_release",
+                               candidate_title=(best[2] if best else None))
+            continue
+        sc, seed, rtitle, link, rid = best
+        h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
+        if not h:
+            core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
+            core.log(f"tv grab EP '{q}': grab failed -> error")
+            continue
+        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
+                           candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
+        core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
+    return n
 
 
 # ------------------------------------------------------------------ FINISH (map + merge)
+def _reject_and_retry_ep(ep, reason, cfg, delta=None, final="sync_fail"):
+    """This episode's donor didn't sync: blocklist that release and go back for another, or land
+    in `final` once max_sync_retries is spent.
+
+    TV had no such path at all — a sync failure went straight to `sync_fail` on the FIRST attempt
+    with `attempts` never incremented, so the retry budget the movie path spends was dead code
+    here and every framerate mismatch was terminal on one try.
+
+    The donor torrent is deliberately NOT deleted: it is usually a season pack that other episodes
+    are still merging from. `free_donor_if_done` releases it once nobody needs it."""
+    import json as _json
+    tried = _json.loads(ep.get("tried") or "[]")
+    if ep.get("dl_id") and ep["dl_id"] not in tried:
+        tried.append(ep["dl_id"])
+    attempts = (ep.get("attempts") or 0) + 1
+    if attempts >= cfg.get("max_sync_retries", 4):
+        core.set_ep_status(ep["id"], final, tried=_json.dumps(tried), attempts=attempts,
+                           sync_delta=delta, progress="",
+                           error=f"{reason}; no compatible release after {attempts} tries")
+        core.log(f"tv merge {ep['id']}: {final} after {attempts} tries ({reason})")
+        return
+    core.set_ep_status(ep["id"], "pending", tried=_json.dumps(tried), attempts=attempts,
+                       **DONOR_RESET, error=None, progress="")
+    core.log(f"tv merge {ep['id']}: {reason} -> blocklisted, re-searching (attempt {attempts})")
+
+
 def _merge_episode(ep, en_file, cfg, hint=None):
     """Share the movie merge gate (max_parallel_merges) so merges can't peg CPU/GPU.
     `hint` = (offset, drift) from a pack-mate, to skip full sync detection when it matches.
@@ -733,7 +835,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
        and _video_quality(en_file, ei["dur"]) >= _video_quality(fr, fi["dur"]):
         out = os.path.dirname(fr) + "/_merged/" + os.path.splitext(os.path.basename(fr))[0] + ".mkv"
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        if subprocess.run(["mkvmerge", "-o", out, en_file], capture_output=True).returncode in (0, 1):
+        ok_mux, mux_err = run_mux(["mkvmerge", "-o", out, en_file], out, cfg)
+        if ok_mux:
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
@@ -749,14 +852,17 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             except Exception: pass
             _plex_ep_refresh(ep, cfg)
         else:
-            core.set_ep_status(ep["id"], "error", error="multi remux failed")
+            core.set_ep_status(ep["id"], "error", error=f"multi remux: {mux_err}")
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
-    offset = ep.get("sync_offset_ms") or 0
+    # Only a DELIBERATELY set offset skips detection — see pipeline._merge_movie_impl. A stored
+    # measurement describes the donor it was measured against, not the next one.
+    manual = bool(ep.get("sync_manual"))
+    offset = (ep.get("sync_offset_ms") or 0) if manual else 0
     # framerate mismatch is handled by the drift detector below (not rejected upfront);
     # only bail here if auto-sync is off, since a constant offset can't fix frame drift.
     fps_diff = not sync.fps_close(ei["fps"], fi["fps"])
-    if fps_diff and not offset and not cfg.get("auto_sync", True):
+    if fps_diff and not manual and not cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta,
                            error=f"framerate differs ({ei['fps']} vs {fi['fps']}), auto-sync off"); return
     eq, fq = _video_quality(en_file, ei["dur"]), _video_quality(fr, fi["dur"])
@@ -766,7 +872,11 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     kind = media.kind_of(fr, ep.get("orig_lang"), cfg,
                          series_type=ep.get("series_type") or "standard")
     want_a, _ = media.profile(kind, cfg, ep.get("orig_lang"))
-    picked = media.wanted_audio(di, bi, want_a)
+    # `extra` keeps the original-language VO eligible when a title's original language isn't in
+    # the profile and no English track exists — the whole point of carrying VO for subtitle
+    # viewers. The movie path has always passed it; TV silently didn't, so a series whose
+    # original language is neither English nor French never got its VO grafted.
+    picked = media.wanted_audio(di, bi, want_a, extra=_orig_codes(ep.get("orig_lang")))
     ids = [a["id"] for a in picked]
     langs = {a["id"]: a["lang"] for a in picked}
     daidx = {a["id"]: ix for ix, a in enumerate(di["auds"]) if a["id"] in set(ids)}
@@ -789,44 +899,48 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         _plex_ep_refresh(ep, cfg)
         return
     # manual offset skips detection; honour a stored stretch ratio (see pipeline)
-    drift = (ep.get("sync_drift") or None) if offset else None
+    drift = (ep.get("sync_drift") or None) if manual else None
     if drift and abs(drift - 1.0) < 1e-6:
         drift = None
-    if not offset and cfg.get("auto_sync", True):
+    if not manual and cfg.get("auto_sync", True):
         core.set_ep_status(ep["id"], "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, (daidx[ids[0]] if ids else 0),
             min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {ep['id']}",
-            on_progress=lambda msg: core.set_ep_status(ep["id"], "merging", progress=msg), hint=hint,
+            on_progress=lambda msg: _beat("episode", ep["id"], msg), hint=hint,
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
-            why = ("framerates differ but no reliable drift could be measured"
-                   if (m is not None and fps_diff and not drift)
-                   else "couldn't sync (incompatible release/cut)")
-            core.set_ep_status(ep["id"], "sync_fail", sync_delta=delta, progress="", error=why); return
+            # Spend the automatic budget on ANOTHER release before settling — see
+            # pipeline.reject_and_retry. This used to be terminal on the first attempt.
+            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+            _reject_and_retry_ep(ep, why, cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
     what = "audio" if ids else ""
     what = (what + "+subs") if (what and subs) else (what or "subs")
-    core.set_ep_status(ep["id"], "merging", progress=f"muxing {what}…")
+    core.set_ep_status(ep["id"], "merging", progress=f"muxing {what}…", updated=time.time())
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_ep_status(ep["id"], "error",
-                           error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
+    ok_mux, mux_err = run_mux(cmd, out, cfg)
+    if not ok_mux:
+        core.set_ep_status(ep["id"], "error", progress="", error=mux_err); return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)
     except OSError:
         pass
     core.forget_probe(fr)           # the file changed; its cached languages are now stale
+    # sync_manual=0 — see pipeline: the instruction has been carried out and must not persist to
+    # whatever donor this episode is given next.
     core.set_ep_status(ep["id"], "merged", merged_file=fr, sync_offset_ms=offset, sync_delta=delta,
-                       sync_drift=drift, error=None, progress="", merge_kind="grafted",
+                       sync_drift=drift, sync_manual=0, error=None, progress="",
+                       merge_kind="grafted",
                        added_subs=",".join(sorted({x["lang"] for x in subs})),
                        added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"tv merge {ep['id']}: OK +{offset}ms"
@@ -858,7 +972,7 @@ def _drop_stalled_eps(eps, t, cfg):
         attempts = (e.get("attempts") or 0) + 1
         st = "no_release" if attempts >= cfg.get("max_sync_retries", 4) else "pending"
         core.set_ep_status(e["id"], st, tried=_json.dumps(tried), attempts=attempts,
-                           dl_hash=None, dl_id=None, en_file=None, progress="",
+                           **DONOR_RESET, progress="",
                            error=("all releases stalled" if st == "no_release" else None))
     core.log(f"tv stall: '{t.get('name','')[:50]}' stalled ({seeds} seeds) -> blocklisted "
              f"{len(eps)} ep(s), re-searching")
@@ -918,11 +1032,18 @@ def merge_ready_episode(ep_id, cfg=None):
     ep = core.get_episode(ep_id)
     if not ep:
         return
-    en = ep.get("en_file")
-    if not en or not os.path.exists(en):
-        core.set_ep_status(ep_id, "error", progress="", error="merge: donor file missing")
-        return
     h = ep.get("dl_hash")
+    # Same stale-path race as the movie path: qB moves a finished pack out of its incomplete
+    # directory, and the per-episode `en_file` captured at promote time no longer resolves.
+    # See pipeline.resolve_donor_path. For a pack this matters more, not less — one move
+    # invalidates the cached path of every episode in it at once.
+    en = resolve_donor_path(cfg, h, ep.get("en_file"), tag=f" {ep_id}")
+    if en and en != ep.get("en_file"):
+        core.set_ep_status(ep_id, ep["status"], en_file=en)
+    if not en or not os.path.exists(en):
+        core.set_ep_status(ep_id, "error", progress="",
+                           error="merge: donor file missing (not on disk, and qB no longer has it)")
+        return
     res = _merge_episode(ep, en, cfg, hint=_PACK_HINT.get(h))
     if res and res[0] is not None and h:
         _PACK_HINT[h] = res
@@ -1060,11 +1181,13 @@ def stage_finish(cfg=None):
     for h, eps in by_hash.items():
         t = torrents.get(h)
         if not t:
-            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search
+            # torrent vanished from qB (removed/failed/never-added) -> re-queue to re-search,
+            # blocklisting the release so the next search can't re-pick it (see pipeline).
             for e in eps:
-                core.set_ep_status(e["id"], "pending", dl_hash=None, dl_id=None,
-                                   en_file=None, error=None, progress="")
-            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) -> re-queued")
+                core.set_ep_status(e["id"], "pending", **DONOR_RESET, error=None, progress="",
+                                   tried=blocklist(e))
+            core.log(f"tv reconcile: {len(eps)} ep(s) no longer in qB (hash {str(h)[:12]}) "
+                     f"-> re-queued (release blocklisted)")
             continue
         if (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
             _drop_stalled_eps(eps, t, cfg)

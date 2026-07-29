@@ -10,8 +10,10 @@ file_b is shifted later than file_a.
 import re, subprocess
 import numpy as np
 
+TIMEOUT_RC = -9        # our own marker for "killed on timeout" (see _run)
 
-def _run(path, start, dur, thresh, scale, threads, hwaccel, device):
+
+def _run(path, start, dur, thresh, scale, threads, hwaccel, device, timeout=None):
     pre = ["nice", "-n", "19", "ffmpeg", "-v", "info", "-threads", str(threads)]
     # Keep the downscale ON THE GPU (scale_vaapi/scale_qsv + hwdownload) so only tiny frames
     # cross PCIe — decode+scale of 4K stays on the iGPU. ~7x faster than '-hwaccel vaapi' alone
@@ -26,21 +28,28 @@ def _run(path, start, dur, thresh, scale, threads, hwaccel, device):
         vf = f"scale={scale}:-2,select='gt(scene,{thresh})',showinfo"
     cmd = pre + ["-ss", str(start), "-t", str(dur), "-i", path,
                  "-vf", vf, "-an", "-sn", "-f", "null", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A hung decode (the iGPU driver wedging is the known one) used to block the merge worker
+        # forever. TIMEOUT is reported as its own return code so scene_cuts does NOT then retry in
+        # software — that path would hang for exactly as long a second time.
+        return [], TIMEOUT_RC
     cuts = [float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", r.stderr)]
     return cuts, r.returncode
 
 
 def scene_cuts(path, start, dur, thresh=0.3, scale=160, threads=4,
-               hwaccel="vaapi", device="/dev/dri/renderD128"):
+               hwaccel="vaapi", device="/dev/dri/renderD128", timeout=None):
     """Scene-cut timestamps. Offloads decode to the iGPU (Intel QSV/VAAPI) when
     available — ~70% less CPU — and transparently falls back to software decode if
     hwaccel isn't present or fails. Run at nice 19 and capped to `threads`."""
-    cuts, rc = _run(path, start, dur, thresh, scale, threads, hwaccel, device)
+    cuts, rc = _run(path, start, dur, thresh, scale, threads, hwaccel, device, timeout)
     # only fall back to (slow, full-res) software decode on a real hwaccel failure — NOT on a
-    # legitimately low-action window, which would needlessly software-decode 4K.
-    if hwaccel and (rc != 0 or len(cuts) == 0):
-        cuts, rc = _run(path, start, dur, thresh, scale, threads, None, device)
+    # legitimately low-action window, which would needlessly software-decode 4K, and NOT on a
+    # timeout, where the fallback would simply hang for the same duration again.
+    if hwaccel and rc != TIMEOUT_RC and (rc != 0 or len(cuts) == 0):
+        cuts, rc = _run(path, start, dur, thresh, scale, threads, None, device, timeout)
     return np.array(cuts)
 
 
@@ -57,7 +66,7 @@ def _train(cuts, dur, sr):
 
 
 def ratio_scan(file_a, file_b, ratios, start=600, dur=2400, max_lag_s=180, bin_ms=20,
-               threads=4, hwaccel="vaapi", device="/dev/dri/renderD128"):
+               threads=4, hwaccel="vaapi", device="/dev/dri/renderD128", timeout=None):
     """Test candidate RATE RATIOS between two files (PAL speedup & friends).
 
     A plain cross-correlation can only find a constant shift, so it is blind to a rate
@@ -73,8 +82,10 @@ def ratio_scan(file_a, file_b, ratios, start=600, dur=2400, max_lag_s=180, bin_m
     exactly what `mkvmerge --sync TID:offset,k` applies.
     Returns [(k, offset_ms, conf), ...] sorted by confidence, best first (empty if too few cuts).
     """
-    ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device)
-    cb = scene_cuts(file_b, start, dur, threads=threads, hwaccel=hwaccel, device=device)
+    ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device,
+                    timeout=timeout)
+    cb = scene_cuts(file_b, start, dur, threads=threads, hwaccel=hwaccel, device=device,
+                    timeout=timeout)
     if len(ca) < 12 or len(cb) < 12:      # need a real pattern to match, not a handful of cuts
         return []
     sr = 1000 // bin_ms
@@ -102,7 +113,8 @@ def ratio_scan(file_a, file_b, ratios, start=600, dur=2400, max_lag_s=180, bin_m
 
 
 def detect_offset_video_ms(file_a, file_b, start=300, dur=600, max_lag_s=120, bin_ms=20,
-                           threads=4, hwaccel="vaapi", device="/dev/dri/renderD128"):
+                           threads=4, hwaccel="vaapi", device="/dev/dri/renderD128",
+                           timeout=None):
     """Constant offset between two files, from their scene-cut patterns over one window.
 
     `max_lag_s` is the largest offset that can be FOUND, and it used to be 20s — which is a real
@@ -117,8 +129,10 @@ def detect_offset_video_ms(file_a, file_b, start=300, dur=600, max_lag_s=120, bi
     the argmax runs over changes. It is also safe — the confidence is normalised, so an unrelated
     pair does not correlate at ANY lag (0/200 random pairs cleared the 0.30 gate at ±20, ±90 or
     ±180s), and detect() still requires several windows to agree within 150ms."""
-    ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device)
-    cb = scene_cuts(file_b, start, dur, threads=threads, hwaccel=hwaccel, device=device)
+    ca = scene_cuts(file_a, start, dur, threads=threads, hwaccel=hwaccel, device=device,
+                    timeout=timeout)
+    cb = scene_cuts(file_b, start, dur, threads=threads, hwaccel=hwaccel, device=device,
+                    timeout=timeout)
     if len(ca) < 5 or len(cb) < 5:
         return None, 0.0
     sr = 1000 // bin_ms

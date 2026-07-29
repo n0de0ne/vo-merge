@@ -12,9 +12,14 @@ class Prowlarr:
         r.raise_for_status(); return r.json()
 
     def search(self, query, indexer_ids):
-        # Prowlarr wants repeated indexerIds params; requests handles list values.
-        return self._get("/api/v1/search", query=query, type="search",
-                         indexerIds=indexer_ids)
+        # Prowlarr wants repeated indexerIds params; requests handles list values. Omitting the
+        # parameter entirely searches EVERY configured indexer, which is what an empty list has
+        # to mean: indexer IDs are per-instance numbers, so a fresh install has none configured
+        # and "search nothing" would make every title look like it has no releases.
+        params = {"query": query, "type": "search"}
+        if indexer_ids:
+            params["indexerIds"] = list(indexer_ids)
+        return self._get("/api/v1/search", **params)
 
     def ping(self):
         return self._get("/api/v1/system/status")
@@ -162,6 +167,19 @@ class QBittorrent:
     def torrents(self, category=None):
         p = {"category": category} if category else {}
         return self.s.get(f"{self.url}/api/v2/torrents/info", params=p, timeout=30).json()
+
+    def torrent(self, torrent_hash):
+        """One torrent's current info dict, or None. qB answers `hashes=` on the same endpoint,
+        so this costs one small request instead of listing a whole category — and it finds the
+        torrent whatever category it is in, which matters when re-resolving a donor whose path
+        moved."""
+        if not torrent_hash:
+            return None
+        r = self.s.get(f"{self.url}/api/v2/torrents/info",
+                       params={"hashes": str(torrent_hash).lower()}, timeout=30)
+        r.raise_for_status()
+        got = r.json() or []
+        return got[0] if got else None
 
     def stop(self, hashes):
         """Stop (pause) torrents. NEVER cap share limits instead — qB's limit-reached

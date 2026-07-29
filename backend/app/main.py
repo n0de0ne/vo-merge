@@ -1,28 +1,123 @@
 """FastAPI app: REST API + serves the built React SPA."""
-import os, subprocess, time
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import hmac, math, os, subprocess, time
+from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from . import agent, core, scheduler, pipeline, media
 from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
-app = FastAPI(title="VO Merger")
-STATIC = os.environ.get("VO_STATIC", "/app/static")
-PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
 
-
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def _lifespan(_app):
+    """Migrations, then the scheduler. `@app.on_event("startup")` is deprecated and slated for
+    removal, and it swallowed the distinction between 'the app failed to start' and 'a startup
+    step raised' — a lifespan failure stops the app cleanly instead."""
     core.init_db()
     core.init_tv()
+    core.init_indexes()
     core.init_probe_cache()
     core.migrate_config()
     scheduler.start()
+    yield
+
+
+app = FastAPI(title="VO Merger", lifespan=_lifespan)
+STATIC = os.environ.get("VO_STATIC", "/app/static")
+PREVIEW_DIR = os.path.join(core.CONFIG_DIR, "preview")
+PREVIEW_TIMEOUT = 300          # seconds for one 20s preview clip encode
+
+
+def _donor_roots(cfg):
+    """Every directory a downloaded donor can legitimately live in, as THIS container sees it.
+
+    Movies and TV use different qB save paths, and qB reports them under its own /data prefix, so
+    a single configured root would reject half the real donors.
+
+    These come from config, so they are only as narrow as the operator's settings: pointing
+    `downloads_mount` at `/media` would widen the donor guard to the whole library. That is a
+    misconfiguration rather than something to defend against here — the guard exists to stop a
+    caller naming an arbitrary path, not to second-guess the mount layout."""
+    out = []
+    for p in (cfg.get("downloads_mount"),
+              pipeline._qb_to_local(cfg.get("qb_download_dir"), cfg),
+              pipeline._qb_to_local(cfg.get("qb_tv_download_dir"), cfg),
+              "/downloads"):
+        p = (p or "").rstrip("/")
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _under(path, root):
+    """True when `path` really resolves inside `root`.
+
+    Both the SPA file server and the donor-assign endpoint take a caller-supplied path and join it
+    onto a trusted root, and `os.path.join` silently returns the caller's path verbatim when it is
+    absolute — so the join is not a containment check, it just looks like one. Compare the RESOLVED
+    paths (symlinks included: the library is full of them, and `/media/...-EN` mirrors point back
+    into the real tree)."""
+    root = os.path.realpath(root)
+    path = os.path.realpath(path)
+    return path == root or path.startswith(root + os.sep)
 
 
 # ----- API -----
 api = FastAPI()
+
+_SAFE_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
+
+
+@api.middleware("http")
+async def _guard(request: Request, call_next):
+    """Two checks the API had neither of: a shared secret, and a cross-origin refusal.
+
+    Nothing here authenticated anything. That is defensible for a LAN-only tool right up to the
+    point where the endpoints delete media (`/library/repair`), rewrite service credentials
+    (`/settings`) and drop torrents — and several of those take only query parameters, so a plain
+    HTML form on any page the operator visits can fire them cross-site. No preflight is involved
+    in that shape, so CORS (correctly absent) never gets a say.
+
+    - **Origin check** — a browser always sends `Origin` on a state-changing request and cannot
+      forge it; a form POST from another site therefore carries a foreign one, while the SPA's own
+      fetch matches `Host` and curl/the host AI dispatcher send none at all. Refusing only a
+      PRESENT-and-mismatched Origin closes the CSRF shape without breaking any real caller, so it
+      is on unconditionally.
+    - **`api_key`** — off by default (empty), preserving current behaviour for existing installs.
+      Set it and every call needs `X-API-Key`. `/hook/*` is exempt: Radarr and Sonarr can't be
+      taught a custom header, and they already authenticate with `webhook_token`."""
+    # A mounted sub-app sees the FULL path in scope["path"] with the mount prefix in root_path
+    # (older Starlette strips it instead), so strip it ourselves rather than assuming either.
+    path = request.scope.get("path", "")
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root):]
+    is_hook = path.startswith("/hook/")
+    if path == "/health":
+        return await call_next(request)     # the container healthcheck carries no credential
+    if request.method not in _SAFE_METHODS:
+        origin = request.headers.get("origin")
+        if origin:
+            host = request.headers.get("host") or ""
+            if urlsplit(origin).netloc.lower() != host.lower():
+                return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
+    key = str(core.load_config().get("api_key") or "").strip()
+    if key and not is_hook:
+        got = request.headers.get("x-api-key") or request.query_params.get("apikey") or ""
+        if not hmac.compare_digest(got, key):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@api.get("/health")
+def health():
+    """Liveness only — no DB, no config, no disk. Deliberately trivial so the container
+    HEALTHCHECK measures whether uvicorn is answering, not whether SQLite is slow. /api/status is
+    the one that reports real state, and it runs count queries, which is the wrong thing to hang a
+    restart policy on. Exempt from api_key so the healthcheck needs no credential."""
+    return {"ok": True}
 
 
 @api.get("/status")
@@ -39,29 +134,94 @@ def movies(status: str | None = None):
     return core.get_movies(status)
 
 
+# Secrets the UI must be able to read back, each with its reason. Everything else in
+# core._SECRET_KEYS is masked automatically, so protecting a NEW secret is a matter of adding it
+# to that tuple — nobody has to remember this endpoint. The old hand-written mask list is exactly
+# how plex2_token (a real Plex account token) came to be returned in cleartext beside five
+# siblings that were masked.
+_VISIBLE_SECRETS = {
+    # The Settings page renders the webhook URL to paste into Radarr/Sonarr, and the token IS
+    # that URL's query string — masking it would only move the exposure into a field the
+    # operator then can't use. It is protected by api_key like the rest of the API.
+    "webhook_token",
+}
+
+
+def _mask_secrets(cfg):
+    for k in core._SECRET_KEYS:
+        if k in _VISIBLE_SECRETS or k not in cfg:
+            continue
+        # qb_pass keeps the placeholder form: the UI renders a password input and treats
+        # "********" as "unchanged" when saving. The rest report only whether they are set.
+        cfg[k] = ("********" if cfg[k] else "") if k == "qb_pass" else bool(cfg[k])
+    return cfg
+
+
 @api.get("/settings")
 def get_settings():
-    cfg = core.load_config()
-    cfg["qb_pass"] = "********" if cfg["qb_pass"] else ""   # never echo secret
-    cfg["prowlarr_key"] = bool(cfg["prowlarr_key"])
-    cfg["radarr_key"] = bool(cfg["radarr_key"])
-    cfg["sonarr_key"] = bool(cfg.get("sonarr_key"))
-    cfg["plex_token"] = bool(cfg["plex_token"])
-    return cfg
+    return _mask_secrets(core.load_config())
 
 
 class SettingsIn(BaseModel):
     data: dict
 
 
+# Keys that become APScheduler intervals, with the smallest value that is not self-harm. Zero is
+# not "disabled" here: APScheduler coerces a zero-length interval to one second, so
+# `search_interval_min: 0` runs the whole scan-and-search sweep every second. A non-numeric value
+# is worse — `timedelta(minutes="60")` raises AFTER save_config has already persisted it, so the
+# next boot dies inside scheduler.start() and the app never comes up until config.json is edited
+# by hand on the host.
+_MIN_VALUES = {"search_interval_min": 1, "finish_interval_min": 1, "stall_check_interval_min": 1,
+               "promote_interval_min": 1, "max_parallel_merges": 1, "mux_timeout_min": 1,
+               "sync_decode_timeout_min": 1}
+
+
+def _validate_settings(d):
+    """Coerce each incoming setting to the type of its default and clamp the dangerous ones.
+
+    Nothing validated these before — `save_config` filters on key NAME only, so any type at all
+    could be persisted. Keys with a legitimate 0 or negative meaning (`no_release_retry_h`: 0 =
+    every scan, negative = never) are deliberately not clamped."""
+    out = {}
+    for k, v in d.items():
+        if k not in core.DEFAULTS:
+            continue                       # save_config drops unknown keys anyway
+        default = core.DEFAULTS[k]
+        try:
+            if isinstance(default, bool):          # before int: bool IS an int in Python
+                v = bool(v)
+            elif isinstance(default, int):
+                v = int(v)
+            elif isinstance(default, float):
+                v = float(v)
+            elif isinstance(default, list):
+                if not isinstance(v, list):
+                    raise ValueError
+            elif isinstance(default, dict):
+                if not isinstance(v, dict):
+                    raise ValueError
+            elif isinstance(default, str):
+                v = str(v)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                422, f"{k}: expected {type(default).__name__}, got {type(v).__name__} ({v!r})")
+        if k in _MIN_VALUES and v < _MIN_VALUES[k]:
+            v = _MIN_VALUES[k]
+        out[k] = v
+    return out
+
+
 @api.post("/settings")
 def post_settings(body: SettingsIn):
-    # drop masked/unchanged secret placeholders
+    # Drop the masked placeholders a GET handed out, so saving the form doesn't overwrite a real
+    # secret with "********" or with the boolean that stood in for it.
     d = {k: v for k, v in body.data.items()
-         if not (k in ("qb_pass",) and v == "********")
-         and not (k in ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token")
-                  and v in (True, False))}
-    cfg = core.save_config(d)
+         if not (k in core._SECRET_KEYS and (v == "********" or isinstance(v, bool)))}
+    try:
+        core.save_config(_validate_settings(d))
+    except core.ConfigUnreadable as e:
+        raise HTTPException(409, str(e))
     scheduler.reschedule()
     return {"ok": True}
 
@@ -83,13 +243,70 @@ def test(which: str):
         else:
             raise HTTPException(404, "unknown service")
         return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # These clients pass their credential in the URL — Plex as ?X-Plex-Token=, the *arrs as
+        # ?apikey= — and both ConnectionError and raise_for_status()'s HTTPError quote the full
+        # URL, query string included, in their message. core.redact exists for exactly this and
+        # is applied on the log() and _set_row funnels; this response path never went through it.
+        return {"ok": False, "error": core.redact(str(e))}
+
+
+def _bg_scan(scope):
+    """Run a progressive scan in the background under SCAN_LOCK, reporting through SCAN_STATE.
+
+    Same locking and progress reporting as /rescan, but none of its extra powers: no probe-cache
+    drop, no prune, and `series_pilot` is honoured — this is "pick up what's new", not "re-read
+    and reconcile the library"."""
+    import threading
+    from . import tv
+
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan is already running",
+                "state": pipeline.SCAN_STATE}
+
+    def _run():
+        st = pipeline.SCAN_STATE
+        st.update(running=True, scope=scope, started=time.time(), finished=0, phase="starting",
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None,
+                  full=False)
+        media.reset_stats()
+        try:
+            cfg = core.load_config()
+            if scope in ("all", "films"):
+                st["phase"] = "films"
+                st["films"] = pipeline.scan(cfg)
+            if scope in ("all", "tv"):
+                st["phase"] = "series & anime"
+                st["episodes"] = tv.scan(cfg)
+            st["phase"] = "done"
+        except Exception as e:
+            st["error"] = str(e); st["phase"] = "error"
+            core.log(f"scan({scope}) failed: {e}")
+        finally:
+            st["running"] = False
+            st["finished"] = time.time()
+            st["read"], st["reused"] = media.STATS["probed"], media.STATS["cached"]
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "state": pipeline.SCAN_STATE}
 
 
 @api.post("/scan")
 def do_scan():
-    return {"found": pipeline.scan()}
+    """Progressive film scan, in the background under SCAN_LOCK.
+
+    It used to call pipeline.scan() inline: minutes of mkvmerge in a request thread, and — since
+    scan() takes no lock of its own, its callers always did — a second heavy probe pass could run
+    alongside a /rescan already holding SCAN_LOCK, which is exactly what that lock forbids. While
+    it ran, hold_reason() reported nothing, so searches kept grabbing off half-finished state.
+
+    Deliberately NOT `do_rescan(scope="films")`: a rescan also prunes records whose file is gone
+    and forces `series_pilot=[]`, and "Scan now" is a different, additive contract. Use the
+    Library tab's re-read buttons for the destructive/whole-library pass."""
+    return _bg_scan("films")
 
 
 @api.post("/rescan")
@@ -123,8 +340,8 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     import threading
     from . import tv
 
-    if scope not in ("all", "films", "anime", "series"):
-        raise HTTPException(422, "scope must be all | films | anime | series")
+    if scope not in ("all", "films", "anime", "series", "tv"):
+        raise HTTPException(422, "scope must be all | films | anime | series | tv")
     if not pipeline.SCAN_LOCK.acquire(blocking=False):
         return {"ok": True, "started": False, "note": "a scan is already running",
                 "state": pipeline.SCAN_STATE}
@@ -142,6 +359,7 @@ def do_rescan(forget: bool = False, scope: str = "all"):
             top = (path or "")[len(mount) + 1:].split(os.sep, 1)[0].lower()
             if scope == "anime":  return top in anime
             if scope == "series": return top in series
+            if scope == "tv":     return top in anime or top in series
             return top not in anime and top not in series
         with core.db() as c:
             if scope == "all":
@@ -183,9 +401,10 @@ def do_rescan(forget: bool = False, scope: str = "all"):
             if scope in ("all", "films"):
                 st["phase"] = "films"
                 st["films"] = pipeline.scan(cfg)
-            if scope in ("all", "anime", "series"):
-                st["phase"] = "anime" if scope == "anime" else ("series" if scope == "series" else "series & anime")
-                kinds = None if scope == "all" else (scope,)
+            if scope in ("all", "anime", "series", "tv"):
+                st["phase"] = ("anime" if scope == "anime" else
+                               "series" if scope == "series" else "series & anime")
+                kinds = None if scope in ("all", "tv") else (scope,)
                 st["episodes"] = tv.scan(cfg, kinds=kinds)
             st["phase"] = "done"
             core.log(f"rescan({scope}, {'full' if forget else 'progressive'}): "
@@ -209,6 +428,16 @@ def do_rescan(forget: bool = False, scope: str = "all"):
 # "unsupported container" and "audio mkvmerge can't read" mean the file is probably fine and we
 # simply can't mux it, and "unreadable" means we know nothing at all.
 BROKEN_ERR = "no audio track"
+
+
+# What counts as vo-merge having actually CHANGED a file. `replaced` legitimately records no
+# added languages (the download became the file), so it can only be recognised by its kind; a
+# `grafted` row that recorded nothing added says nothing about what the app did, and `already`
+# (a scan closing out a file that was correct on its own) is not work at all. Recently-merged,
+# the 24h/7d counters and the completion forecast all read this, so they cannot disagree about
+# what a completion is.
+DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
+            "OR COALESCE(added_subs,'') != '')")
 
 
 def _inventory(cfg, cols="path, auds, subs, err"):
@@ -254,6 +483,108 @@ def _inventory(cfg, cols="path, auds, subs, err"):
         have_s = {x for x in (r["subs"] or "").split(",") if x}
         yield (r, top, kind, want_a, want_s, have_a, have_s,
                [k for k in want_a if k not in have_a], [k for k in want_s if k not in have_s])
+
+
+@api.get("/forecast")
+def forecast(target: float = 90.0):
+    """When the library reaches `target`% complete, at the rate it is actually going.
+
+    Every input is measured, not assumed: the denominator is the probe inventory (the only
+    complete list of files), a "completion" is the same DID_WORK predicate that drives Recently
+    merged, and the rate is divided by the observed span rather than the nominal window — an
+    install three days old must not have its 30-day rate divided by 30.
+
+    The honest part is `blocked`. The remaining incomplete files are not uniformly reachable: a
+    record in `no_release` has nothing to find, `ignored` is a deliberate give-up, and an
+    unreadable file is not a language problem at all. Extrapolating the current rate straight
+    across those would produce a confident date the pipeline cannot deliver, so they are counted
+    and reported, and when they alone put the target out of reach the ETA is withheld rather than
+    guessed."""
+    if not 0 < target <= 100:
+        raise HTTPException(422, "target must be a percentage in (0, 100]")
+    cfg = core.load_config()
+    total = complete = unreadable = 0
+    incomplete_paths = []
+    per_lib = {}
+    for row, top, kind, wa, ws, ha, hs, ma, ms in _inventory(cfg):
+        lib = per_lib.setdefault(top, {"name": top, "total": 0, "complete": 0})
+        total += 1; lib["total"] += 1
+        if row["err"]:
+            unreadable += 1
+        elif not ma and not ms:
+            complete += 1; lib["complete"] += 1
+        else:
+            incomplete_paths.append(row["path"])
+    if not total:
+        return {"target": target, "total": 0, "complete": 0, "pct": None, "eta_days": None,
+                "reason": "nothing has been probed yet — run a library re-read first"}
+
+    pct = 100.0 * complete / total
+    need = max(0, math.ceil(total * target / 100.0) - complete)
+
+    # How many of the incomplete files cannot move on their own.
+    blocked = {"no_release": 0, "ignored": 0, "unreadable": unreadable}
+    if incomplete_paths:
+        with core.db() as c:
+            stat = {}
+            for t in ("movies", "episodes"):
+                for r in c.execute(f"SELECT french_path p, status s FROM {t} "
+                                   f"WHERE french_path IS NOT NULL"):
+                    stat[r["p"]] = r["s"]
+        for p in incomplete_paths:
+            st = stat.get(p)
+            if st in ("no_release", "ignored"):
+                blocked[st] += 1
+
+    # Rate, from real completions, over the span actually observed.
+    now = time.time()
+    rates = {}
+    with core.db() as c:
+        first = min((r["t"] for r in c.execute(
+            f"SELECT MIN(COALESCE(merged_at, updated)) t FROM movies WHERE status='merged' "
+            f"AND {DID_WORK} UNION ALL SELECT MIN(COALESCE(merged_at, updated)) t FROM episodes "
+            f"WHERE status='merged' AND {DID_WORK}") if r["t"]), default=None)
+        for label, days in (("7d", 7), ("30d", 30)):
+            since = now - days * 86400
+            n = sum(c.execute(
+                f"SELECT COUNT(*) n FROM {t} WHERE status='merged' AND {DID_WORK} "
+                "AND COALESCE(merged_at, updated) >= ?", (since,)).fetchone()["n"]
+                for t in ("movies", "episodes"))
+            # Divide by the span actually observed, so a young install isn't understated — a
+            # 30-day window on a 3-day-old install must not divide by 30. The +1 is not a fudge:
+            # a merge that happened 2 days ago means activity across 3 days (that day, and the
+            # two since), so first-to-now understates the span by exactly one day.
+            span = days if first is None else max(1.0, min(days, (now - first) / 86400.0 + 1.0))
+            rates[label] = round(n / span, 2)
+
+    # Prefer the longer window (steadier); fall back to the short one while young.
+    rate = rates["30d"] or rates["7d"]
+    out = {"target": target, "total": total, "complete": complete, "unreadable": unreadable,
+           "pct": round(pct, 1), "needed": need, "rate": rates, "rate_used": rate,
+           "blocked": blocked, "now": now,
+           "libraries": [dict(v, pct=round(100.0 * v["complete"] / v["total"], 1))
+                         for v in per_lib.values() if v["total"]]}
+    if need == 0:
+        out["eta_days"] = 0
+        out["reason"] = f"already at {pct:.1f}%"
+        return out
+    if not rate:
+        out["eta_days"] = None
+        out["reason"] = ("nothing has completed in the last 30 days, so there is no rate to "
+                         "project from")
+        return out
+    reachable = len(incomplete_paths) - blocked["no_release"] - blocked["ignored"]
+    if reachable < need:
+        out["eta_days"] = None
+        out["reason"] = (f"{need} more file(s) needed but only {max(0, reachable)} are reachable — "
+                         f"{blocked['no_release']} have no release and {blocked['ignored']} were "
+                         f"given up on. The target needs those unblocked, not more time.")
+        return out
+    days = need / rate
+    out["eta_days"] = round(days, 1)
+    out["eta_ts"] = now + days * 86400
+    out["reason"] = f"{need} file(s) at {rate}/day"
+    return out
 
 
 @api.get("/coverage")
@@ -641,6 +972,40 @@ def _hook_after(fn, what):
     threading.Thread(target=_run, daemon=True).start()
 
 
+class PriorityIn(BaseModel):
+    level: int = 1                   # 0 = normal, >0 = jump the queue
+
+
+@api.post("/movie/{tmdb_id}/priority")
+def movie_priority(tmdb_id: int, body: PriorityIn):
+    """Move a film to the front of the search sweep and the merge queue (level 0 = back to
+    normal). This is the answer to "someone asked for this and it is French-only": the backlog is
+    ordered by recency, so without it a title requested today sits behind everything already in
+    it and may never be reached."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    core.set_priority("movie", tmdb_id, body.level)
+    core.log(f"priority movie {tmdb_id} -> {body.level}")
+    return {"ok": True, "priority": body.level}
+
+
+@api.post("/episode/{ep_id}/priority")
+def episode_priority(ep_id: str, body: PriorityIn):
+    if not core.get_episode(ep_id):
+        raise HTTPException(404, "unknown episode")
+    core.set_priority("episode", ep_id, body.level)
+    core.log(f"priority episode {ep_id} -> {body.level}")
+    return {"ok": True, "priority": body.level}
+
+
+@api.post("/tv/{series_id}/priority")
+def series_priority(series_id: int, body: PriorityIn):
+    """Bump a whole show — TV is requested per series, not per episode."""
+    n = core.prioritise_series(series_id, body.level)
+    core.log(f"priority series {series_id} -> {body.level} ({n} episode(s))")
+    return {"ok": True, "priority": body.level, "episodes": n}
+
+
 @api.post("/hook/radarr")
 def hook_radarr(body: dict, token: str | None = None):
     """Radarr Connect -> Webhook. Point it at http://<vo-merge>/api/hook/radarr."""
@@ -665,6 +1030,12 @@ def hook_radarr(body: dict, token: str | None = None):
         r = pipeline.ingest_movie(m, cfg, refresh=True)
         core.log(f"hook radarr: {ev} {m.get('title')!r} -> {r}")
         if r == "gap":
+            # An import event means someone just asked for this title, so it goes to the front
+            # rather than the back of a backlog ordered by recency.
+            lvl = int(cfg.get("priority_on_import", 1) or 0)
+            if lvl and m.get("tmdbId"):
+                core.set_priority("movie", m["tmdbId"], lvl)
+                core.log(f"hook radarr: {m.get('title')!r} prioritised ({lvl})")
             _kick_search(cfg, lambda c: pipeline.stage_search(c))
     _hook_after(_run, f"radarr {ev} {mid}")
     return {"ok": True, "event": ev, "movie": mid, "queued": True}
@@ -696,6 +1067,12 @@ def hook_sonarr(body: dict, token: str | None = None):
         n = tv.scan(cfg, only_series=sid, refresh=True)
         core.log(f"hook sonarr: {ev} series {sid} -> {n} gap(s)")
         if n:
+            # Someone asked for this show — see hook_radarr. Bumped per SERIES, since that is
+            # the unit a request comes in.
+            lvl = int(cfg.get("priority_on_import", 1) or 0)
+            if lvl:
+                bumped = core.prioritise_series(sid, lvl)
+                core.log(f"hook sonarr: series {sid} prioritised ({lvl}, {bumped} episode(s))")
             _kick_search(cfg, lambda c: tv.stage_search(c))
     _hook_after(_run, f"sonarr {ev} {sid}")
     return {"ok": True, "event": ev, "series": sid, "queued": True}
@@ -728,7 +1105,10 @@ def set_pause(body: PauseIn):
     left to finish — killing mkvmerge mid-write would leave a corrupt library file — so the load
     drops as the current merge ends rather than instantly. Scans keep running, which is the
     point: pause is how you let a library re-read finish before anything grabs off it."""
-    core.save_config({"paused": bool(body.on)})
+    try:
+        core.save_config({"paused": bool(body.on)})
+    except core.ConfigUnreadable as e:
+        raise HTTPException(409, str(e))
     core.log("PAUSED by operator" if body.on else "resumed by operator")
     return {"ok": True, "paused": bool(body.on), "in_flight": pipeline._merging_now()}
 
@@ -776,17 +1156,33 @@ def search_all():
 
 @api.post("/movie/{tmdb_id}/search")
 def do_search(tmdb_id: int):
-    pipeline.search_movie(tmdb_id); return core.get_movie(tmdb_id)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
+    return core.get_movie(tmdb_id)
 
 
 @api.post("/movie/{tmdb_id}/merge")
 def do_merge(tmdb_id: int):
-    pipeline.merge_movie(tmdb_id); return core.get_movie(tmdb_id)
+    """Queue the merge; the background worker runs it. See pipeline.enqueue_merge for why this
+    must not merge inline."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    queued, note = pipeline.enqueue_merge("movie", tmdb_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"movie": core.get_movie(tmdb_id), "queued": True, "note": note}
 
 
 @api.get("/movie/{tmdb_id}/candidates")
 def movie_candidates(tmdb_id: int):
-    return pipeline.candidates(tmdb_id, include_tried=True)
+    try:
+        return pipeline.candidates(tmdb_id, include_tried=True)
+    except pipeline.SearchUnavailable as e:
+        # An empty list would read as "no releases exist for this title", which is a very
+        # different thing to tell someone staring at an interactive search.
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 class GrabIn(BaseModel):
@@ -813,10 +1209,14 @@ def set_sync(tmdb_id: int, body: SyncIn):
         pipeline.resync_movie(tmdb_id, offset_ms=body.offset_ms or None)
     else:
         # not merged (sync_fail/error) -> re-attempt the merge; manual offset if given,
-        # otherwise the video scene-cut matcher tries to align it.
-        core.set_status(tmdb_id, mv["status"] if mv else "pending",
-                        sync_offset_ms=(body.offset_ms or 0), error=None)
-        pipeline.merge_movie(tmdb_id)
+        # otherwise the video scene-cut matcher tries to align it. An explicit offset is an
+        # instruction (sync_manual=1, applied verbatim); offset 0 means "detect it", so the flag
+        # is cleared or detection would be skipped with a zero shift.
+        queued, note = pipeline.enqueue_merge("movie", tmdb_id, error=None,
+                                              sync_offset_ms=(body.offset_ms or 0),
+                                              sync_manual=1 if body.offset_ms else 0)
+        if not queued:
+            raise HTTPException(409, note)
     return core.get_movie(tmdb_id)
 
 
@@ -851,8 +1251,11 @@ def unignore(tmdb_id: int):
 @api.post("/movie/{tmdb_id}/research")
 def research(tmdb_id: int):
     # search again now (keeps the tried-blocklist so it won't re-pick known-bad releases)
-    core.set_status(tmdb_id, "pending", error=None, dl_hash=None, dl_id=None, en_file=None)
-    pipeline.search_movie(tmdb_id)
+    core.set_status(tmdb_id, "pending", error=None, **pipeline.DONOR_RESET, **pipeline.AI_RESET)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
     return core.get_movie(tmdb_id)
 
 
@@ -873,8 +1276,11 @@ def another(tmdb_id: int):
     except Exception:
         pass
     core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
-                    dl_hash=None, dl_id=None, en_file=None)
-    pipeline.search_movie(tmdb_id)
+                    **pipeline.DONOR_RESET, **pipeline.AI_RESET)
+    try:
+        pipeline.search_movie(tmdb_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
     return core.get_movie(tmdb_id)
 
 
@@ -1025,6 +1431,14 @@ def episode_assign(ep_id: str, body: AssignIn):
         raise HTTPException(400, f"no such file: {body.path}")
     if not body.path.lower().endswith((".mkv", ".mp4", ".m4v", ".avi", ".ts")):
         raise HTTPException(400, "not a video file")
+    # A donor is something we downloaded. Nothing confined this before, so any absolute path on
+    # the container — including a library file, or a symlink pointing at one — could be named as
+    # the donor for an unrelated episode, whose library file is then replaced in place with the
+    # merge of the two.
+    roots = _donor_roots(core.load_config())
+    if not any(_under(body.path, r) for r in roots):
+        raise HTTPException(400, "donor must be a downloaded file, under one of: "
+                                 + ", ".join(roots))
     core.set_ep_status(ep_id, "ready", en_file=body.path, error=None,
                        progress="queued for merge (assigned)")
     pipeline.MERGE_WAKE.set()
@@ -1041,8 +1455,11 @@ def _set_sync(kind: str, rec, ident, body: SetSyncIn):
     if body.drift is not None and not (0.9 <= body.drift <= 1.11):
         raise HTTPException(422, "drift must be a rate ratio near 1.0 (0.9–1.11)")
     setter = core.set_status if kind == "movie" else core.set_ep_status
+    # sync_manual marks this as an INSTRUCTION rather than a measurement, which is what makes the
+    # merge apply it verbatim and skip detection. A merge's own measured offset is stored too, but
+    # without this flag, so it can never be replayed onto a different donor.
     setter(ident, rec["status"], sync_offset_ms=int(body.offset_ms),
-           sync_drift=body.drift, error=None)
+           sync_drift=body.drift, sync_manual=1, error=None)
     return setter
 
 
@@ -1057,8 +1474,10 @@ def movie_set_sync(tmdb_id: int, body: SetSyncIn):
         raise HTTPException(404, "unknown movie")
     _set_sync("movie", mv, tmdb_id, body)
     core.log(f"set_sync {tmdb_id}: offset={body.offset_ms}ms drift={body.drift}")
-    pipeline.merge_movie(tmdb_id)
-    return core.get_movie(tmdb_id)
+    queued, note = pipeline.enqueue_merge("movie", tmdb_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"movie": core.get_movie(tmdb_id), "queued": True, "note": note}
 
 
 @api.post("/episode/{ep_id}/set_sync")
@@ -1070,8 +1489,10 @@ def episode_set_sync(ep_id: str, body: SetSyncIn):
         raise HTTPException(404, "unknown episode")
     _set_sync("episode", e, ep_id, body)
     core.log(f"set_sync {ep_id}: offset={body.offset_ms}ms drift={body.drift}")
-    tv.merge_ready_episode(ep_id)
-    return core.get_episode(ep_id)
+    queued, note = pipeline.enqueue_merge("episode", ep_id)
+    if not queued:
+        raise HTTPException(409, note)
+    return {"episode": core.get_episode(ep_id), "queued": True, "note": note}
 
 
 class SyncProbeIn(BaseModel):
@@ -1128,8 +1549,7 @@ def movie_sync_probe(tmdb_id: int, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("movie", mv, tmdb_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                   drift=out["drift"]))
-        pipeline.merge_movie(tmdb_id)
-        out["applied"] = True
+        out["applied"], out["note"] = pipeline.enqueue_merge("movie", tmdb_id)
     return out
 
 
@@ -1146,8 +1566,7 @@ def episode_sync_probe(ep_id: str, body: SyncProbeIn):
     if body.apply and out["offset_ms"] is not None:
         _set_sync("episode", e, ep_id, SetSyncIn(offset_ms=int(out["offset_ms"]),
                                                  drift=out["drift"]))
-        tv.merge_ready_episode(ep_id)
-        out["applied"] = True
+        out["applied"], out["note"] = pipeline.enqueue_merge("episode", ep_id)
     return out
 
 
@@ -1427,8 +1846,7 @@ def dashboard():
         # A 'grafted' row with nothing recorded as added is a contradiction — it adds no
         # information about what the app did, so it stays out. `already` (the scan closing out a
         # file that was correct on its own) is excluded by both clauses, which is the point.
-        DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
-                    "OR COALESCE(added_subs,'') != '')")
+        # (module-level DID_WORK — the forecast has to count the same thing)
         recent = [{"kind": "movie", "title": r["title"], "langs": r["added_langs"],
                    "subs": r["added_subs"], "how": r["merge_kind"] or "grafted",
                    "poster": r["poster"], "ts": r["merged_at"] or r["updated"]}
@@ -1539,12 +1957,16 @@ def make_preview(tmdb_id: int, lang: str = "eng", t: int = -1):
     os.makedirs(out, exist_ok=True)
     ai = _audio_index(f, lang)
     vid, aud = os.path.join(out, "video.mp4"), os.path.join(out, "audio.m4a")
+    # 20-second clips: a run past PREVIEW_TIMEOUT is a wedged decode, and this one blocks a
+    # request thread rather than the merge worker.
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
                     "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "scale=640:-2",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-                    "-movflags", "+faststart", vid], capture_output=True)
+                    "-movflags", "+faststart", vid],
+                   capture_output=True, timeout=PREVIEW_TIMEOUT)
     subprocess.run(["nice", "-n", "19", "ffmpeg", "-y", "-ss", str(t), "-t", "20", "-i", f,
-                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud], capture_output=True)
+                    "-map", f"0:a:{ai}", "-vn", "-c:a", "aac", "-b:a", "160k", aud],
+                   capture_output=True, timeout=PREVIEW_TIMEOUT)
     ver = int(os.path.getmtime(f))           # changes whenever Apply rewrites the file -> busts cache
     return {"video": f"/api/preview/{tmdb_id}/video.mp4?v={t}_{ver}",
             "audio": f"/api/preview/{tmdb_id}/audio.m4a?v={t}_{ver}",
@@ -1596,14 +2018,18 @@ def tv_episodes(status: str | None = None):
 
 @api.post("/tv/scan")
 def tv_scan():
-    from . import tv
-    return {"found": tv.scan()}
+    """Progressive series+anime scan — see do_scan for why it is backgrounded, and why it is not
+    a rescan."""
+    return _bg_scan("tv")
 
 
 @api.get("/tv/{series_id}/{season}/candidates")
 def tv_season_candidates(series_id: int, season: int):
     from . import tv
-    return tv.season_candidates(series_id, season)
+    try:
+        return tv.season_candidates(series_id, season)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 @api.post("/tv/{series_id}/{season}/grab")
@@ -1633,7 +2059,10 @@ def ep_ignore(ep_id: str):
 @api.get("/episode/{ep_id}/candidates")
 def ep_candidates(ep_id: str):
     from . import tv
-    return tv.episode_candidates(ep_id)
+    try:
+        return tv.episode_candidates(ep_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
 
 
 @api.post("/episode/{ep_id}/grab")
@@ -1651,7 +2080,12 @@ if os.path.isdir(STATIC):
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        f = os.path.join(STATIC, full_path)
-        if full_path and os.path.isfile(f):
+        # `os.path.join` DISCARDS its left operand when the right one is absolute, so a request
+        # for "//config/config.json" resolved to /config/config.json — the API keys, the qB
+        # password and both Plex tokens — and "//etc/passwd" likewise. Dot-segments are already
+        # normalised away by the ASGI layer; this is purely the absolute-path case, which is why
+        # it survives casual testing. Resolve, then require the result to stay under STATIC.
+        f = os.path.realpath(os.path.join(STATIC, full_path))
+        if full_path and _under(f, STATIC) and os.path.isfile(f):
             return FileResponse(f)
         return FileResponse(os.path.join(STATIC, "index.html"))

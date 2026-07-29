@@ -196,7 +196,13 @@ def qb_grab(qb, link, category, savepath):
         if guess and guess in before:         # 409 duplicate: already present
             return guess
         time.sleep(1.5)
-    return guess
+    # Nothing ever appeared in the category, so qB did NOT accept this. Returning the parsed
+    # magnet hash here (which almost always parses) reported a silently-failed add as a
+    # successful grab: the caller's `if not h` guard never fired, the record sat in `downloading`
+    # behind a hash qB doesn't have, and the reconcile bounced it back to `pending` to be grabbed
+    # again — forever. An unconfirmed add is a failed add.
+    core.log(f"qb_grab: torrent never appeared in category {category} after 18s -> treating as failed")
+    return None
 
 
 def _qb_to_local(p, cfg):
@@ -278,9 +284,59 @@ def reopen_status(prev, updated, cfg):
         if cool >= 0 and time.time() - (updated or 0) >= cool:
             return "pending"
     return prev or "pending"
+# Everything that identifies the CURRENT donor, cleared as one unit whenever a record goes back
+# for a different release. Kept as a single constant because the sync fields were the ones that got
+# forgotten: each retry path cleared the download fields inline and left `sync_offset_ms` behind, so
+# the next donor was muxed with the previous donor's offset and detection was skipped entirely.
+# Anything donor-specific added later belongs here, not in the individual call sites.
+DONOR_RESET = dict(dl_hash=None, dl_id=None, en_file=None,
+                   sync_offset_ms=0, sync_drift=None, sync_manual=0)
+
+# The AI's verdict describes the attempt that FAILED. Once a record is re-queued for a fresh one
+# it is void, and leaving it behind is what kept retried records sitting in the Review tab flagged
+# "needs you" — a row badged `pending`, already searching again, still captioned "AI did not
+# respond within 60m". The list is filtered on ai_status, so the stale flag alone is enough to
+# keep it there forever; "Retry N failed" then reports a tiny N against a list of a thousand.
+# The durable record of what the AI said is the log, not these columns.
+AI_RESET = dict(ai_status=None, ai_verdict=None, ai_at=None)
+
+# ...but a record whose status still IS a problem keeps its verdict, and so does `ignored`: that
+# is a deliberate give-up (usually the AI's own /unfixable), and the reason is the point of it.
+AI_KEEP_STATES = ("error", "review", "sync_fail", "ignored")
+
+
+def _beat(kind, ident, progress):
+    """Write merge progress AND bump `updated`, so a running merge is visibly alive.
+
+    `_set_row` deliberately leaves `updated` alone when the status is unchanged (it means "when
+    the pipeline state last changed", which is what keeps Needs-attention from reshuffling on
+    every background write). A merge writes progress under an unchanging `merging` status, so its
+    timestamp would otherwise be frozen at the moment it started — and the stale-merge sweep reads
+    that timestamp to decide whether a merge was interrupted. Forcing the bump here is safe: a
+    `merging` record is in neither the attention panel nor the FIFO ready queue."""
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    setter(ident, "merging", progress=progress, updated=time.time())
+
+
+def blocklist(rec):
+    """`rec`'s tried-release list with its CURRENT release added — the JSON string to store.
+
+    Every path that sends a record back for a different release has to do this, or "different"
+    isn't guaranteed: the search re-runs, scores the same candidates the same way, and picks the
+    identical top release. The vanished-torrent reconcile skipped it, which is what turned a
+    silently-failed grab into an endless grab -> reconcile -> re-grab loop."""
+    import json as _json
+    tried = _json.loads(rec.get("tried") or "[]")
+    if rec.get("dl_id") and rec["dl_id"] not in tried:
+        tried.append(rec["dl_id"])
+    return _json.dumps(tried)
+
 # ...but the donor FILES must survive until the merge consumes them, so the orphan sweep keeps
-# its hands off ready/merging (and review/sync_fail, kept for manual resync).
-KEEP_DONOR_STATES = ("downloading", "ready", "merging", "review", "sync_fail")
+# its hands off ready/merging (and review/sync_fail, kept for manual resync). `error` is included
+# because the AI's advertised repair for a numbering mismatch is `POST /episode/{id}/assign
+# {path}` — it needs those exact files, and the host dispatcher runs on a cron minutes to hours
+# later. Deleting them 3 minutes after the error made that repair path dead on arrival.
+KEEP_DONOR_STATES = ("downloading", "ready", "merging", "review", "sync_fail", "error")
 
 
 def _dl_hashes(states):
@@ -465,12 +521,24 @@ def ingest_movie(m, cfg, refresh=False):
     # `ignored` is left alone: that is a deliberate decision, not an oversight.
     prev = (existing or {}).get("status")
     status = reopen_status(prev, (existing or {}).get("updated"), cfg)
+    extra = {}
     if status != prev and prev:
         core.log(f"scan: {m.get('title')} is marked {prev} but still needs "
                  f"{'+'.join(miss_a + miss_s)} -> re-opening")
-    core.set_status(m["tmdbId"], status,
+        # A re-opened record starts a fresh run at its gap, so give it a fresh budget. Carrying
+        # the spent `attempts` over meant a record re-opened at attempts=4 grabbed one release and
+        # then hit `attempts >= max_sync_retries` on its first stall — an effective budget of 1
+        # per 24-hour cooldown instead of the configured 4. recheck_settled and retry_movie both
+        # reset it deliberately; this path just never did.
+        # DONOR_RESET because re-opening means "the last donor didn't finish the job, go find
+        # another": its file, its id and — critically — its sync offset all describe a release
+        # this record is about to stop using.
+        extra.update(attempts=0, **DONOR_RESET)
+    # `expect=prev` so a record the merge worker claimed between the read above and this write is
+    # left alone rather than being dragged back to a queued state underneath a running merge.
+    core.set_status(m["tmdbId"], status, expect=prev,
                     audio_langs=alangs, sub_langs=slangs, needs=need,
-                    need_audio=",".join(miss_a), need_subs=",".join(miss_s))
+                    need_audio=",".join(miss_a), need_subs=",".join(miss_s), **extra)
     return "gap"
 
 
@@ -556,6 +624,11 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need
     return sc
 
 
+class SearchUnavailable(Exception):
+    """The indexer could not be reached. Distinct from "the indexer returned nothing", which is a
+    real answer that legitimately settles a record into `no_release`."""
+
+
 def candidates(tmdb_id, cfg=None, include_tried=False):
     """Scored English/MULTI release candidates for a movie (no grab) — powers the UI's
     interactive search and the auto-picker."""
@@ -574,7 +647,13 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
     try:
         results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
     except Exception as e:
-        core.log(f"candidates {tmdb_id}: {e}"); return []
+        # An empty list is a VERDICT — "nothing suitable exists" — and the caller writes
+        # `no_release`, which then sits out `no_release_retry_h` (24h by default). A Prowlarr
+        # restart or a network blip during a sweep is not that verdict, and returning [] made a
+        # transient failure indistinguishable from one, parking a slice of the backlog for a day
+        # on a decision nobody made.
+        core.log(f"candidates {tmdb_id}: {e}")
+        raise SearchUnavailable(str(e)) from e
     import json as _json
     tried = set(_json.loads(mv.get("tried") or "[]"))
     out = []
@@ -598,10 +677,26 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
     cfg = cfg or core.load_config()
     if do_grab is None:
         do_grab = (cfg["grab_mode"] == "auto")
-    if not core.get_movie(tmdb_id):
+    mv = core.get_movie(tmdb_id)
+    if not mv:
         return
-    core.set_status(tmdb_id, "searching")
-    cand = candidates(tmdb_id, cfg)
+    # Claim pending -> searching atomically. A plain set_status let two overlapping sweeps (the
+    # hourly search job, the 10-minute finish refill and any webhook can all be in stage_search at
+    # once) both pick up the same record and grab two different releases for it — the second
+    # dl_hash overwriting the first and orphaning a torrent. A record already in `searching`
+    # belongs to whoever claimed it.
+    if mv["status"] == "pending" and not core.claim_movie(tmdb_id, "pending", "searching"):
+        return
+    try:
+        cand = candidates(tmdb_id, cfg)
+    except SearchUnavailable as e:
+        # Indexer unreachable — say nothing about whether a release exists. Back to `pending` so
+        # the next sweep retries, instead of `no_release` and a 24-hour cooldown. Then RE-RAISE:
+        # every remaining query this cycle would fail the same way, and stage_search stops rather
+        # than burning its budget confirming it. Swallowing it here made that handler dead code.
+        core.set_status(tmdb_id, "pending", progress="")
+        core.log(f"search {tmdb_id}: indexer unavailable ({e}) -> left pending for the next sweep")
+        raise
     if not cand or cand[0]["score"] < cfg["score_threshold"] or cand[0]["seeders"] < cfg["min_seeders"]:
         core.set_status(tmdb_id, "no_release",
                         candidate_title=(cand[0]["title"] if cand else None),
@@ -708,12 +803,23 @@ def drop_stalled(mv, t, cfg):
              f"({int((t.get('time_active',0) or 0)/60)}min, {seeds} seeds) -> blocklisted, re-searching")
     if attempts >= cfg.get("max_sync_retries", 4):
         core.set_status(tmdb_id, "no_release", tried=_json.dumps(tried), attempts=attempts,
-                        dl_hash=None, dl_id=None, en_file=None, progress="",
+                        **DONOR_RESET, progress="",
                         error=f"all candidate releases stalled after {attempts} tries")
         return
     core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
-                    dl_hash=None, dl_id=None, en_file=None, error=None, progress="")
-    search_movie(tmdb_id, cfg)
+                    **DONOR_RESET, error=None, progress="")
+    # Dropping the dead torrent is right even while paused — it frees a slot and costs nothing.
+    # Starting a NEW download is not: "paused" means no new searches, grabs or merges, and a
+    # search during a rescan grabs against gaps the half-finished scan is about to re-price.
+    # This 3-minute sweep drove straight through both brakes.
+    why = hold_reason(cfg)
+    if why:
+        core.log(f"stalled {tmdb_id}: dropped, re-search held off ({why})")
+        return
+    try:
+        search_movie(tmdb_id, cfg)
+    except SearchUnavailable:
+        pass          # the record is back at `pending`; the next sweep retries
 
 
 _WEDGE_SINCE = {"ts": None}
@@ -763,10 +869,11 @@ def ai_health_check(cfg=None):
         seen = set(json.load(open(seen_path)))
     except Exception:
         seen = set()
-    news = []
+    news, live = [], set()
     for st in ("error", "review", "sync_fail"):
         for m in core.get_movies(st):
             rk = f"movie:{m['tmdb_id']}:{st}"
+            live.add(rk)
             if rk in seen: continue
             seen.add(rk)
             core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
@@ -774,19 +881,29 @@ def ai_health_check(cfg=None):
                          "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
         for e in core.get_episodes(st):
             rk = f"episode:{e['id']}:{st}"
+            live.add(rk)
             if rk in seen: continue
             seen.add(rk)
             core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
             news.append({"type": "episode", "status": st, "id": e["id"],
                          "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
                          "error": (e.get("error") or "")[:200]})
+    # Forget records that are no longer in a problem state. The set only ever grew before, so a
+    # title the AI FIXED stayed "already seen" forever — when it failed again months later for an
+    # unrelated reason it was silently never escalated, breaking the contract that every failure
+    # reaches the AI within 3 minutes. It also grew without bound, while its sibling
+    # ai_tickets_filed.json is capped at 3000. Newly-paged keys are in `live` by construction, so
+    # intersecting keeps them.
+    stale = seen - live
+    filed = True
     if news:
-        json.dump(sorted(seen), open(seen_path, "w"))
         key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
-        core.ticket("errors-review",
+        # once=False: the per-record dedup above already decided these are NEW pages, and the
+        # (kind,key) guard would refuse the identical record-set a second time — see core.ticket.
+        filed = core.ticket("errors-review",
                     f"{len(news)} NEW record(s) in error/review/sync_fail",
                     {"records": news[:60], "total_new": len(news),
-                     "api": "http://10.0.1.5:8090/api (host) / http://localhost:8080/api (in-container)",
+                     "api": agent._api_hint(),
                      "report_back": (
                          "After handling each record, POST its outcome so it leaves the operator's "
                          "manual-review queue: movies -> /movie/{id}/ai_result, episodes -> "
@@ -822,7 +939,18 @@ def ai_health_check(cfg=None):
                          "act on a result with POST /movie|episode/{id}/grab {\"link\":...}.",
                          "POST /movie|episode/{id}/another | /research | /retry | /ignore",
                          "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
-                    key=key)
+                    key=key, once=False)
+    if stale or (news and filed):
+        # Only remember records whose ticket actually reached the directory. Marking them seen
+        # when the write was refused (a previous errors-review.json still awaiting dispatch)
+        # meant they were never paged again once it was consumed.
+        seen &= live
+        with open(seen_path, "w") as f:
+            json.dump(sorted(seen), f)
+        if stale:
+            core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
+    elif news and not filed:
+        core.log(f"ai: {len(news)} record(s) not paged yet (a ticket is still awaiting dispatch)")
 
     # Staleness: a record the dispatcher took and never reported on within ai_stale_min, still in
     # a problem state -> it crashed or failed silently. Flag it for a human.
@@ -907,9 +1035,37 @@ def sweep_stalled(cfg=None):
             drop_stalled(mv, t, cfg)
 
 
-def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
+def _sync_fail_reason(m, fps_diff, drift, base_fps, donor_fps):
+    """Why a sync attempt was rejected, phrased so the NEXT actor can act on it.
+
+    "framerates differ but no reliable drift could be measured — review or pick another release"
+    named a manual action and withheld the one fact that makes the automatic one possible: the two
+    framerates. The stretch mkvmerge needs is just donor_fps/base_fps, so putting the numbers and
+    the computed ratio in the message means the on-call AI can go straight to
+    `/set_sync {"drift": …}` instead of guessing — or reading them back out of a probe."""
+    if m is not None and fps_diff and not drift:
+        if base_fps and donor_fps:
+            k = donor_fps / base_fps
+            # ffprobe reports 23.976 rounded, not 24000/1001, so the raw division lands a hair off
+            # the real transfer ratio. Snap to the textbook value when it is obviously the one
+            # meant — that is the number to hand someone, and mkvmerge applies it exactly.
+            near = min(sync.RATE_RATIOS, key=lambda r: abs(r - k))
+            if abs(near - k) < 1e-3 and abs(near - 1.0) > 1e-9:
+                k = near
+            return (f"framerates differ ({donor_fps} donor vs {base_fps} library) and the rate "
+                    f"test could not confirm a stretch; the arithmetic ratio is {k:.7f} "
+                    f"(POST /set_sync {{\"drift\": {k:.7f}}} to apply it)")
+        return "framerates differ but no reliable drift could be measured"
+    return "low-confidence sync"
+
+
+def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
     """A grabbed release didn't sync. Blocklist it, delete its download, and re-search for
-    another release — or give up (sync_fail) after max_sync_retries."""
+    another release — or land in `final` once max_sync_retries is spent.
+
+    `final="review"` asks a human instead of giving up, and KEEPS the donor: the whole point of
+    that state is that someone (or the on-call AI, via /sync_probe then /set_sync) can still
+    align this exact pair, and that needs the file to still be there."""
     import json as _json
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
@@ -917,19 +1073,22 @@ def reject_and_retry(tmdb_id, reason, cfg=None, delta=None):
     if mv.get("dl_id") and mv["dl_id"] not in tried:
         tried.append(mv["dl_id"])
     attempts = (mv.get("attempts") or 0) + 1
-    try:
-        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
-        if mv.get("dl_hash"):
-            qb.delete([mv["dl_hash"]], delete_files=True)
-    except Exception:
-        pass
-    if attempts >= cfg.get("max_sync_retries", 4):
-        core.set_status(tmdb_id, "sync_fail", tried=_json.dumps(tried), attempts=attempts,
+    spent = attempts >= cfg.get("max_sync_retries", 4)
+    keep_donor = spent and final == "review"
+    if not keep_donor:
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            if mv.get("dl_hash"):
+                qb.delete([mv["dl_hash"]], delete_files=True)
+        except Exception:
+            pass
+    if spent:
+        core.set_status(tmdb_id, final, tried=_json.dumps(tried), attempts=attempts, progress="",
                         sync_delta=delta, error=f"{reason}; no compatible release after {attempts} tries")
-        core.log(f"merge {tmdb_id}: giving up after {attempts} tries ({reason})")
+        core.log(f"merge {tmdb_id}: {final} after {attempts} tries ({reason})")
     else:
         core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
-                        dl_hash=None, dl_id=None, en_file=None, error=None)
+                        **DONOR_RESET, error=None)
         core.log(f"merge {tmdb_id}: {reason} -> trying another release (attempt {attempts}/{cfg.get('max_sync_retries',4)})")
 
 
@@ -955,7 +1114,7 @@ def retry_movie(tmdb_id, cfg=None):
         except Exception as ex:
             core.log(f"retry {tmdb_id}: donor drop failed: {ex}")
     core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
-                    dl_hash=None, dl_id=None, en_file=None, progress="")
+                    **DONOR_RESET, **AI_RESET, progress="")
     return True
 
 
@@ -1053,6 +1212,43 @@ def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, 
     return st
 
 
+# ---------------------------------------------------------------- MUX (mkvmerge)
+def _unlink(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        core.log(f"cleanup: could not remove {path}: {e}")
+
+
+def run_mux(cmd, out, cfg=None):
+    """Run one mkvmerge, returning (ok, error). Always removes a partial `out` on failure.
+
+    Two things every mux site got wrong. **No timeout**: a wedged mkvmerge — a stalled /mnt/user
+    read, or the iGPU driver hanging the decode the sync stage feeds it — parked the merge worker
+    forever, and at the default `max_parallel_merges: 1` that is the whole merge pipeline, with
+    nothing detecting or reporting it. **No cleanup**: on rc>=2 (disk full being the classic
+    cause) the half-written file was left in `<libdir>/_merged/`, inside the folder Plex indexes,
+    where it can be picked up as an alternate version — and where it compounds the very disk-full
+    that produced it, once per retry.
+
+    rc=1 is mkvmerge's "completed with warnings", which is a success."""
+    cfg = cfg or core.load_config()
+    timeout = max(60, int(cfg.get("mux_timeout_min", 240)) * 60)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _unlink(out)
+        return False, f"mkvmerge exceeded {timeout // 60}min and was killed"
+    except Exception as e:
+        _unlink(out)
+        return False, f"mkvmerge failed to start: {e}"
+    if r.returncode in (0, 1):
+        return True, None
+    _unlink(out)
+    return False, f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}"
+
+
 # ---------------------------------------------------------------- PROBE (local bins)
 def _ffprobe(path, args):
     try:
@@ -1092,6 +1288,62 @@ def _find_video(folder):
     return best
 
 
+def resolve_donor_path(cfg, dl_hash, cached, tag=""):
+    """The donor's CURRENT path, re-asked of qB when the cached one no longer resolves.
+
+    `en_file` is captured when a download completes, from the torrent's `content_path`. But qB
+    then MOVES the finished torrent out of its incomplete directory into the completed one, and
+    the merge — which runs later, from a queue — still holds the pre-move path. `os.path.exists`
+    fails, and the record is marked `merge: missing en_file` while the file is sitting on disk
+    perfectly intact under its new name. That is a stale cached path, not a missing donor.
+
+    (Specifically NOT the Unraid mover: both containers read through /mnt/user, which is a FUSE
+    union the mover is transparent to. Nothing here is mover-aware.)
+
+    Asking qB is the fix, because qB is the thing that moved it and always knows where it is now.
+    Returns an existing path, or None when the donor is genuinely gone — in which case the
+    caller's existing error path is still exactly right."""
+    if cached and os.path.exists(cached):
+        return cached                       # fast path: nothing moved
+    if not dl_hash:
+        return None
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+        t = qb.torrent(dl_hash)
+    except Exception as e:
+        core.log(f"donor re-resolve{tag}: qB error {e}")
+        return None
+    if not t:
+        return None                         # qB no longer has it -> genuinely gone
+    for raw in (t.get("content_path"), t.get("save_path")):
+        p = _qb_to_local(raw or "", cfg)
+        if not p or not os.path.exists(p):
+            continue
+        vid = _find_video(p) if os.path.isdir(p) else p
+        if vid and os.path.exists(vid):
+            if vid != cached:
+                core.log(f"donor re-resolve{tag}: qB moved it -> {vid}")
+            return vid
+    # content_path/save_path didn't land: fall back to the file list, which is relative to
+    # save_path and survives a rename of the torrent's own root folder.
+    try:
+        root = _qb_to_local(t.get("save_path") or "", cfg)
+        best = None
+        for f in qb.files(dl_hash) or []:
+            name = f.get("name") or ""
+            if not name.lower().endswith(VIDEXT):
+                continue
+            p = os.path.join(root, name)
+            if os.path.exists(p) and (best is None or (f.get("size") or 0) > best[0]):
+                best = ((f.get("size") or 0), p)
+        if best:
+            core.log(f"donor re-resolve{tag}: matched via file list -> {best[1]}")
+            return best[1]
+    except Exception as e:
+        core.log(f"donor re-resolve{tag}: file list failed: {e}")
+    return None
+
+
 # ---------------------------------------------------------------- MERGE + FINISH
 def _video_quality(path, dur):
     """(height, video_bitrate) — to pick the better-looking source. mkv often omits
@@ -1117,10 +1369,9 @@ def _place_multi(en, mv, cfg, tmdb_id):
     outdir = os.path.dirname(libfile) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
-    r = subprocess.run(["mkvmerge", "-o", out, en], capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error",
-                        error=f"multi remux rc={r.returncode}: {media.mkv_error(r, 200)}"); return
+    ok, err = run_mux(["mkvmerge", "-o", out, en], out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", error=f"multi remux: {err}"); return
     core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
                     merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
@@ -1175,9 +1426,20 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     replaces the library file IN PLACE (keeps its name, so Plex/Radarr paths stay valid)."""
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
-    if not mv or not mv.get("en_file") or not mv.get("french_path"):
-        core.set_status(tmdb_id, "error", error="merge: missing en_file or french_path"); return
-    en, fr = mv["en_file"], mv["french_path"]
+    if not mv or not mv.get("french_path"):
+        core.set_status(tmdb_id, "error", error="merge: missing french_path"); return
+    # Re-ask qB where the donor is before declaring it missing: it moves a torrent out of its
+    # incomplete directory on completion, and the path we cached at promote time is then stale.
+    # See resolve_donor_path — this is the "merge: missing en_file" that fires on donors sitting
+    # intact on disk. A new path is persisted so the next stage (and the operator) sees the truth.
+    en = resolve_donor_path(cfg, mv.get("dl_hash"), mv.get("en_file"), tag=f" {tmdb_id}")
+    if en and en != mv.get("en_file"):
+        core.set_status(tmdb_id, mv["status"], en_file=en)
+    fr = mv["french_path"]
+    if not en:
+        core.set_status(tmdb_id, "error", progress="",
+                        error="merge: donor file missing (not on disk, and qB no longer has it)")
+        return
     if not (os.path.exists(en) and os.path.exists(fr)):
         core.set_status(tmdb_id, "error", error="merge: file(s) not found on disk"); return
     ei, fi = probe(en), probe(fr)
@@ -1212,12 +1474,17 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         core.log(f"merge {tmdb_id}: release is lower-res than the library file -> keeping the "
                  f"library video, grafting its audio instead")
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
-    offset = mv.get("sync_offset_ms") or 0
+    # ONLY a deliberately-set offset skips detection. A merge also stores what it measured, and
+    # reading that back as an instruction meant a re-opened record (a scan finding a remaining
+    # gap re-opens `merged` by design) muxed a completely different donor with the previous
+    # donor's offset — no detection, no error, and a permanently desynced file marked `merged`.
+    manual = bool(mv.get("sync_manual"))
+    offset = (mv.get("sync_offset_ms") or 0) if manual else 0
     # Different framerates (e.g. 25 vs 23.976 PAL speedup) need a linear-drift STRETCH, not a
     # constant offset. We no longer reject these outright: the drift detector below corrects
     # them when the sync is confident (high R²), otherwise routes to review.
     fps_diff = not sync.fps_close(ei["fps"], fi["fps"])
-    if fps_diff and not offset and not cfg.get("auto_sync", True):
+    if fps_diff and not manual and not cfg.get("auto_sync", True):
         reject_and_retry(tmdb_id, f"framerate differs ({ei['fps']} vs {fi['fps']}), auto-sync off", cfg, delta)
         return
     # keep the better video; the other source donates its audio
@@ -1261,30 +1528,31 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     # A manually-set offset skips detection. Honour a stored stretch ratio too, so a
     # known rate correction (e.g. a PAL 1.0427 ratio) can be applied by hand via
     # /set_sync when detection can't measure it.
-    drift = (mv.get("sync_drift") or None) if offset else None
+    drift = (mv.get("sync_drift") or None) if manual else None
     if drift and abs(drift - 1.0) < 1e-6:
         drift = None
-    if not offset and cfg.get("auto_sync", True):
+    if not manual and cfg.get("auto_sync", True):
         core.set_status(tmdb_id, "merging", progress="sync: starting", error=None)
         m, conf, method, drift = sync.detect(
             base, donor, 0, (daidx[ids[0]] if ids else 0),
             min(ei["dur"] or 0, fi["dur"] or 0), cfg, tag=f" {tmdb_id}",
-            on_progress=lambda msg: core.set_status(tmdb_id, "merging", progress=msg),
+            on_progress=lambda msg: _beat("movie", tmdb_id, msg),
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
             # m is None  -> inconsistent/low-confidence sync.
             # fps_diff & no drift -> framerates differ but only a constant offset was found
             #   (e.g. audio fallback); a constant can't correct frame drift, so don't risk it.
-            why = ("framerates differ but no reliable drift could be measured"
-                   if (m is not None and fps_diff and not drift)
-                   else "low-confidence sync")
-            if cfg.get("sync_review", True):
-                core.set_status(tmdb_id, "review", sync_delta=delta, progress="",
-                                error=f"{why} — review or pick another release")
-                core.log(f"merge {tmdb_id}: {why} -> review")
-            else:
-                reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta)
+            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+            # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit here
+            # on the very first failure, so `max_sync_retries` — the budget that exists to try
+            # four DIFFERENT releases — was never spent, and every sync failure became a manual
+            # "pick another release" that nothing in the pipeline would ever do for you. A
+            # different release is by far the likeliest fix (one at the library's own framerate
+            # simply works), it is fully automatic, and it costs a download slot. Review is what
+            # happens when that budget is GONE, not instead of it.
+            reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
+                             final="review" if cfg.get("sync_review", True) else "sync_fail")
             return
         if abs(m) >= 40 or drift:
             offset = int(round(m))
@@ -1293,7 +1561,8 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     what = "audio" if ids else ""
     if subs:
         what = (what + "+subs") if what else "subs"
-    core.set_status(tmdb_id, "merging", sync_delta=delta, progress=f"muxing {what}…")
+    core.set_status(tmdb_id, "merging", sync_delta=delta, progress=f"muxing {what}…",
+                    updated=time.time())
     # output replaces the LIBRARY (french) file in place — keep its name; force .mkv
     libfile = mv["french_path"]
     outdir = os.path.dirname(libfile) + "/_merged"
@@ -1301,12 +1570,16 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     cmd = ["mkvmerge", "-o", out, base] + \
           _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):     # mkvmerge rc=1 = warnings (ok)
-        core.set_status(tmdb_id, "error", error=f"mkvmerge rc={r.returncode}: {media.mkv_error(r)}")
+    ok, err = run_mux(cmd, out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", progress="", error=err)
         return
+    # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single
+    # /set_sync keep skipping detection for every future donor this record ever gets — the same
+    # replay bug the flag exists to prevent, just gated behind one manual fix. The offset itself
+    # is still recorded, for display and diagnosis.
     core.set_status(tmdb_id, "merged", merged_file=out, progress="", merge_kind="grafted",
-                    sync_offset_ms=offset, sync_drift=drift,
+                    sync_offset_ms=offset, sync_drift=drift, sync_manual=0,
                     added_subs=",".join(sorted({s["lang"] for s in subs})),
                     added_langs=",".join(sorted({langs[i] for i in ids})))
     core.log(f"merge {tmdb_id}: OK video={who} ({bi['dur'] and int(_video_quality(base,bi['dur'])[1]/1000)}kbps "
@@ -1342,7 +1615,8 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
             return
         offset_ms = int(round(m))
     # shift EVERY audio track of that language (a release can carry 2+, e.g. 5.1 + 2.0)
-    j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True).stdout)
+    j = json.loads(subprocess.run(["mkvmerge", "-J", f], capture_output=True, text=True,
+                                  timeout=180).stdout)
     shift_ids = [t["id"] for t in j["tracks"]
                  if t["type"] == "audio" and (t["properties"].get("language") or "").lower().startswith(shift_pfx)]
     if not shift_ids:
@@ -1352,10 +1626,9 @@ def resync_movie(tmdb_id, offset_ms=None, cfg=None, shift_lang=None):
     for sid in shift_ids:
         cmd += ["--sync", f"{sid}:{offset_ms:+d}"]
     cmd += [f]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode not in (0, 1):
-        core.set_status(tmdb_id, "error",
-                        error=f"resync mkvmerge rc={r.returncode}: {media.mkv_error(r)}"); return
+    ok, err = run_mux(cmd, out, cfg)
+    if not ok:
+        core.set_status(tmdb_id, "error", error=f"resync {err}"); return
     shutil.move(out, f)
     core.set_status(tmdb_id, "merged", sync_offset_ms=offset_ms, error=None)
     core.log(f"resync {tmdb_id}: shifted {len(shift_ids)} {shift_pfx} track(s) {offset_ms:+d}ms")
@@ -1493,7 +1766,15 @@ def stage_search(cfg=None):
         return
     cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0
     for mv in core.get_movies("pending"):
-        search_movie(mv["tmdb_id"], cfg); n += 1
+        try:
+            search_movie(mv["tmdb_id"], cfg)
+        except SearchUnavailable:
+            # Indexer down: every remaining query this cycle fails the same way, so stop rather
+            # than burn the budget confirming it. The records keep their state and retry next
+            # sweep. (search_movie handles its own record; this is only about the sweep.)
+            core.log("search films: indexer unavailable -> abandoning this sweep")
+            return
+        n += 1
         if n >= cap:
             break
 
@@ -1513,13 +1794,50 @@ def _merging_now():
         return set(_MERGING_NOW)
 
 
+def enqueue_merge(kind, ident, **fields):
+    """Put a record on the merge queue instead of merging it in the caller's thread.
+
+    The API used to call `merge_movie()` / `merge_ready_episode()` directly. That took the
+    MERGE_GATE slot, but it did NOT claim the record (only `merge_next` does) and did NOT register
+    it in `_MERGING_NOW` — so an operator or AI merge raced the worker on the same record: both
+    wrote the same `_merged/<name>.mkv` and both moved it onto the library file. It also blocked a
+    request thread for the length of a sync detect plus a 4K remux, far longer than any HTTP client
+    waits, and left the record invisible to the stale-merge requeue, which would then re-queue a
+    merge that was still running.
+
+    Returns (queued, note). `queued` is False when the worker already has this record — a second
+    merge would graft the donor's tracks onto the already-merged output. `note` is non-empty when
+    the item is queued but nothing will drain it yet: the worker only runs while `enabled` and not
+    `paused`, and `enabled` is False on a fresh install, so an endpoint that merged inline before
+    would now silently do nothing while still reporting success. Queueing is right; claiming it
+    started is not."""
+    key = f"{'m' if kind == 'movie' else 'e'}{ident}"
+    if key in _merging_now():
+        return False, "already merging"
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    setter(ident, "ready", progress="queued for merge", **fields)
+    MERGE_WAKE.set()
+    cfg = core.load_config()
+    if not cfg.get("enabled"):
+        return True, "queued, but the pipeline is disabled — nothing will merge until you enable it"
+    if cfg.get("paused"):
+        return True, "queued, but the pipeline is paused — it will merge when you resume"
+    return True, ""
+
+
 def merge_queue(cfg=None):
-    """Everything waiting to merge, oldest first (FIFO — the old LIFO ordering meant the
-    longest-waiting item was served last). Returns [(kind, id, updated), ...]."""
-    items = [("movie", m["tmdb_id"], m.get("updated") or 0) for m in core.get_movies("ready")]
-    items += [("episode", e["id"], e.get("updated") or 0) for e in core.get_episodes("ready")]
-    items.sort(key=lambda x: x[2])
-    return items
+    """Everything waiting to merge: priority first, then oldest-first (FIFO — the old LIFO
+    ordering meant the longest-waiting item was served last).
+
+    Priority has to apply HERE as well as at search time. Getting a requested title downloaded
+    quickly achieves nothing if it then queues behind thirty season-pack episodes, each of which
+    is a sync detect plus a remux. Returns [(kind, id, updated), ...]."""
+    items = [("movie", m["tmdb_id"], m.get("updated") or 0, -(m.get("priority") or 0))
+             for m in core.get_movies("ready")]
+    items += [("episode", e["id"], e.get("updated") or 0, -(e.get("priority") or 0))
+              for e in core.get_episodes("ready")]
+    items.sort(key=lambda x: (x[3], x[2]))
+    return [(k, i, u) for k, i, u, _ in items]
 
 
 def merge_next(cfg=None):
@@ -1671,18 +1989,28 @@ def stage_finish(cfg=None):
             t = next((x for x in torrents
                       if _owns(x.get("save_path", "") + x.get("content_path", ""), tmdb)), None)
         if not t:
-            # torrent vanished from qB (removed/failed) -> re-queue so it searches again
+            # torrent vanished from qB (removed/failed) -> re-queue so it searches again, with
+            # THIS release blocklisted: without that the next search re-picks it and the record
+            # loops grab -> reconcile -> re-grab forever (qb_grab can return a hash qB never
+            # actually accepted, which is the usual way a torrent is "missing" here).
             if not _owns(all_paths, tmdb):
-                core.set_status(mv["tmdb_id"], "pending", dl_hash=None, dl_id=None, en_file=None, error=None)
-                core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued")
+                core.set_status(mv["tmdb_id"], "pending", **DONOR_RESET, error=None,
+                                tried=blocklist(mv))
+                core.log(f"reconcile {mv['tmdb_id']}: download no longer in qB -> re-queued "
+                         f"(release blocklisted)")
             continue
         if (t.get("progress", 0) or 0) < 1.0 and _is_stalled(t, cfg):
             drop_stalled(mv, t, cfg)
     # completed downloads -> merge queue (also runs on its own fast timer)
     promote_completed(cfg)
-    # re-queue merges interrupted by a restart/crash: stuck at 'merging' but not updated
-    # recently (an active merge bumps `updated` every window via the progress field). Skip
-    # anything the worker is merging RIGHT NOW — a long remux writes no progress.
+    # Re-queue merges interrupted by a restart/crash: stuck at 'merging' but not updated recently.
+    # `_merging_now()` is the authoritative "is it running in THIS process" answer, and since every
+    # merge now goes through the worker (the API queues rather than merging inline), it covers all
+    # of them — a restart clears the set, which is exactly when a requeue IS wanted. The 15-minute
+    # `updated` test is only the second line of defence: an active merge heartbeats it (see
+    # `_beat`), because `_set_row` deliberately holds `updated` when the status is unchanged, so
+    # without the heartbeat a merging record's timestamp is frozen at the moment it started and
+    # any merge longer than 15 minutes looked stale.
     live = _merging_now()
     for mv in core.get_movies("merging"):
         if f"m{mv['tmdb_id']}" in live:

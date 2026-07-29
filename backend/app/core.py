@@ -24,7 +24,10 @@ DEFAULTS = {
     "plex2_url": "",                       # optional replica PMS (e.g. http://10.0.1.2:32400)
     "plex2_token": "",                     # replica's own token (usually a different account)
     "plex_media_prefix": "/data",          # how Plex sees what this app mounts at /media
-    "en_indexer_ids": [105, 107],          # The Pirate Bay, Nyaa.si
+    # Prowlarr's numeric indexer IDs are per-INSTANCE, so shipping one install's values means a
+    # fresh deployment silently queries indexers that don't exist there — and an empty result is
+    # then recorded as "no release exists". Empty = search every configured indexer.
+    "en_indexer_ids": [],
     "multi_indexer_ids": [],               # extra indexers to also search for MULTI (e.g. FR trackers)
     "vo_gap_tag": "vo-gap",
     "qb_category": "audio-merge",
@@ -39,6 +42,17 @@ DEFAULTS = {
     "delete_donor": True,
     "french_trackers": [],                         # substrings of tracker URLs to KEEP seeding
     "no_seed_public": True,                        # public donors: stop at 100%, never seed
+    # How the host AI dispatcher reaches this API, e.g. "http://10.0.1.5:8090". Written into every
+    # ticket; empty = tell it only the in-container address. This was hard-coded to one install's
+    # LAN address, as was the CLAUDE.md path below.
+    "api_url": "",
+    "docs_path": "",                               # host path to CLAUDE.md, for the ticket brief
+    # A title arriving via the *arr webhook is one that someone has just ASKED for — that is what
+    # an import event means — so it jumps the queue instead of joining the back of a backlog it
+    # would never reach. Set 0 to disable. If you bulk-import a whole library the hook fires for
+    # everything and priority stops distinguishing anything, which degrades to the old ordering
+    # rather than breaking; turn it off for the duration of an import if that matters.
+    "priority_on_import": 1,
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
@@ -47,7 +61,9 @@ DEFAULTS = {
     "grab_mode": "auto",                   # auto | approval
     "scope_films": True,
     "scope_series": False,
-    "series_pilot": ["The Neighborhood", "Friends", "My Wife and Kids"],  # only these series run (empty = all tagged)
+    # Which series the pipeline acts on; empty = all of them. This used to ship three personal
+    # show names, which quietly limited every other install to those three.
+    "series_pilot": [],
     "sonarr_url": "http://10.0.1.3:8989",
     "sonarr_key": "",
     "sonarr_vo_gap_tag": "vo-gap",
@@ -110,6 +126,14 @@ DEFAULTS = {
     "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
     "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
     "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
+    "mux_timeout_min": 240,                # kill an mkvmerge that runs longer than this. It is a
+                                           # deadlock guard, not a tuning knob — a wedged mux (a
+                                           # stalled /mnt/user read, a hung iGPU decode) held the
+                                           # merge worker forever, and at max_parallel_merges=1
+                                           # that silently stops ALL merging with no error.
+    "sync_decode_timeout_min": 30,         # ...and the same for one sync-detection decode pass,
+                                           # which reads a bounded window (sync_window_dur) and so
+                                           # can never legitimately take this long.
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
@@ -138,10 +162,21 @@ DEFAULTS = {
                                            # in qB at once (a season pack counts as one). vo-merge
                                            # won't grab another until a merge finishes + donor is
                                            # freed, dropping the count below the cap.
+    "db_backup_keep": 7,                   # nightly VACUUM INTO /config/backup/, keeping this
+                                           # many daily snapshots (0 = no backup). The DB is the
+                                           # probe inventory plus every record's state, and it
+                                           # runs in WAL — a plain file copy of it is torn.
     "enabled": False,                      # master switch; off until configured
     "webhook_token": "",                   # optional shared secret for /api/hook/*. Empty =
                                            # no check (matches the rest of this LAN-only API).
                                            # Set it and Radarr/Sonarr must send ?token=… .
+    "api_key": "",                         # optional shared secret for the WHOLE API. Empty = no
+                                           # check, which is the historical behaviour. Set it and
+                                           # every /api call must send `X-API-Key: …` (or
+                                           # ?apikey=…); /api/hook/* is exempt because the *arrs
+                                           # can't be taught an extra header and already have
+                                           # webhook_token. Cross-origin POSTs are refused
+                                           # regardless — see main._guard.
     "paused": False,                       # temporary brake: no NEW searches, grabs or merges.
                                            # Work already in flight finishes (killing mkvmerge
                                            # mid-write would leave a corrupt file), so the load
@@ -152,15 +187,51 @@ DEFAULTS = {
 _lock = threading.Lock()
 
 
+# Whether the persisted config currently fails to parse, and which file state we already
+# complained about. `load_config` runs on EVERY API request and every scheduler tick, so logging
+# the failure each time would bury the real history — the log rotates at 8 MB keeping 3 files, so
+# a broken config would churn through all of it in minutes. Complain once per distinct
+# (mtime, size), i.e. once per edit.
+_CONFIG_BROKEN = {"at": 0.0, "reported": None}
+
+
 def load_config():
     cfg = dict(DEFAULTS)
-    if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = f.read()
+    except OSError:
+        # No file at all is the normal first-run state — and it is also how an operator ACTS ON
+        # the message below, which says "fix or remove the file". Clearing the flag here is what
+        # makes removing it work; keying only off a successful parse left the process refusing to
+        # save for its whole lifetime against a file that no longer existed.
+        _CONFIG_BROKEN.update(at=0.0, reported=None)
+        raw = None
+    if raw is not None:
         try:
-            cfg.update(json.load(open(CONFIG_FILE)))
-        except Exception:
-            pass
-    _SECRETS.clear()
-    _SECRETS.update(str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8)
+            cfg.update(json.loads(raw))
+            _CONFIG_BROKEN.update(at=0.0, reported=None)
+        except Exception as e:
+            # Silently falling back to DEFAULTS is how a truncated config.json erased an install:
+            # every URL and key reads as empty, `enabled` flips to False, and the next save_config
+            # — which starts from this very dict — writes the defaults back over the real file.
+            # Say so loudly, and refuse to save over it (see save_config).
+            try:
+                st = os.stat(CONFIG_FILE)
+                fingerprint = (st.st_mtime, st.st_size)
+            except OSError:
+                fingerprint = None
+            if _CONFIG_BROKEN["reported"] != fingerprint:
+                _CONFIG_BROKEN["reported"] = fingerprint
+                log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
+                    f"REFUSING to overwrite it. Fix or remove the file.")
+            _CONFIG_BROKEN["at"] = _CONFIG_BROKEN["at"] or time.time()
+    # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
+    # every job calls this constantly, and a redact() running inside the clear-to-update window
+    # saw an empty set — writing the secret it was meant to scrub verbatim into the log. Rebinding
+    # is atomic as far as other threads are concerned: they see either the old set or the new one.
+    global _SECRETS
+    _SECRETS = {str(cfg[k]) for k in _SECRET_KEYS if cfg.get(k) and len(str(cfg[k])) >= 8}
     return cfg
 
 
@@ -183,16 +254,37 @@ def migrate_config():
     prof = dict(prof)
     prof["audio"] = ["orig" if a == "jpn" else a for a in aud]
     profiles = dict(cfg["lang_profiles"]); profiles["anime"] = prof
-    save_config({"lang_profiles": profiles})
+    try:
+        save_config({"lang_profiles": profiles})
+    except ConfigUnreadable as e:
+        log(f"config: skipping the jpn -> orig migration ({e})")
+        return       # a startup migration must never be the thing that stops the app coming up
     log("config: anime audio target jpn -> orig (the original language, resolved per title)")
+
+
+class ConfigUnreadable(Exception):
+    """The persisted config exists but can't be parsed, so saving would destroy it."""
 
 
 def save_config(updates: dict):
     with _lock:
         cfg = load_config()
+        if _CONFIG_BROKEN["at"]:
+            # load_config fell back to DEFAULTS, so `cfg` is defaults+this change. Writing that
+            # would replace every setting the operator ever entered with a default.
+            raise ConfigUnreadable(
+                f"{CONFIG_FILE} is present but unparseable; refusing to overwrite it")
         cfg.update({k: v for k, v in updates.items() if k in DEFAULTS})
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
+        # Write-then-rename: json.dump straight onto CONFIG_FILE truncates first, so a crash or a
+        # power cut mid-dump leaves a half-written file that parses as nothing. os.replace is
+        # atomic on POSIX, so a reader sees either the old file or the new one.
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_FILE)
     return load_config()
 
 
@@ -204,7 +296,7 @@ def save_config(updates: dict):
 _SECRET_QS = re.compile(r'((?:api_?key|apikey|token|passkey|rss_?key|auth|pass(?:word)?)=)[^&\s]+',
                         re.I)
 _SECRET_KEYS = ("prowlarr_key", "radarr_key", "sonarr_key", "plex_token", "plex2_token",
-                "qb_pass", "webhook_token")
+                "qb_pass", "webhook_token", "api_key")
 _SECRETS = set()      # the configured values themselves, refreshed whenever config is read
 
 
@@ -218,30 +310,65 @@ def redact(text):
     return out
 
 
+LOG_MAX_BYTES = 8 * 1024 * 1024        # rotate past this
+LOG_KEEP = 3                           # vo-merge.log.1 .. .3
+
+
+def _rotate_log():
+    """Roll vo-merge.log once it passes LOG_MAX_BYTES, keeping LOG_KEEP old files.
+
+    Nothing truncated this file before, so a busy install grew it without limit — and `tail_log`
+    read the WHOLE thing into memory on every call, on paths as hot as the UI's log poll and the
+    per-record AI context built every 3 minutes."""
+    try:
+        if os.path.getsize(LOG_FILE) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for i in range(LOG_KEEP - 1, 0, -1):
+            src, dst = f"{LOG_FILE}.{i}", f"{LOG_FILE}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(LOG_FILE, f"{LOG_FILE}.1")
+    except OSError:
+        pass                            # a failed rotation must never stop us logging
+
+
 def log(msg: str):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    _rotate_log()
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
     print(line, flush=True)
 
 
-def ticket(kind, summary, context=None, key=None, force=False):
+def ticket(kind, summary, context=None, key=None, force=False, once=True):
     """File an issue ticket for the host's AI dispatcher (an Unraid user script cron
     that runs the Claude Code CLI on each ticket). Tickets land in /config/ai-tickets/
     which the host reads as appdata/vo-merge/ai-tickets/. A (kind,key) pair is filed
     only once (persisted in ai_tickets_filed.json) so a standing condition doesn't
     re-page after being handled. force=True (operator-initiated, e.g. the Review tab's
     Send-to-AI button) skips the once-only guard and overwrites a pending same-kind
-    ticket. Returns True if a ticket was filed."""
+    ticket. Returns True if a ticket was filed.
+
+    `once=False` skips ONLY the (kind,key) guard, keeping the "already awaiting dispatch"
+    one. `ai_health_check` needs that: it keys its batch on a hash of the record ids, so the
+    same record failing again months later produces the same key and was silently refused a
+    ticket — while the record had already been stamped ai_status='pending'. With no ticket on
+    disk, `undispatched()` couldn't see it either, so the staleness sweep then reported "the AI
+    did not respond within 60m" about a page that was never sent. That path does its own
+    per-record dedup (ai_seen_records.json), which is what makes this guard redundant there."""
     try:
         seen_path = os.path.join(CONFIG_DIR, "ai_tickets_filed.json")
         try:
-            seen = set(json.load(open(seen_path)))
+            with open(seen_path) as f:
+                seen = set(json.load(f))
         except Exception:
             seen = set()
         k = f"{kind}:{key or ''}"
-        if k in seen and not force:
+        if once and k in seen and not force:
             return False
         d = os.path.join(CONFIG_DIR, "ai-tickets")
         os.makedirs(d, exist_ok=True)
@@ -254,7 +381,8 @@ def ticket(kind, summary, context=None, key=None, force=False):
                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S")},
                       f, ensure_ascii=False, indent=1, default=str)
         seen.add(k)
-        json.dump(sorted(seen)[-3000:], open(seen_path, "w"))
+        with open(seen_path, "w") as f:
+            json.dump(sorted(seen)[-3000:], f)
         log(f"AI-TICKET {kind}: {summary[:70]}")
         return True
     except Exception as e:
@@ -263,10 +391,32 @@ def ticket(kind, summary, context=None, key=None, force=False):
 
 
 def tail_log(n=300):
+    """Last `n` lines, read from the END of the file.
+
+    `f.readlines()[-n:]` materialised the entire log to return 300 lines, and the callers are hot:
+    the UI's log poll, and both AI context builders, which filter tail_log(800) per record while
+    the 3-minute sweep rebuilds contexts. With rotation capping the file at 8 MB that would be
+    survivable, but reading ~64 KB instead of 8 MB is free."""
     if not os.path.exists(LOG_FILE):
         return []
-    with open(LOG_FILE) as f:
-        return f.readlines()[-n:]
+    want = max(1, n)
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            block, data, lines = 8192, b"", 0
+            pos = end
+            while pos > 0 and lines <= want:
+                step = min(block, pos)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                data = chunk + data
+                lines = data.count(b"\n")
+            text = data.decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [ln + "\n" for ln in text.splitlines()[-want:]]
 
 
 @contextmanager
@@ -320,6 +470,20 @@ def init_db():
                                    "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                    # rate-stretch ratio applied at merge (PAL etc); 1.0 = none
                                    "sync_drift": "REAL",
+                                   # 1 = the offset/drift above were set DELIBERATELY (an operator
+                                   # or the AI via /set_sync) and must be applied as-is. A merge
+                                   # also records what it measured, for display — but that is a
+                                   # fact about the donor it measured, not an instruction for the
+                                   # next one, and treating the two the same is how a re-opened
+                                   # record re-merged an unrelated release with the old release's
+                                   # offset and skipped detection entirely.
+                                   "sync_manual": "INTEGER DEFAULT 0",
+                                   # 0 = normal, >0 = jump the queue. A title someone has just
+                                   # ASKED for shouldn't wait behind a thousand-item backlog that
+                                   # nobody is watching — the search sweep and the merge queue
+                                   # both order on this before their usual recency/FIFO rule.
+                                   "priority": "INTEGER DEFAULT 0",
+
                                    # what the FILE actually holds (from mkvmerge, not metadata)
                                    "audio_langs": "TEXT", "sub_langs": "TEXT",
                                    "needs": "TEXT",          # audio | subs | audio+subs
@@ -330,6 +494,26 @@ def init_db():
                                    # replaced (we used the download as the file) | already (it
                                    # met its profile on its own — we did nothing). NULL = legacy.
                                    "merge_kind": "TEXT"})
+
+
+def _ensure_indexes(c):
+    """Indexes for the queries the background jobs run constantly.
+
+    There were none beyond the primary keys, so every `WHERE status=? ORDER BY updated DESC` was a
+    full table scan — and those back stage_search, promote_completed (every minute), the stall
+    sweep, `_dl_hashes` (which scans once per state per call), the dashboard's 5000-row attention
+    query and ai_log. The episodes table holds one row per tracked episode, so a large TV library
+    makes that thousands of rows scanned several times a minute, with UI polls on top."""
+    for table in ("movies", "episodes"):
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status)")
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated ON {table}(updated)")
+        # partial: ai_log selects the handful of rows that have ever been escalated
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ai_at ON {table}(ai_at) "
+                  f"WHERE ai_at IS NOT NULL")
+    # the merge queue and the attention panel both sort a status subset by recency
+    c.execute("CREATE INDEX IF NOT EXISTS idx_movies_status_updated ON movies(status, updated)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_episodes_status_updated ON episodes(status, updated)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_episodes_series ON episodes(series_id, season)")
 
 
 def _ensure_cols(c, table, cols):
@@ -360,6 +544,8 @@ def init_tv():
                                      # AI-review round-trip (see movies table)
                                      "ai_status": "TEXT", "ai_verdict": "TEXT", "ai_at": "REAL",
                                      "sync_drift": "REAL",
+                                     "sync_manual": "INTEGER DEFAULT 0",   # see movies table
+                                     "priority": "INTEGER DEFAULT 0",   # see movies table
                                      # what the FILE actually holds (see movies table)
                                      "audio_langs": "TEXT", "sub_langs": "TEXT",
                                      "needs": "TEXT", "added_subs": "TEXT",
@@ -368,6 +554,13 @@ def init_tv():
                                      # inputs the scan used, or the two pick different profiles
                                      "orig_lang": "TEXT",
                                      "merge_kind": "TEXT"})   # see movies table
+
+
+def init_indexes():
+    """Create the query indexes. Separate from init_db/init_tv because it spans both tables, so
+    it has to run after each has been created."""
+    with db() as c:
+        _ensure_indexes(c)
 
 
 def init_probe_cache():
@@ -473,6 +666,39 @@ def prune_missing_records():
     return tuple(out)
 
 
+BACKUP_DIR = os.path.join(CONFIG_DIR, "backup")
+
+
+def backup_db(keep=7):
+    """Snapshot the database, keeping the last `keep` daily copies.
+
+    This file is the app's entire memory — the probe cache (the only complete inventory of the
+    library) plus every record's pipeline state — and nothing backed it up. It runs in WAL mode,
+    so copying the file while the app is live is torn by construction; `VACUUM INTO` takes a
+    consistent snapshot through SQLite itself, which is the supported way to do this hot."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"vo-merge-{time.strftime('%Y%m%d')}.db")
+    tmp = dest + ".tmp"
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        with db() as c:
+            c.execute("VACUUM INTO ?", (tmp,))
+        os.replace(tmp, dest)
+    except Exception as e:
+        log(f"backup failed: {e}")
+        return None
+    old = sorted(f for f in os.listdir(BACKUP_DIR)
+                 if f.startswith("vo-merge-") and f.endswith(".db"))
+    for f in old[:-keep] if keep > 0 else []:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, f))
+        except OSError:
+            pass
+    log(f"backup: {dest} ({os.path.getsize(dest) // 1024} KB), keeping {keep}")
+    return dest
+
+
 def probe_stats():
     with db() as c:
         r = c.execute("SELECT COUNT(*) n, SUM(err IS NOT NULL) bad FROM probes").fetchone()
@@ -480,29 +706,34 @@ def probe_stats():
 
 
 def upsert_episode(e: dict):
+    """Insert or refresh an episode's metadata columns. Never touches `status`.
+
+    SELECT-then-INSERT raced: a webhook ingest and the scheduled scan can reach a new title at the
+    same moment, and the loser's INSERT raised IntegrityError, aborting that whole scan pass. The
+    single ON CONFLICT statement is atomic — `put_probe` already did it this way."""
     cols = ["id", "series_id", "series_title", "tvdb_id", "season", "episode",
             "french_path", "quality", "poster", "series_type"]
     with db() as c:
-        ex = c.execute("SELECT status FROM episodes WHERE id=?", (e["id"],)).fetchone()
-        if ex:
-            c.execute("""UPDATE episodes SET series_title=?,tvdb_id=?,french_path=?,quality=?,poster=?,series_type=?,updated=?
-                         WHERE id=?""",
-                      (e["series_title"], e["tvdb_id"], e["french_path"], e["quality"],
-                       e.get("poster"), e.get("series_type", "standard"), time.time(), e["id"]))
-        else:
-            c.execute(f"INSERT INTO episodes ({','.join(cols)},updated) "
-                      f"VALUES ({','.join('?'*len(cols))},?)",
-                      tuple(e.get(k) for k in cols) + (time.time(),))
+        c.execute(f"""INSERT INTO episodes ({','.join(cols)},updated)
+                      VALUES ({','.join('?' * len(cols))},?)
+                      ON CONFLICT(id) DO UPDATE SET
+                        series_title=excluded.series_title, tvdb_id=excluded.tvdb_id,
+                        french_path=excluded.french_path, quality=excluded.quality,
+                        poster=excluded.poster, series_type=excluded.series_type,
+                        updated=excluded.updated""",
+                  tuple(e.get(k) for k in cols) + (time.time(),))
 
 
-def set_ep_status(ep_id, status, **fields):
-    _set_row("episodes", "id", ep_id, status, fields)
+def set_ep_status(ep_id, status, expect=None, **fields):
+    return _set_row("episodes", "id", ep_id, status, fields, expect)
 
 
 def get_episodes(status=None):
     with db() as c:
         if status:
-            rows = c.execute("SELECT * FROM episodes WHERE status=? ORDER BY updated DESC", (status,)).fetchall()
+            rows = c.execute("SELECT * FROM episodes WHERE status=? "
+                             "ORDER BY COALESCE(priority,0) DESC, updated DESC",
+                             (status,)).fetchall()
         else:
             rows = c.execute("SELECT * FROM episodes ORDER BY series_title,season,episode").fetchall()
     return [dict(r) for r in rows]
@@ -521,25 +752,23 @@ def ep_status_counts():
 
 
 def upsert_movie(m: dict):
+    """Insert or refresh a movie's metadata columns. Never touches `status`. See upsert_episode
+    for why this is one atomic statement rather than SELECT-then-INSERT."""
     cols = ["tmdb_id", "imdb_id", "radarr_id", "title", "original_title", "year",
             "original_lang", "french_path", "quality", "poster"]
     with db() as c:
-        existing = c.execute("SELECT tmdb_id FROM movies WHERE tmdb_id=?",
-                             (m["tmdb_id"],)).fetchone()
-        if existing:
-            c.execute("""UPDATE movies SET imdb_id=?,radarr_id=?,title=?,original_title=?,
-                         year=?,original_lang=?,french_path=?,quality=?,poster=?,updated=?
-                         WHERE tmdb_id=?""",
-                      (m["imdb_id"], m["radarr_id"], m["title"], m["original_title"],
-                       m["year"], m["original_lang"], m["french_path"], m["quality"],
-                       m.get("poster"), time.time(), m["tmdb_id"]))
-        else:
-            c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
-                          VALUES ({','.join('?'*len(cols))},?)""",
-                      tuple(m.get(k) for k in cols) + (time.time(),))
+        c.execute(f"""INSERT INTO movies ({','.join(cols)},updated)
+                      VALUES ({','.join('?' * len(cols))},?)
+                      ON CONFLICT(tmdb_id) DO UPDATE SET
+                        imdb_id=excluded.imdb_id, radarr_id=excluded.radarr_id,
+                        title=excluded.title, original_title=excluded.original_title,
+                        year=excluded.year, original_lang=excluded.original_lang,
+                        french_path=excluded.french_path, quality=excluded.quality,
+                        poster=excluded.poster, updated=excluded.updated""",
+                  tuple(m.get(k) for k in cols) + (time.time(),))
 
 
-def _set_row(table, key_col, key, status, fields):
+def _set_row(table, key_col, key, status, fields, expect=None):
     """The one writer for both tables. Two timestamps that look incidental decide what the whole
     Overview shows, and both used to be re-stamped by writes that changed nothing:
 
@@ -559,7 +788,14 @@ def _set_row(table, key_col, key, status, fields):
       alone, so an upgrade doesn't dump the whole back catalogue into "Recently merged" at once;
       those fall back to `updated`, which is now stable too.
 
-    Pass `updated=<ts>` explicitly to force a bump."""
+    Pass `updated=<ts>` explicitly to force a bump.
+
+    `expect` guards the write on the row still being in that status, and returns False when it
+    isn't. A scan reads a record, decides what status it should carry, then writes it back — and
+    in between, the merge worker can claim `ready -> merging`. Writing unconditionally put `ready`
+    back underneath a running merge, and the record was then claimed and merged a second time into
+    the same output path. Losing the write is harmless: the scan was only refreshing the language
+    columns, and the next pass redoes it."""
     if fields.get("error"):        # errors quote URLs, which carry apikey=... in the query string
         fields["error"] = redact(fields["error"])
     now = fields.pop("updated", None)
@@ -576,12 +812,17 @@ def _set_row(table, key_col, key, status, fields):
     if status == "merged":
         sets += ",merged_at=CASE WHEN status=? THEN merged_at ELSE ? END"
         vals += ["merged", stamp]
+    where, args = f"{key_col}=?", [key]
+    if expect is not None:
+        where += " AND status=?"
+        args.append(expect)
     with db() as c:
-        c.execute(f"UPDATE {table} SET {sets} WHERE {key_col}=?", tuple(vals) + (key,))
+        cur = c.execute(f"UPDATE {table} SET {sets} WHERE {where}", tuple(vals) + tuple(args))
+        return cur.rowcount == 1
 
 
-def set_status(tmdb_id, status, **fields):
-    _set_row("movies", "tmdb_id", tmdb_id, status, fields)
+def set_status(tmdb_id, status, expect=None, **fields):
+    return _set_row("movies", "tmdb_id", tmdb_id, status, fields, expect)
 
 
 def claim_movie(tmdb_id, from_status, to_status, **fields):
@@ -611,8 +852,11 @@ def claim_episode(ep_id, from_status, to_status, **fields):
 def get_movies(status=None):
     with db() as c:
         if status:
-            rows = c.execute("SELECT * FROM movies WHERE status=? ORDER BY updated DESC",
-                            (status,)).fetchall()
+            # priority first, then the usual recency. A requested title must not sit behind a
+            # backlog it can never overtake on `updated` alone.
+            rows = c.execute("SELECT * FROM movies WHERE status=? "
+                             "ORDER BY COALESCE(priority,0) DESC, updated DESC",
+                             (status,)).fetchall()
         else:
             rows = c.execute("SELECT * FROM movies ORDER BY updated DESC").fetchall()
     return [dict(r) for r in rows]
@@ -622,6 +866,31 @@ def get_movie(tmdb_id):
     with db() as c:
         r = c.execute("SELECT * FROM movies WHERE tmdb_id=?", (tmdb_id,)).fetchone()
     return dict(r) if r else None
+
+
+def set_priority(kind, ident, level):
+    """Set a record's QUEUE priority without touching its pipeline state.
+
+    Priority is orthogonal to status: a record keeps its place in the state machine and only
+    changes where it sits in the search sweep and the merge queue. Deliberately does not move
+    `updated` either — that means "when the state last changed", and bumping it here would
+    reshuffle the attention panel for a change that isn't a state change at all.
+
+    It is NOT cleared when the title finishes. If a merged record is later re-opened because its
+    file is still short of the profile, something someone asked for is still something someone
+    asked for. The cost of being wrong is only ordering."""
+    table, key_col = ("movies", "tmdb_id") if kind == "movie" else ("episodes", "id")
+    with db() as c:
+        cur = c.execute(f"UPDATE {table} SET priority=? WHERE {key_col}=?", (int(level), ident))
+        return cur.rowcount == 1
+
+
+def prioritise_series(series_id, level):
+    """Bump every unfinished episode of a series. TV is requested per SHOW, not per episode."""
+    with db() as c:
+        cur = c.execute("UPDATE episodes SET priority=? WHERE series_id=? "
+                        "AND status NOT IN ('merged','ignored')", (int(level), series_id))
+        return cur.rowcount
 
 
 def status_counts():

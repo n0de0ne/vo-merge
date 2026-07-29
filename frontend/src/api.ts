@@ -6,6 +6,7 @@ export interface Movie {
   merged_file: string | null; sync_delta: number | null; sync_offset_ms: number;
   error: string | null; updated: number; poster?: string | null; progress?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  priority?: number | null;   // >0 = jumps the search sweep and the merge queue
   // read off the FILE by mkvmerge, not from Radarr/Sonarr metadata
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
@@ -23,11 +24,17 @@ export interface Episode {
   sync_delta: number | null; error: string | null; progress?: string | null;
   dl_hash?: string | null; series_type?: string | null;
   ai_status?: string | null; ai_verdict?: string | null; sync_drift?: number | null;
+  priority?: number | null;   // see Movie
   aired?: string | null;   // "S04E15" when releases number this episode differently
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
 }
 export interface TvStatus { counts: Record<string, number>; }
+// What a scan/rescan POST returns: it starts a background pass rather than doing the work in
+// the request, so there is no count to report yet — poll rescanState() for progress.
+export interface RescanStart {
+  ok: boolean; started: boolean; note?: string; state?: RescanState;
+}
 export interface RescanState {
   running: boolean; scope: string; phase: string; started: number; finished: number;
   films: number | null; episodes: number | null; error: string | null;
@@ -91,6 +98,17 @@ export interface CoverageLib {
   audio_of?: Record<string, number>; subs_of?: Record<string, number>;
   targets: { audio: string[]; subs: string[] };
 }
+// When the library reaches a target %, at the rate it is actually going. `eta_days` is null
+// when there is no rate to project from, or when the remaining files are blocked rather than
+// merely pending — `reason` says which, so the panel never shows a date it can't stand behind.
+export interface Forecast {
+  target: number; total: number; complete: number; unreadable: number;
+  pct: number | null; needed: number;
+  rate: Record<string, number>; rate_used: number;
+  blocked: { no_release: number; ignored: number; unreadable: number };
+  eta_days: number | null; eta_ts?: number; reason: string; now: number;
+  libraries: { name: string; total: number; complete: number; pct: number }[];
+}
 export interface Coverage {
   libraries: CoverageLib[]; total: number; complete: number; unreadable: number; probed: number;
 }
@@ -147,10 +165,42 @@ export interface Dash {
   next_runs: Record<string, number>; now: number;
 }
 
+// When the server has an api_key set, every request needs it. It is kept in localStorage so a
+// reload doesn't log you out; a 401 clears it and prompts again, so a rotated key can't leave the
+// UI permanently wedged against a stale one.
+const KEY_STORAGE = "vo-merge.apiKey";
+
+export function getApiKey(): string {
+  try { return localStorage.getItem(KEY_STORAGE) || ""; } catch { return ""; }
+}
+
+export function setApiKey(k: string) {
+  try { k ? localStorage.setItem(KEY_STORAGE, k) : localStorage.removeItem(KEY_STORAGE); } catch { /* private mode */ }
+}
+
+/** Append the API key to a URL loaded by the browser directly (a <video src> or a bare fetch
+ *  can't carry the X-API-Key header). The guard accepts ?apikey= for exactly this. */
+export function withKey(url: string): string {
+  const k = getApiKey();
+  if (!k) return url;
+  return url + (url.includes("?") ? "&" : "?") + "apikey=" + encodeURIComponent(k);
+}
+
+export class Unauthorized extends Error {
+  constructor() { super("API key required"); this.name = "Unauthorized"; }
+}
+
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
+  const key = getApiKey();
   const r = await fetch(url, {
-    headers: { "Content-Type": "application/json" }, ...opts,
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...(key ? { "X-API-Key": key } : {}),
+      ...(opts?.headers || {}),
+    },
   });
+  if (r.status === 401) { setApiKey(""); throw new Unauthorized(); }
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   return r.json();
 }
@@ -165,20 +215,34 @@ export const api = {
     j<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ data }) }),
   test: (which: string) =>
     j<{ ok: boolean; error?: string }>(`/api/test/${which}`, { method: "POST" }),
-  scan: () => j<{ found: number }>("/api/scan", { method: "POST" }),
+  // Now a background scan (see main.do_scan) — same shape as rescan, not { found }.
+  scan: () => j<RescanStart>("/api/scan", { method: "POST" }),
   pause: (on: boolean) =>
     j<{ ok: boolean; paused: boolean; in_flight: string[] }>(
       "/api/pause", { method: "POST", body: JSON.stringify({ on }) }),
   searchAll: () => j<{ ok: boolean; started: boolean; pending?: number; slots?: number | null; note?: string }>(
     "/api/search_all", { method: "POST" }),
   search: (id: number) => j<Movie>(`/api/movie/${id}/search`, { method: "POST" }),
-  merge: (id: number) => j<Movie>(`/api/movie/${id}/merge`, { method: "POST" }),
+  // Queues rather than merges inline (see pipeline.enqueue_merge). `note` says when nothing will
+  // drain the queue — the pipeline being disabled or paused.
+  merge: (id: number) =>
+    j<{ movie: Movie; queued: boolean; note: string }>(`/api/movie/${id}/merge`, { method: "POST" }),
   sync: (id: number, offset_ms: number) =>
     j<Movie>(`/api/movie/${id}/sync`, { method: "POST", body: JSON.stringify({ offset_ms }) }),
   retry: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/retry`, { method: "POST" }),
   ignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/ignore`, { method: "POST" }),
   unignore: (id: number) => j<{ ok: boolean }>(`/api/movie/${id}/unignore`, { method: "POST" }),
   research: (id: number) => j<Movie>(`/api/movie/${id}/research`, { method: "POST" }),
+  // Move a title to the front of the search sweep AND the merge queue (level 0 = normal).
+  priority: (id: number, level = 1) =>
+    j<{ ok: boolean; priority: number }>(`/api/movie/${id}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
+  epPriority: (id: string, level = 1) =>
+    j<{ ok: boolean; priority: number }>(`/api/episode/${encodeURIComponent(id)}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
+  seriesPriority: (seriesId: number, level = 1) =>
+    j<{ ok: boolean; priority: number; episodes: number }>(`/api/tv/${seriesId}/priority`,
+      { method: "POST", body: JSON.stringify({ level }) }),
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
     j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),
@@ -198,12 +262,12 @@ export const api = {
   tvStatus: () => j<TvStatus>("/api/tv/status"),
   tvEpisodes: (status?: string) =>
     j<Episode[]>("/api/tv/episodes" + (status ? `?status=${encodeURIComponent(status)}` : "")),
-  tvScan: () => j<{ found: number }>("/api/tv/scan", { method: "POST" }),
-  rescan: (scope: "all" | "films" | "anime" | "series" = "all", forget = false) =>
-    j<{ ok: boolean; started: boolean; note?: string }>(
-      `/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
+  tvScan: () => j<RescanStart>("/api/tv/scan", { method: "POST" }),
+  rescan: (scope: "all" | "films" | "anime" | "series" | "tv" = "all", forget = false) =>
+    j<RescanStart>(`/api/rescan?scope=${scope}&forget=${forget}`, { method: "POST" }),
   rescanState: () => j<RescanState>("/api/rescan"),
   coverage: () => j<Coverage>("/api/coverage"),
+  forecast: (target = 90) => j<Forecast>(`/api/forecast?target=${target}`),
   // re-probe everything in a settled state (merged / no_release) and re-open what's below target
   recheck: (scope: "all" | "films" | "tv" | "anime" | "series" = "all") =>
     j<{ ok: boolean; started: boolean; note?: string }>(

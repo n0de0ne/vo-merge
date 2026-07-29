@@ -37,6 +37,27 @@ def _promote_job():
         core.log(f"promote_job error: {e}")
 
 
+def _run_search(cfg):
+    """One search sweep, behind SEARCH_LOCK.
+
+    The lock's own comment says hammering the indexers concurrently gets you rate-limited, and the
+    API paths honoured it — but the scheduler's two entry points (`_search_job` hourly and
+    `_finish_job`'s refill every 10 minutes) called stage_search directly, so two or three sweeps
+    could and did overlap. Each computes its own grab budget up front, so overlapping sweeps also
+    collectively exceed max_inflight_downloads. Non-blocking: a sweep already running is doing
+    this same work, so there is nothing to wait for."""
+    if not pipeline.SEARCH_LOCK.acquire(blocking=False):
+        core.log("search: a sweep is already running -> skipping this one")
+        return
+    try:
+        if cfg.get("scope_films", True):
+            pipeline.stage_search(cfg)
+        if cfg.get("scope_series"):
+            tv.stage_search(cfg)
+    finally:
+        pipeline.SEARCH_LOCK.release()
+
+
 def _search_job():
     try:
         cfg = core.load_config()
@@ -55,10 +76,7 @@ def _search_job():
         finally:
             if scanning:
                 pipeline.SCAN_LOCK.release()
-        if cfg.get("scope_films", True):
-            pipeline.stage_search(cfg)
-        if cfg.get("scope_series"):
-            tv.stage_search(cfg)
+        _run_search(cfg)
     except Exception as e:
         core.log(f"search_job error: {e}")
 
@@ -81,11 +99,7 @@ def _finish_job():
     # merges freed slots + deleted donors -> top the download queue back up to the in-flight cap
     if refill:
         try:
-            cfg = core.load_config()
-            if cfg.get("scope_films", True):
-                pipeline.stage_search(cfg)
-            if cfg.get("scope_series"):
-                tv.stage_search(cfg)
+            _run_search(core.load_config())
         except Exception as e:
             core.log(f"finish refill error: {e}")
 
@@ -106,6 +120,14 @@ def _stall_job():
         core.log(f"stall_job error: {e}")
 
 
+def _backup_job():
+    try:
+        cfg = core.load_config()
+        core.backup_db(keep=int(cfg.get("db_backup_keep", 7)))
+    except Exception as e:
+        core.log(f"backup_job error: {e}")
+
+
 def start():
     cfg = core.load_config()
     _sched.add_job(_search_job, "interval", minutes=cfg["search_interval_min"],
@@ -116,6 +138,11 @@ def start():
                    id="stall", replace_existing=True)
     _sched.add_job(_promote_job, "interval", minutes=cfg.get("promote_interval_min", 1),
                    id="promote", replace_existing=True)
+    # Nightly at 04:00 — the DB holds the whole probe inventory and every record's state, and
+    # nothing backed it up. Cheap: VACUUM INTO on a few thousand rows is well under a second.
+    if int(cfg.get("db_backup_keep", 7)) > 0:
+        _sched.add_job(_backup_job, "cron", hour=4, minute=0,
+                       id="backup", replace_existing=True)
     _sched.start()
     ensure_merge_workers()          # background merger(s) draining the 'ready' queue
     core.log("scheduler started")

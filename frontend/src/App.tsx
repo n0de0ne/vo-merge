@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage, CoverageLib,
-  LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState } from "./api";
+import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
+  CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState,
+  Forecast } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -19,6 +20,37 @@ const fmtEta = (s: number) => (!s || s <= 0 || s >= 8640000 ? "" : "ETA " + fmtT
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
+// ---------------------------------------------------------------- error reporting
+// Failures used to be swallowed twice over: the act() helpers were try/finally with no catch, so
+// a failed grab/retry/merge click told the user nothing, and usePoll invoked its refresh
+// uncaught, so a backend that was down produced an unhandled rejection every few seconds behind a
+// silently stale screen. One subscriber-based sink means every one of those surfaces in the same
+// banner, and it lives outside React so api.ts and non-component code can report too.
+type ErrSink = (msg: string | null) => void;
+const errSinks = new Set<ErrSink>();
+
+export function reportError(e: unknown) {
+  if (e && (e as Error).name === "Unauthorized") { errSinks.forEach(f => f("__auth__")); return; }
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(e);
+  errSinks.forEach(f => f(msg));
+}
+
+function useErrorSink() {
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    const f: ErrSink = m => setErr(m);
+    errSinks.add(f);
+    return () => { errSinks.delete(f); };
+  }, []);
+  return [err, setErr] as const;
+}
+
+/** Run an action, surfacing any failure instead of dropping it. */
+export async function runAction(fn: () => Promise<unknown>) {
+  try { await fn(); return true; } catch (e) { reportError(e); return false; }
+}
+
 // Poll `fn` every `ms`, but ONLY while the tab is visible. Browsers throttle background-tab
 // timers, so a tab left open would silently go stale (the "won't update without a reload"
 // complaint). We pause while hidden and fire an immediate refresh the moment the tab is
@@ -28,7 +60,18 @@ function usePoll(fn: () => void, ms: number, deps: any[] = []) {
   saved.current = fn;
   useEffect(() => {
     let alive = true;
-    const run = () => { if (alive && !document.hidden) saved.current(); };
+    // Catch here, not at each call site. Every refresh function was invoked uncaught, so a
+    // backend that is down produced an unhandled rejection on every tick behind a screen that
+    // silently showed stale data. Reporting it once, centrally, is what makes "the list stopped
+    // updating" visible instead of mysterious.
+    const run = () => {
+      if (!alive || document.hidden) return;
+      try {
+        const r = saved.current() as unknown;
+        if (r && typeof (r as Promise<unknown>).catch === "function")
+          (r as Promise<unknown>).catch(reportError);
+      } catch (e) { reportError(e); }
+    };
     run();
     const id = setInterval(run, ms);
     const onVis = () => { if (!document.hidden) run(); };   // instant refresh on return
@@ -124,7 +167,7 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
     try { srcRef.current?.stop(); ctxRef.current?.close(); } catch {}
     try {
       const dd = await api.preview(movie.tmdb_id, "eng", t); setD(dd); setMsg("decoding audio…");
-      const buf = await (await fetch(dd.audio)).arrayBuffer();
+      const buf = await (await fetch(withKey(dd.audio))).arrayBuffer();
       const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
       const ab = await ac.decodeAudioData(buf);
       ctxRef.current = ac; bufRef.current = ab;
@@ -210,7 +253,7 @@ function SyncEditor({ movie, onClose }: { movie: Movie; onClose: () => void }) {
           playhead. Sound too early → spike is <b>left</b> of the line → push toward <b>+</b>.</p>
         {msg && <div className="muted">{msg}</div>}
         {d && <>
-          <video ref={v} src={d.video} muted loop playsInline controls
+          <video ref={v} src={withKey(d.video)} muted loop playsInline controls
             style={{ width: "100%", maxHeight: "46vh", borderRadius: 8, background: "#000" }} />
           <div className="row" style={{ margin: "8px 0 2px" }}>
             <span className="muted" style={{ width: 46 }}>scene:</span>
@@ -449,6 +492,60 @@ function LibBar({ l }: { l: CoverageLib }) {
             })}
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// "When does the library hit 90%?" — answerable from data we already keep: the probe inventory
+// is the denominator, and Recently-merged's own DID_WORK predicate is the rate. Deliberately
+// shows the working (how many left, at what rate) rather than just a date, and shows NO date when
+// the backend says the remainder is blocked rather than merely pending.
+function ForecastPanel() {
+  const [f, setF] = useState<Forecast | null>(null);
+  const [err, setErr] = useState("");
+  const [target, setTarget] = useState(() => {
+    const v = Number(localStorage.getItem("vo.forecastTarget")); return v > 0 && v <= 100 ? v : 90;
+  });
+  usePoll(() => api.forecast(target).then(x => { setF(x); setErr(""); })
+    .catch(e => setErr(e.message || "forecast unavailable")), 300000, [target]);
+  const pick = (v: number) => { setTarget(v); localStorage.setItem("vo.forecastTarget", String(v)); };
+  if (err) return null;                       // coverage already reports a dead backend
+  if (!f || !f.total) return null;
+  const eta = f.eta_days != null && f.eta_ts
+    ? new Date(f.eta_ts * 1000).toLocaleDateString(undefined,
+        { year: "numeric", month: "short", day: "numeric" })
+    : null;
+  const blocked = f.blocked.no_release + f.blocked.ignored;
+  return (
+    <div className="panel">
+      <div className="row" style={{ marginBottom: 8 }}>
+        <b>Forecast</b>
+        <span className="muted">at {f.pct}% now · {f.rate_used}/day over the last 30d</span>
+        <div className="spacer" />
+        {[80, 90, 95, 100].map(v =>
+          <button key={v} className={"btn sec" + (v === target ? " active" : "")}
+                  onClick={() => pick(v)}>{v}%</button>)}
+      </div>
+      {f.needed === 0
+        ? <div className="fc-hero ok">Already at {f.pct}% — target met 🎉</div>
+        : eta
+          ? <div className="fc-hero">~{eta}
+              <span className="muted"> · {f.eta_days} days · {f.needed.toLocaleString()} file(s) to go</span>
+            </div>
+          : <div className="fc-hero none">No date yet
+              <span className="muted"> · {f.reason}</span>
+            </div>}
+      {blocked > 0 && f.needed > 0 &&
+        <div className="sub" style={{ marginTop: 6 }}>
+          {blocked.toLocaleString()} of the remaining files can’t move on their own:{" "}
+          {f.blocked.no_release.toLocaleString()} found no release,{" "}
+          {f.blocked.ignored.toLocaleString()} were given up on
+          {f.blocked.unreadable > 0 && <> · {f.blocked.unreadable.toLocaleString()} unreadable</>}.
+        </div>}
+      <div className="sub muted" style={{ marginTop: 6 }}>
+        Straight-line from the last 30 days ({f.rate["7d"]}/day over 7d). It assumes the rate holds
+        and that what’s left is as findable as what’s done — neither is guaranteed.
       </div>
     </div>
   );
@@ -768,6 +865,11 @@ function MovieActions({ m, busy, act, onRelease, onTune }:
       {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
       {m.status === "merged" && B("Tune sync", () => onTune(m))}
       {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
+      {/* Someone asked for this one: jump the search sweep AND the merge queue. The backlog is
+          ordered by recency, so a title requested today otherwise sits behind all of it. */}
+      {!["merged", "ignored"].includes(m.status) && (m.priority
+        ? B("★ Un-prioritise", () => act(() => api.priority(m.tmdb_id, 0)))
+        : B("★ Prioritise", () => act(() => api.priority(m.tmdb_id, 1))))}
       {m.status === "ignored" && B("Unignore", () => act(() => api.unignore(m.tmdb_id)))}
       {m.status !== "ignored" && m.status !== "merged" && B("Ignore", () => act(() => api.ignore(m.tmdb_id)))}
     </RowMenu>
@@ -937,6 +1039,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       </div>
 
       <CoveragePanel goto={goto} />
+      <ForecastPanel />
 
       <div className="dash-cols">
         <div className="panel">
@@ -1072,7 +1175,9 @@ function Films() {
   }, [movies, q]);
   const dlOf = (m: Movie) => dls[(m.dl_hash || "").toLowerCase()];
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
 
   async function searchAll() {
     setBusy(true); setSearchMsg("starting…");
@@ -1138,7 +1243,8 @@ function Films() {
                   <tr key={m.tmdb_id}>
                     <td><div className="titlecell">
                       <Poster src={m.poster} alt={m.title} />
-                      <div>{m.title}<div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
+                      <div>{m.priority ? <span className="prio" title="Prioritised — ahead of the backlog in both the search sweep and the merge queue">★</span> : null}{m.title}
+                        <div className="sub">→ {m.original_title} ({m.year}) · {m.original_lang}</div>
                         {m.error && <div className="sub bad">{m.error}</div>}</div>
                     </div></td>
                     <td style={{ minWidth: 150 }}><Pill s={m.status} />{m.sync_delta != null && m.status === "sync_fail" &&
@@ -1220,7 +1326,9 @@ function Series({ anime }: { anime: boolean }) {
   usePoll(refresh, 8000, [filter]);
   usePoll(() => api.downloads().then(d => setDls(d.items || {})).catch(() => {}), 4000);
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
 
   async function searchAll() {
     setBusy(true); setSearchMsg("starting…");
@@ -1391,12 +1499,19 @@ function Review() {
       api.movies("review"), api.movies("sync_fail"), api.movies("error"), api.tvEpisodes(),
     ]);
     setMovies([...rv, ...sf, ...er]);
-    setEps(allEps.filter(e =>
-      ["error", "sync_fail"].includes(e.status) || aiUnfixed(e.ai_status)));
+    // Filter on the pipeline STATUS, with ai_status as a modifier on those rows — never as an
+    // independent trigger. The `|| aiUnfixed(...)` this replaces meant a record that had already
+    // been retried (now `pending`, searching again) stayed listed forever on the strength of the
+    // verdict from its previous attempt: the screenshot symptom of a row badged `pending` and
+    // captioned "AI did not respond within 60m". This is the same set the dashboard's attention
+    // panel uses, so the two can no longer disagree about what needs you.
+    setEps(allEps.filter(e => ["error", "sync_fail", "review"].includes(e.status)));
   }
   usePoll(refresh, 8000);
 
-  async function act(fn: () => Promise<any>) { setBusy(true); try { await fn(); } finally { setBusy(false); refresh(); } }
+  // try/finally with no catch meant a failed grab, ignore, retry or merge click told the user
+  // nothing at all and logged an unhandled rejection. runAction surfaces it in the banner.
+  async function act(fn: () => Promise<any>) { setBusy(true); try { await runAction(fn); } finally { setBusy(false); refresh(); } }
   async function sendAI(k: string, call: () => Promise<{ queued: boolean }>) {
     setAi(s => ({ ...s, [k]: "…" }));
     try { const r = await call(); setAi(s => ({ ...s, [k]: r.queued ? "queued ✓" : "failed" })); }
@@ -1562,7 +1677,10 @@ function AiSolvedPanel() {
 }
 
 // ---------------- Settings ----------------
-const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token"];
+// Server-side these are masked to a plain "is it set?" boolean (see main._mask_secrets), so a
+// boolean coming back from the form means "unchanged" and must not be saved over the real value.
+const SECRET_BOOLS = ["prowlarr_key", "radarr_key", "sonarr_key", "plex_token",
+                      "plex2_token", "api_key"];
 function Settings() {
   const [cfg, setCfg] = useState<Record<string, any> | null>(null);
   const [changed, setChanged] = useState<Record<string, any>>({});
@@ -1709,7 +1827,11 @@ function Settings() {
       <div className="form-grid">
         <label>Webhook token</label>{Text("webhook_token")}
         <span className="muted">optional; when set, the URLs above must carry
-          <code>?token=…</code>. Leave empty for no check (LAN-only, like the rest of the API)</span>
+          <code>?token=…</code>. Leave empty for no check</span>
+        <label>API key</label>{Secret("api_key")}
+        <span className="muted">optional; when set, every API call needs it (this page will ask
+          once and remember). Radarr/Sonarr webhooks are exempt — they use the token above — and
+          so is the container healthcheck. <b>Cross-site requests are refused either way.</b></span>
       </div>
 
       <div className="section-title">Language targets</div>
@@ -1770,6 +1892,13 @@ function Settings() {
         <label>AI reply timeout (min)</label>{Text("ai_stale_min", "number")}
         <span className="muted">no verdict in this long → flag for manual review. This is the
           only backstop for the host script having stopped running, so don't set it high.</span>
+        <label>API URL (from the host)</label>{Text("api_url")}
+        <span className="muted"><b>Set this.</b> Every ticket tells the dispatcher where to call —
+          e.g. <code>http://10.0.1.5:8090</code>. Left empty, the brief only carries the
+          in-container address, which a host script can't reach.</span>
+        <label>Docs path (on the host)</label>{Text("docs_path")}
+        <span className="muted">where CLAUDE.md lives for the dispatcher to read, e.g.
+          <code>/mnt/user/appdata/.../CLAUDE.md</code>. Optional.</span>
       </div>
 
       <div className="section-title">Master</div>
@@ -1834,8 +1963,51 @@ function PauseControl() {
   );
 }
 
+/** Asks for the API key when the server has one set. Shown instead of the app, since nothing
+ *  can load without it. */
+function ApiKeyGate({ onDone }: { onDone: () => void }) {
+  const [key, setKey] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [bad, setBad] = useState(false);
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setChecking(true); setBad(false);
+    setApiKey(key.trim());
+    try { await api.status(); onDone(); }
+    catch { setApiKey(""); setBad(true); }
+    finally { setChecking(false); }
+  }
+  return (
+    <div className="app">
+      <header className="top"><h1>🎬 VO Merger</h1></header>
+      <div className="panel" style={{ maxWidth: 460 }}>
+        <div className="section-title">API key required</div>
+        <p className="muted" style={{ marginTop: 0 }}>
+          This server has <code>api_key</code> set. Enter it to continue — it is kept in this
+          browser only.
+        </p>
+        <form onSubmit={submit} style={{ display: "flex", gap: 8 }}>
+          <input type="password" autoFocus value={key} placeholder="API key"
+                 onChange={e => setKey(e.target.value)} style={{ flex: 1 }} />
+          <button className="btn primary" disabled={checking || !key.trim()}>
+            {checking ? "checking…" : "Unlock"}
+          </button>
+        </form>
+        {bad && <div className="err" style={{ marginTop: 10 }}>That key was rejected.</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("overview");
+  const [err, setErr] = useErrorSink();
+  const [locked, setLocked] = useState(false);
+  // A 401 clears the stored key and reports "__auth__", so a rotated key prompts again instead
+  // of leaving every panel silently empty.
+  useEffect(() => { if (err === "__auth__") { setLocked(true); setErr(null); } }, [err, setErr]);
+  if (locked) return <ApiKeyGate onDone={() => { setLocked(false); setErr(null); }} />;
+
   const tabs: [string, string][] = [
     ["overview", "Overview"],
     ["films", "Films"], ["anime", "🎌 Anime"], ["series", "📺 TV Shows"],
@@ -1849,6 +2021,12 @@ export default function App() {
         <div className="spacer" />
         <PauseControl />
       </header>
+      {err && (
+        <div className="errbar" role="alert">
+          <span>{err}</span>
+          <button className="btn small" onClick={() => setErr(null)}>dismiss</button>
+        </div>
+      )}
       <nav>
         {tabs.map(([k, label]) =>
           <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{label}</button>)}
