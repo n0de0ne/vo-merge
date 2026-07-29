@@ -350,7 +350,7 @@ def _size_bonus(r):
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=(),
-            need_subs=(), tried=()):
+            need_subs=(), tried=(), orig=None):
     """Return best (score, seeders, title, link, rid) for a usable release, or None.
 
     `tried` is the set of release identities this record has already burned. Without it the
@@ -376,8 +376,8 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, query):
-            continue                     # advertises only dubs this episode already has
+        if media.useless_release(t, lang_need, query, orig=orig, need_subs=need_subs):
+            continue    # advertises only audio this episode already has (dub OR VOST claim)
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
         if want_pack:
@@ -492,7 +492,8 @@ def season_candidates(series_id, season, cfg=None):
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, title):
+        if media.useless_release(t, lang_need, title, orig=eps[0].get("orig_lang"),
+                                 need_subs=need_s):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -600,7 +601,8 @@ def episode_candidates(ep_id, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, title):
+        if media.useless_release(t, lang_need, title, orig=e.get("orig_lang"),
+                                 need_subs=need_s):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -733,6 +735,7 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
         # reason enough not to grab it again for the whole season.
         pack_tried = {x for e in eps for x in tried_active(e, cfg)}
         best = _search(q, cfg, want_pack=True, season=season, tried=pack_tried,
+                       orig=eps[0].get("orig_lang"),
                        need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
                        need_subs={x for e in eps
                                   for x in (e.get("need_subs") or "").split(",") if x})
@@ -767,7 +770,8 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
         e_need_s = {x for x in (e.get("need_subs") or "").split(",") if x}
         q = f"{title} S{rs:02d}E{rn:02d}"
         best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                       tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s)
+                       tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s,
+                       orig=e.get("orig_lang"))
         n += 1
         # Query ladder: once a record has burned a whole fruitless ROUND, the library title has
         # proven unmatchable and Sonarr's alternate titles (romaji etc.) are the automatable
@@ -778,7 +782,8 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
                     break
                 q2 = f"{alt} S{rs:02d}E{rn:02d}"
                 best = _search(q2, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                               tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s)
+                               tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s,
+                               orig=e.get("orig_lang"))
                 n += 1
                 if _usable(best, cfg):
                     core.log(f"tv search: query ladder matched on '{q2}'")
@@ -956,6 +961,17 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
                            added_langs="", merge_kind="already")
         core.log(f"tv merge {ep['id']}: already has English -> done")
         _plex_ep_refresh(ep, cfg)
+        return
+    # The merge must give the LIBRARY FILE something it still lacks — see pipeline.graft_gains
+    # for the VOSTFR shape this closes. Decided BEFORE sync detection, the expensive part.
+    from .pipeline import graft_gains
+    gains, lib_needs = graft_gains(bi, fi, {langs[i] for i in ids},
+                                   {s["lang"] for s in subs}, kind, cfg,
+                                   ep.get("orig_lang"), _orig_codes(ep.get("orig_lang")))
+    if not gains:
+        _reject_and_retry_ep(ep, "release adds nothing this file needs "
+                                 f"(file still needs {'+'.join(lib_needs) or 'nothing'})",
+                             cfg, delta)
         return
     # manual offset skips detection; honour a stored stretch ratio (see pipeline)
     drift = (ep.get("sync_drift") or None) if manual else None

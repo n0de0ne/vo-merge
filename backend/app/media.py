@@ -451,18 +451,42 @@ def _toks(s):
     return set(re.findall(r'[a-z0-9]+', (s or '').lower()))
 
 
-def useless_release(title, need, media_title=""):
-    """True when a release advertises dubs and NONE of them is a language this file still needs.
+# What a VOST-family tag says about the SUBTITLES: VOSTFR/SUBFRENCH promise French subs, VOSTA
+# (and English-scene SUBBED) English ones. Bare VOST is French-scene shorthand for VOSTFR; bare
+# VO promises no subtitles at all.
+_VOST_SUBS = ((re.compile(r'(?<![A-Za-z])(VOSTFR|SUBFRENCH|VOST)(?![A-Za-z])', re.I), "fre"),
+              (re.compile(r'(?<![A-Za-z])(VOSTA|SUBBED)(?![A-Za-z])', re.I), "eng"))
+
+
+def useless_release(title, need, media_title="", orig=None, need_subs=()):
+    """True when a release advertises audio and NONE of it is a language this file still needs.
 
     This is the generalised form of the old French-dub-only reject: the library file already
     carries its own dub, so a release offering only that same language adds nothing and would
     burn a download slot. A release that advertises nothing (the common `Movie.2019.1080p.BluRay`
-    shape) says nothing about its audio and is never rejected here; nor is MULTI, nor an
-    original-audio/VOST release."""
-    langs_, multi, orig = release_langs(title, media_title)
-    if multi or orig or not langs_:
+    shape) says nothing about its audio and is never rejected here; nor is MULTI.
+
+    A VOST-family release (VOSTFR/VOSTA/VOST/VO) is NOT the free pass it used to be. Those tags
+    are a concrete claim: the audio is the ORIGINAL language and the subs are French (VOSTFR) or
+    English (VOSTA). When the caller knows the title's original language, that claim is
+    checkable against the gap — and a VOSTFR (original audio + French subs) can never fill a
+    French DUB gap, which is exactly how a Korean film missing only `fre` audio got a VOSTFR
+    release grabbed, synced for an hour and muxed for nothing. With the original language
+    unknown (`orig=None`, or Radarr's "?"), the old conservative never-reject stands."""
+    langs_, multi, orig_flag = release_langs(title, media_title)
+    needs = {norm_lang(x) for x in (need or ())}
+    if multi:
         return False
-    return not (langs_ & {norm_lang(x) for x in (need or ())})
+    if orig_flag:
+        oc = norm_lang(orig) if orig else "und"
+        if not oc.isalpha() or oc == "und":
+            return False                    # original language unknown -> can't judge the claim
+        subs_adv = {code for rx, code in _VOST_SUBS if rx.search(title or "")}
+        needs_s = {norm_lang(x) for x in (need_subs or ())}
+        return not (oc in needs or (langs_ & needs) or (subs_adv & needs_s))
+    if not langs_:
+        return False
+    return not (langs_ & needs)
 
 
 def lang_hits(title, need, media_title=""):

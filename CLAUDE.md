@@ -628,13 +628,26 @@ Spanish got no signal at all, and a Spanish-dub release wasn't recognised as a d
 markers are a **per-language table**, so the same rule works for any profile:
 
 - `media.release_langs(title)` → *(languages advertised, multi, original)*.
-- `media.useless_release(title, need)` — reject when a release advertises dubs and **none** is a
-  language this file still needs. A release advertising nothing (`Movie.2019.1080p.BluRay`, the
-  common shape) says nothing about its audio and is never rejected; nor is MULTI, nor VOST/VOSTFR
-  (which state the audio is *original*, i.e. not a dub).
+- `media.useless_release(title, need, orig=, need_subs=)` — reject when a release advertises
+  audio and **none** of it is a language this file still needs. A release advertising nothing
+  (`Movie.2019.1080p.BluRay`, the common shape) says nothing about its audio and is never
+  rejected; nor is MULTI. **VOST/VOSTFR is no longer a free pass**: those tags are a concrete,
+  checkable claim — the audio is the ORIGINAL language, the subs French (VOSTFR) or English
+  (VOSTA) — so with the title's original language known, a VOSTFR that fills no remaining gap is
+  rejected. That is the Colony bug: a Korean film missing only the French DUB grabbed a VOSTFR
+  (Korean audio + French subs, definitionally unable to help) and sank an hour of sync into it.
+  Unknown original (`orig=None`/`"?"`) keeps the old conservative pass.
 - `media.lang_hits(title, need)` — +60 (films) / +120 (TV candidates) per missing language the
   name advertises, so a dub of a language we need beats an unmarked release, and MULTI still
   beats both.
+- **The merge itself re-asks the question of the FILES** (`pipeline.graft_gains`, before sync
+  detection — the expensive part): the OUTPUT (base languages + everything grafted) must give
+  the LIBRARY file something it still lacks, whichever file won the video comparison. This is
+  the second half of the Colony bug: the release won the quality comparison, became the base,
+  and `wanted_audio` — which asks what the *base* lacks — happily grafted the library's own
+  English track while the output still lacked `fre` and the library's video got replaced by the
+  rip. The deliberate VO fallback stays a gain (Kraken's Norwegian); anything else that adds
+  nothing needed is rejected and blocklisted before a single decode runs.
 
 **Only the tag zone is inspected** — everything after the first year / SxxExx / resolution /
 source token. That's where a scene release states its audio, and scanning only there is what

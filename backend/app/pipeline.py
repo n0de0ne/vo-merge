@@ -651,7 +651,8 @@ def _scan_tagged(cfg):
 
 
 # ---------------------------------------------------------------- SEARCH + SCORE
-def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need_subs=()):
+def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need_subs=(),
+                  orig=None):
     """Score a Prowlarr result for this title, or None to reject it.
 
     `need` = the audio languages this file is still missing (its `need_audio`), and it drives
@@ -686,8 +687,8 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need
               any(str(year + d) in t for d in (-1, 0, 1)))
     if not titleok:
         return None
-    if media.useless_release(t, lang_need, otitle):
-        return None                      # advertises only dubs we already have -> adds nothing
+    if media.useless_release(t, lang_need, otitle, orig=orig, need_subs=need_subs):
+        return None      # advertises only audio we already have (dub OR checkable VOST claim)
     sc = min(int(r.get("seeders") or 0), 100)
     if subs_only:
         # smaller is strictly better: we keep the text track and throw the rest away
@@ -769,7 +770,7 @@ def candidates(tmdb_id, cfg=None, include_tried=False):
             # tokens are matched against the query actually used — results found via an
             # alternate title would otherwise all fail the 0.6 overlap test against the primary
             sc = score_release(r, q, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src,
-                               need=need, need_subs=need_s)
+                               need=need, need_subs=need_s, orig=mv.get("original_lang"))
             if sc is None:
                 continue
             link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
@@ -1958,6 +1959,32 @@ def resolve_donor_path(cfg, dl_hash, cached, tag=""):
 
 
 # ---------------------------------------------------------------- MERGE + FINISH
+def graft_gains(bi, fi, added_a, added_s, kind, cfg, orig_name, orig_codes):
+    """What this merge would give the LIBRARY FILE that it still lacks — the set that must be
+    non-empty for the merge to be worth running at all. Returns (gains, library_missing).
+
+    `wanted_audio`/`wanted_subs` ask what the BASE lacks, and the base is whichever file won the
+    video-quality comparison. When the RELEASE wins, its shortfalls — usually English, which the
+    library already has — read as things to graft, and nothing anywhere asked whether the output
+    helps the record's actual gap. That is how a VOSTFR donor (original audio + French subs, for
+    a file missing only the French DUB) got a full sync scan and a mux: the library's own eng
+    track was "wanted" by the release, the output still lacked `fre`, and the library file's
+    video had been replaced by the rip along the way.
+
+    So judge the OUTPUT (base languages plus everything grafted) against the LIBRARY file's own
+    remaining gap — whichever direction the quality comparison chose. The deliberate VO fallback
+    stays a gain in its own right: adding the original-language track a library file LACKS is
+    worth a merge even though it can't close the profile gap (Kraken's Norwegian when no English
+    exists)."""
+    lib_a, lib_s = media.langs(fi)
+    miss_a, miss_s = media.gap_langs(lib_a, lib_s, kind, cfg, orig_name)
+    out_a = set(media.langs(bi)[0]) | set(added_a)
+    out_s = set(media.langs(bi)[1]) | set(added_s)
+    gains = ((out_a & set(miss_a)) | (out_s & set(miss_s))
+             | ((out_a & set(orig_codes)) - lib_a))
+    return gains, miss_a + miss_s
+
+
 def qc_grafted_audio(out, n_base_auds, dur, cfg, tag=""):
     """Verify the mux we just wrote, before it replaces the library file: cross-correlate the
     FIRST grafted audio track against the base's own track inside the single output file.
@@ -2258,6 +2285,16 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         en_dir = mirror_to_en(fr, cfg)
         plex_refresh(cfg, [os.path.dirname(fr).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1),
                            en_dir], mv.get("title"), year=mv.get("year"))
+        return
+    # The merge must give the LIBRARY FILE something it still lacks — see graft_gains for the
+    # VOSTFR shape this closes. Decided BEFORE sync detection, which is the expensive part.
+    gains, lib_needs = graft_gains(bi, fi, {langs[i] for i in ids},
+                                   {s["lang"] for s in subs}, kind, cfg,
+                                   mv.get("original_lang"), orig_codes)
+    if not gains:
+        reject_and_retry(tmdb_id, "release adds nothing this file needs "
+                                  f"(file still needs {'+'.join(lib_needs) or 'nothing'})",
+                         cfg, delta)
         return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     # A manually-set offset skips detection. Honour a stored stretch ratio too, so a

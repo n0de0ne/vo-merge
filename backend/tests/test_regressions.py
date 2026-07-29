@@ -1321,3 +1321,63 @@ def test_repair_pass_is_shared_and_lock_guarded(app_env):
     pipeline.run_repair([], cfg)                     # empty pass: verifies nothing, deletes nothing
     assert pipeline.REPAIR_STATE["phase"] == "done"
     assert pipeline.REPAIR_STATE["deleted"] == 0
+
+
+# ------------------------------------------------------------------ the Colony VOSTFR bug
+# A Korean film missing only the French DUB grabbed a VOSTFR release (original audio + French
+# subs — definitionally unable to fill the gap), then ran an hour of sync detection because the
+# release won the video comparison and "wanted" the library's own English track. Two holes, two
+# gates: scoring must reject a checkable VOST claim that fills no gap, and a merge must give the
+# LIBRARY file something it lacks before the expensive part starts.
+
+def test_vost_release_is_rejected_when_it_cannot_fill_the_gap():
+    """VOSTFR is a concrete claim — original audio, French subs — not a free pass."""
+    from app import media
+    t = "Colony.2026.VOSTFR.1080p.WEBRip.10bits.AAC.2.0.x265-FaS"
+    # the Colony case: Korean original, gap = French DUB -> the claim fills nothing
+    assert media.useless_release(t, {"fre"}, "Colony", orig="Korean") is True
+    # the same release IS the answer when the gap is the original-language VO...
+    assert media.useless_release(t, {"kor"}, "Colony", orig="Korean") is False
+    # ...or when the French SUBS it promises are what's missing
+    assert media.useless_release(t, {"fre"}, "Colony", orig="Korean",
+                                 need_subs={"fre"}) is False
+    # a VOSTFR of an ENGLISH-original film still carries eng audio
+    assert media.useless_release("Movie.2019.VOSTFR.1080p", {"eng"}, "Movie",
+                                 orig="English") is False
+    # unknown original language -> the claim is uncheckable -> old conservative pass
+    assert media.useless_release(t, {"fre"}, "Colony") is False
+    assert media.useless_release(t, {"fre"}, "Colony", orig="?") is False
+    # a VOSTFR+VF combo advertises the French dub too -> kept
+    assert media.useless_release("Movie.2019.VF.VOSTFR.1080p", {"fre"}, "Movie",
+                                 orig="Korean") is False
+    # MULTI always passes; plain dub-reject behaviour unchanged
+    assert media.useless_release("Movie.2019.MULTI.VOSTFR.1080p", {"fre"}, "Movie",
+                                 orig="Korean") is False
+    assert media.useless_release("Movie.2019.FRENCH.1080p", {"eng"}, "Movie",
+                                 orig="Korean") is True
+
+
+def test_merge_must_give_the_library_file_something_it_lacks(app_env):
+    """graft_gains judges the OUTPUT against the LIBRARY file's own gap, whichever file won the
+    video comparison — the base-relative question wanted_audio answers is not the record's."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS)
+    lib = {"auds": [{"lang": "eng"}, {"lang": "kor"}],
+           "subs": [{"lang": "eng"}, {"lang": "fre"}]}          # Colony: needs only fre AUDIO
+    vostfr = {"auds": [{"lang": "kor"}], "subs": [{"lang": "fre"}]}
+    # the bug: release won the video comparison (base=vostfr), library donates its eng track
+    gains, needs = pipeline.graft_gains(vostfr, lib, {"eng"}, {"eng"},
+                                        "movie", cfg, "Korean", {"kor"})
+    assert not gains and needs == ["fre"], "output still lacks the French dub -> pointless merge"
+    # a legit swap: the release actually carries the needed dub
+    multi = {"auds": [{"lang": "kor"}, {"lang": "fre"}], "subs": []}
+    gains, _ = pipeline.graft_gains(multi, lib, {"eng"}, set(), "movie", cfg, "Korean", {"kor"})
+    assert "fre" in gains
+    # normal direction: grafting the missing dub onto the library base
+    gains, _ = pipeline.graft_gains(lib, lib, {"fre"}, set(), "movie", cfg, "Korean", {"kor"})
+    assert gains == {"fre"}
+    # the deliberate VO fallback stays a gain: Kraken's Norwegian when no English exists
+    kraken = {"auds": [{"lang": "fre"}], "subs": []}
+    gains, _ = pipeline.graft_gains(kraken, kraken, {"nor"}, set(),
+                                    "movie", cfg, "Norwegian", {"nor"})
+    assert "nor" in gains
