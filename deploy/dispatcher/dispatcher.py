@@ -56,7 +56,10 @@ TICKETS = os.environ.get("TICKETS", "/tickets")
 CLAIMED = os.path.join(TICKETS, "claimed")
 DEAD = os.path.join(TICKETS, "dead")
 HEARTBEAT = os.path.join(TICKETS, ".heartbeat")
-AGENT_CMD = os.environ.get("AGENT_CMD", "claude -p --dangerously-skip-permissions")
+# --dangerously-skip-permissions is refused when running as root (which a container does), so
+# grant tools explicitly. Bash is what lets the agent POST the ai_result callback.
+AGENT_CMD = os.environ.get(
+    "AGENT_CMD", "claude -p --allowedTools Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch")
 AGENT_TIMEOUT_S = int(os.environ.get("AGENT_TIMEOUT_S", "1800"))
 POLL_S = int(os.environ.get("POLL_S", "30"))
 RETRY_MIN = int(os.environ.get("RETRY_MIN", "45"))

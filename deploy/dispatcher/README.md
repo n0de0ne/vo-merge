@@ -14,26 +14,44 @@ no per-token billing.
 
 ## Option A (recommended): on the Unraid host — `dispatcher.sh`
 
-Uses the host's existing CLI login. This is the modern replacement for the legacy
-"run the CLI from a user-script cron" setup — same tickets directory, but it now speaks the
-full protocol (heartbeat, claim/ack, crash retry, dead-letter), which is what lets vo-merge
-tell a dead dispatcher from a slow one.
+The **successor of the original `ai-dispatch` user script** — replace that script's content
+with this one. Everything it proved out is carried over: multi-app ticket dirs
+(sonarr-completor too), **session resume** of interrupted runs (`--resume` + the
+half-applied-action warning), the **idle-vs-hard timeout** watchdog (silence kills a wedged
+run fast; a legitimately slow sync_probe survives), the **daily run budget** with a once-a-day
+warning, **Unraid-native notifications**, the **dispatcher-side `ai_result` callback** (a run
+that forgot to report still reports), session-loss detection after a plugin reinstall,
+transcript archiving to `done/`, the CLI/HOME liveness alarms, and `--allowedTools` instead of
+`--dangerously-skip-permissions` (which the CLI refuses for root). New on top: the heartbeat,
+claim-while-running, `dead/`, and the vo-merge-down cross-watch.
 
-1. **User Scripts** plugin → add a new script → paste `dispatcher.sh`.
-2. Schedule **"At First Array Start Only"** — it loops forever (30 s poll) and takes a lock, so
-   double-starts are harmless. Prefer a cron? Schedule it hourly with `ONESHOT=1` and keep
-   vo-merge's `ai_dispatcher_alarm_min` above the cron interval.
-3. Settings: edit the variables at the top, or persist overrides in
-   `/boot/config/vo-dispatcher.conf` (plain `VAR=value` lines):
-   - `TICKETS` — default `/mnt/user/appdata/vo-merge/ai-tickets`
-   - `AGENT_CMD` — default `claude -p --dangerously-skip-permissions`; use the absolute path if
-     `claude` isn't on cron's PATH
-   - `VO_URL` — default `http://127.0.0.1:8090/api` (the cross-watch; empty = off)
-   - `NOTIFY_URL` — same value as vo-merge's `notify_url`, for the vo-merge-down alarm
-4. Retire the legacy ticket-handling user script — two consumers race the same queue.
+1. **User Scripts** → open the old ai-dispatch script → replace its content with
+   `dispatcher.sh` (one consumer per queue — don't run both).
+2. Schedule **"At First Array Start Only"** for loop mode (30 s poll, flock-guarded), or keep
+   the old cron cadence with `ONESHOT=1` (then keep vo-merge's `ai_dispatcher_alarm_min` above
+   the cron interval). An hourly cron in loop mode also works and doubles as a supervisor:
+   each firing either becomes the daemon or exits on the lock.
+3. Settings: edit the variables at the top, or persist them in
+   `/boot/config/vo-dispatcher.conf` (sourced bash) — a config matching the original setup:
+
+   ```bash
+   TICKET_DIRS="/mnt/user/appdata/vo-merge/ai-tickets /mnt/user/appdata/sonarr-completor/ai-tickets"
+   CLAUDE=/usr/local/emhttp/plugins/unraid-aicliagents/bin/claude
+   HOME_DIR=/tmp/unraid-aicliagents/work/root/home
+   WORKDIR=/mnt/nvme/AIWorkspace
+   PROMPT_FILE=/mnt/user/appdata/ai-dispatch/prompt.md      # your existing guardrails file
+   VO_URL=http://10.0.1.3:8090/api
+   NOTIFY_URL=<same value as vo-merge's notify_url>
+   ```
+
+   `DISPATCH` (state/log/transcripts) defaults to `/mnt/user/appdata/ai-dispatch`, so the run
+   budget, attempt state and `done/` archive live where the old script kept them.
+4. The outcome contract is unchanged: the agent ends with `STATUS:` / `DIAGNOSIS:` / `ACTION:`
+   lines (your existing `prompt.md` already instructs this; the built-in framing used when the
+   file is absent does too).
 
 The agent reaches vo-merge over the LAN via the `api_url` each ticket carries — set
-**Settings → `api_url`** (e.g. `http://10.0.1.5:8090`).
+**Settings → `api_url`** (e.g. `http://10.0.1.3:8090`).
 
 ## Option B: as a container — `dispatcher.py` + `Dockerfile`
 
