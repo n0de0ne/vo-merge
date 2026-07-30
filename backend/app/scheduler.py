@@ -141,6 +141,14 @@ def _housekeeping_job():
     the operator has opted in — run the audio-less repair pass."""
     try:
         cfg = core.load_config()
+        # Deletions must not wait for an operator's re-read: sweep vanished files daily, with
+        # the same mount-alive guard the rescan prune uses. Behind SCAN_LOCK non-blocking — a
+        # rescan already running prunes on its own, so there is nothing to wait for.
+        if pipeline.SCAN_LOCK.acquire(blocking=False):
+            try:
+                pipeline.prune_library(cfg)
+            finally:
+                pipeline.SCAN_LOCK.release()
         pipeline.purge_recycle(cfg)
         pipeline.revisit_ignored(cfg)
         if cfg.get("auto_repair"):

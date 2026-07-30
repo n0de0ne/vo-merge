@@ -550,17 +550,20 @@ rather than a missing file.
 ### A scan adds what's new; the prune drops what's gone
 
 Nothing used to remove a probe or a record, so a title deleted from the library kept being counted
-— and kept dragging the coverage percentage down — forever. Every rescan now starts with
-`core.prune_missing_probes()` + `core.prune_missing_records()`. Two guards keep that from eating
-the DB:
+— and kept dragging the coverage percentage down — forever. `pipeline.prune_library` is the one
+shared implementation, run by **every rescan and by the daily housekeeping job** — the prune only
+lived inside the operator's re-read before, so on an unattended install a deletion was never
+swept at all. Two guards keep it from eating the DB:
 
 - **The mount must look alive.** If `/media` is missing or empty (an unmounted share) every path
   reads as gone, so the prune is skipped and logged rather than run.
 - **Mid-flight records are never pruned** (`core._PRUNE_SKIP`: downloading / ready / merging /
   grabbed / searching) — a merge swaps a new file in, so the library path can be briefly absent.
 
-`SCAN_STATE` carries `pruned` / `pruned_records` and the button reports "N deleted entries
-removed" alongside the gap count.
+The webhooks cover the *arr-driven case instantly (a delete event calls `core.forget_probe`);
+the daily prune is what catches files removed behind the *arrs' backs. `SCAN_STATE` carries
+`pruned` / `pruned_records` and the button reports "N deleted entries removed" alongside the gap
+count.
 
 ## `updated` and `merged_at` mean specific things (`core._set_row`)
 

@@ -1768,6 +1768,36 @@ def start_repair(paths, cfg):
     return True
 
 
+def prune_library(cfg=None):
+    """Drop probes and records whose file has VANISHED — the delete half of keeping the
+    inventory honest. A scan only ever adds and updates, so a title removed from the library
+    kept being counted (and kept dragging the coverage percentage down) until an operator
+    pressed a re-read; on an unattended install that is forever. Shared by every /rescan and
+    the daily housekeeping job, so deletions are swept on a schedule like everything else.
+
+    Guarded on the mount actually looking alive: with /media unmounted every path reads as
+    missing and a blind prune would wipe the DB. Mid-flight records are separately protected by
+    core._PRUNE_SKIP — a merge swaps a new file in, so its library path can be briefly absent.
+
+    Returns (probes, movie_records, episode_records) pruned, or None when the mount looked dead
+    and nothing was touched."""
+    cfg = cfg or core.load_config()
+    mount = (cfg.get("media_mount") or "/media").rstrip("/")
+    try:
+        alive = os.path.isdir(mount) and bool(os.listdir(mount))
+    except OSError:
+        alive = False
+    if not alive:
+        core.log(f"prune: {mount} is missing or empty (unmounted?) — skipping, nothing dropped")
+        return None
+    probes = core.prune_missing_probes()
+    mv, ep = core.prune_missing_records()
+    if probes or mv or ep:
+        core.log(f"prune: dropped {probes} probe(s) and {mv} movie / {ep} episode record(s) "
+                 f"whose file is gone")
+    return probes, mv, ep
+
+
 def revisit_ignored(cfg=None):
     """Re-examine long-`ignored` records: one cheap candidates query each, capped per day.
 

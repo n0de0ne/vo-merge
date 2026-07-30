@@ -1413,3 +1413,31 @@ def test_merge_must_give_the_library_file_something_it_lacks(app_env):
     gains, _ = pipeline.graft_gains(kraken, kraken, {"nor"}, set(),
                                     "movie", cfg, "Norwegian", {"nor"})
     assert "nor" in gains
+
+
+def test_deleted_titles_are_pruned_on_a_schedule_with_the_mount_guard(app_env, tmp_path):
+    """The prune only ran inside an operator's /rescan, so on an unattended install a deleted
+    title dragged coverage down forever. pipeline.prune_library is the one shared
+    implementation (rescan + daily housekeeping): mount-dead refuses to touch anything, and
+    mid-flight records survive even with their file briefly absent."""
+    from app import pipeline
+    media_root = tmp_path / "media"
+    kept = media_root / "Films" / "Kept (2020)" / "kept.mkv"
+    gone = media_root / "Films" / "Gone (2019)" / "gone.mkv"
+    app_env.put_probe(str(kept))
+    app_env.put_probe(str(gone))
+    _seed_error_movie(app_env, 1)                        # error + missing file -> prunable
+    _seed_error_movie(app_env, 2, "MidFlight")
+    app_env.set_status(2, "downloading")                 # merge-window absence -> protected
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media_root))
+    assert pipeline.prune_library(cfg) is None, "an unmounted share must never authorise a prune"
+    assert app_env.get_movie(1) is not None
+    kept.parent.mkdir(parents=True)
+    kept.write_text("v")                                 # the mount is alive now
+    probes, mv, ep = pipeline.prune_library(cfg)
+    assert (probes, mv, ep) == (1, 1, 0)
+    assert app_env.get_movie(1) is None, "settled record with a vanished file is dropped"
+    assert app_env.get_movie(2) is not None, "mid-flight records are never pruned"
+    with app_env.db() as c:
+        left = [r["path"] for r in c.execute("SELECT path FROM probes")]
+    assert left == [str(kept)]

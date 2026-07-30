@@ -388,21 +388,14 @@ def do_rescan(forget: bool = False, scope: str = "all"):
         try:
             # whatever the scopes say; pilot cleared so a pilot list can't shrink a rescan
             cfg = dict(core.load_config(), series_pilot=[])
-            # A scan adds what is new; this is the other half — drop what is gone. Nothing else
-            # ever removes a probe or a record, so a deleted title keeps being counted (and keeps
-            # dragging coverage down) forever. Guarded on the mount actually being there: if
-            # /media is unmounted every path is "missing" and a blind prune would wipe the DB.
-            mount = (cfg.get("media_mount") or "/media").rstrip("/")
-            if os.path.isdir(mount) and os.listdir(mount):
-                st["phase"] = "pruning deleted files"
-                st["pruned"] = core.prune_missing_probes()
-                mv, ep = core.prune_missing_records()
-                st["pruned_records"] = mv + ep
-                if st["pruned"] or st["pruned_records"]:
-                    core.log(f"rescan({scope}): dropped {st['pruned']} probe(s) and "
-                             f"{mv} movie/{ep} episode record(s) whose file is gone")
-            else:
-                core.log(f"rescan({scope}): {mount} looks unmounted — skipping the prune")
+            # A scan adds what is new; the prune drops what is gone. One shared implementation
+            # (pipeline.prune_library — mount-alive guard included) with the daily housekeeping
+            # job, so a rescan and the schedule can never disagree about what pruning means.
+            st["phase"] = "pruning deleted files"
+            pruned = pipeline.prune_library(cfg)
+            if pruned is not None:
+                st["pruned"] = pruned[0]
+                st["pruned_records"] = pruned[1] + pruned[2]
             if scope in ("all", "films"):
                 st["phase"] = "films"
                 st["films"] = pipeline.scan(cfg)
