@@ -27,9 +27,16 @@
 # either becomes the daemon or exits on the lock.
 #
 # Settings: edit below, or persist overrides in /boot/config/vo-dispatcher.conf (sourced bash).
+# The conf is sourced FIRST — it must be, because TICKET_DIRS arrives from it as a plain
+# space-separated string and is split into the array below. Sourcing it after the array line
+# (the original order) left the string as ONE element: a single bogus path with a space in it,
+# which the dispatcher then polled forever while the real queues sat untouched — with the
+# startup log printing identically for both shapes.
+[ -f /boot/config/vo-dispatcher.conf ] && . /boot/config/vo-dispatcher.conf
 
 DISPATCH="${DISPATCH:-/mnt/user/appdata/ai-dispatch}"
 # Every app that files tickets. Add sonarr-completor's dir here if it pages the same agent.
+# Deliberately unquoted: a space-separated string from the conf/env becomes one element per dir.
 TICKET_DIRS=(${TICKET_DIRS[@]:-/mnt/user/appdata/vo-merge/ai-tickets})
 CLAUDE="${CLAUDE:-claude}"                 # absolute path if not on cron's PATH, e.g.
                                            # /usr/local/emhttp/plugins/unraid-aicliagents/bin/claude
@@ -63,7 +70,6 @@ VO_URL="${VO_URL-http://127.0.0.1:8090/api}"   # vo-merge API: callbacks + cross
 VO_DOWN_ALARM_MIN="${VO_DOWN_ALARM_MIN:-15}"
 NOTIFY_URL="${NOTIFY_URL-}"                # ntfy/Discord/Slack — same value as vo-merge's notify_url
 UNRAID_NOTIFY="${UNRAID_NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
-[ -f /boot/config/vo-dispatcher.conf ] && . /boot/config/vo-dispatcher.conf
 
 LOG="$DISPATCH/dispatch.log"
 STATE="$DISPATCH/state"
@@ -117,6 +123,12 @@ if [ -z "$HOME_DIR" ] && [ ! -d "$HOME/.claude" ]; then
         "no login and every run will fail instantly. Set HOME_DIR in" \
         "/boot/config/vo-dispatcher.conf (AI CLI Agents plugin: /tmp/unraid-aicliagents/work/root/home)."
 fi
+# A queue dir must already exist — the app that files tickets creates it. Creating it here
+# would turn a typo (or a mis-parsed TICKET_DIRS) into a silently-polled empty directory while
+# the real queue rots; that exact failure shipped once. Warn loudly and skip it instead.
+for d in "${TICKET_DIRS[@]}"; do
+    [ -d "$d" ] || log "WARNING: ticket dir does not exist and will be SKIPPED: '$d' — check TICKET_DIRS"
+done
 
 check_vo() {
     [ -n "$VO_URL" ] || return 0
@@ -240,7 +252,7 @@ run_ticket() {  # $1 = queue dir, $2 = ticket filename. Returns via side effects
     # Time the SILENCE instead, with a hard ceiling as a backstop.
     while kill -0 "$cpid" 2>/dev/null; do
         sleep "$WATCH_POLL"
-        for d in "${TICKET_DIRS[@]}"; do touch "$d/.heartbeat"; done   # a long run isn't a dead dispatcher
+        for d in "${TICKET_DIRS[@]}"; do [ -d "$d" ] && touch "$d/.heartbeat"; done   # a long run isn't a dead dispatcher
         now=$(date +%s)
         last=$(stat -c %Y "$stream" 2>/dev/null || echo "$started")
         if [ $(( now - last )) -ge "$IDLE_TIMEOUT" ]; then
@@ -345,6 +357,7 @@ pass() {
 
     local d f name handled=0
     for d in "${TICKET_DIRS[@]}"; do
+        [ -d "$d" ] || continue          # never create a queue dir — see the startup warning
         mkdir -p "$d/claimed" "$d/dead"
         touch "$d/.heartbeat"
         # anything still claimed at pass start is a crashed dispatcher run — requeue it (its
@@ -401,7 +414,7 @@ pass() {
         fi
         run_ticket "${entry%%|*}" "${entry#*|}"
         handled=$((handled + 1))
-        for d in "${TICKET_DIRS[@]}"; do touch "$d/.heartbeat"; done
+        for d in "${TICKET_DIRS[@]}"; do [ -d "$d" ] && touch "$d/.heartbeat"; done
     done
 }
 

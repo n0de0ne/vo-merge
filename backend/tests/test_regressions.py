@@ -1441,3 +1441,23 @@ def test_deleted_titles_are_pruned_on_a_schedule_with_the_mount_guard(app_env, t
     with app_env.db() as c:
         left = [r["path"] for r in c.execute("SELECT path FROM probes")]
     assert left == [str(kept)]
+
+
+def test_ai_paging_holds_while_a_scan_churns_statuses(app_env, monkeypatch):
+    """Observed live: a running recheck re-opened records en masse, and every 3-minute sweep
+    paged ~26 tickets that the NEXT sweep withdrew as 'recovered' and then re-filed — an
+    endless create/withdraw cycle burning dispatcher runs on tickets about to be void. Paging
+    holds while a scan runs, like searches always have."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    assert pipeline.SCAN_LOCK.acquire(blocking=False)
+    try:
+        pipeline.ai_health_check(cfg)
+        assert not os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+        assert app_env.get_movie(1)["ai_status"] is None, "no stamp for a page never sent"
+    finally:
+        pipeline.SCAN_LOCK.release()
+    pipeline.ai_health_check(cfg)                       # scan over -> paged promptly
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))

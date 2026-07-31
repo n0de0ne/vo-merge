@@ -980,6 +980,14 @@ def ai_health_check(cfg=None):
             _WEDGE_SINCE["ts"] = time.time()
     else:
         _WEDGE_SINCE["ts"] = None
+    # A scan or recheck rewrites statuses en masse — re-opens, close-outs, transient bounces —
+    # and paging off that churn files tickets the very next sweep WITHDRAWS (the record passed
+    # through `pending`) and then re-files: dozens of create/withdraw cycles per sweep, with
+    # dispatcher runs burned on tickets about to be void. Hold the paging machinery while the
+    # scan runs, exactly like searches do; anything still failing when it ends is paged by the
+    # next 3-minute sweep. (Part (a) above stays live — a wedged cap is not scan churn.)
+    if SCAN_LOCK.locked():
+        return
     # (b) records newly landed in error / review / sync_fail — one ticket PER RECORD, capped.
     # The old single errors-review.json batch had queue semantics that fought the dispatcher:
     # while one batch sat unconsumed every later failure was refused a ticket, and a batch is
