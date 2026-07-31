@@ -44,6 +44,16 @@ PROMPT_FILE="${PROMPT_FILE:-$DISPATCH/prompt.md}"   # guardrails prepended to fr
 MAX_RUNS="${MAX_RUNS:-100}"                # claude runs per day
 PER_INVOCATION="${PER_INVOCATION:-2}"      # tickets handled per pass/firing
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"          # resumes of the SAME ticket before giving up on it
+RETRY_WAIT="${RETRY_WAIT:-600}"            # min seconds between attempts of the SAME ticket. The
+                                           # old cron cadence paced retries by accident; loop
+                                           # mode retried a failing ticket every 30s and burned
+                                           # all its attempts in 90 seconds.
+BREAKER_FAILS="${BREAKER_FAILS:-3}"        # this many CONSECUTIVE instant failures (rc!=0 in
+                                           # under 30s, i.e. the CLI itself dying — login gone,
+                                           # binary missing) trips the breaker...
+BREAKER_COOLDOWN="${BREAKER_COOLDOWN:-900}"  # ...which pauses all dispatch this long and alarms,
+                                           # instead of grinding the queue and the daily budget
+                                           # into give-ups
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-300}"        # kill only after this long with NO output at all
 HARD_TIMEOUT="${HARD_TIMEOUT:-3600}"       # absolute backstop, however chatty the run is
 WATCH_POLL="${WATCH_POLL:-15}"             # watchdog check interval during a run
@@ -99,6 +109,13 @@ if [ -n "$HOME_DIR" ] && [ ! -d "$HOME/.claude" ]; then
     alarm "Dispatcher cannot run" \
           "$HOME/.claude missing — the AI CLI Agents plugin has not started. It lives under /tmp and is lost on every reboot."
     exit 1
+fi
+# The silent variant of the same failure: no HOME_DIR configured at all, so the CLI looks in
+# root's own HOME for a login that isn't there and every run dies instantly with rc=1.
+if [ -z "$HOME_DIR" ] && [ ! -d "$HOME/.claude" ]; then
+    log "WARNING: HOME_DIR is not set and $HOME/.claude does not exist — the CLI probably has" \
+        "no login and every run will fail instantly. Set HOME_DIR in" \
+        "/boot/config/vo-dispatcher.conf (AI CLI Agents plugin: /tmp/unraid-aicliagents/work/root/home)."
 fi
 
 check_vo() {
@@ -238,6 +255,24 @@ run_ticket() {  # $1 = queue dir, $2 = ticket filename. Returns via side effects
     wait "$cpid" 2>/dev/null; wrc=$?
     [ -z "$rc" ] && rc=$wrc
     runs=$((runs + 1)); echo "$runs" > "$BUDGET"
+    local dur=$(( $(date +%s) - started ))
+
+    # Circuit breaker accounting: an instant rc!=0 is the CLI itself dying (login gone after a
+    # reboot, plugin not started, bad flag) — a real agent run, even one that ends in failure,
+    # takes minutes. A run of them means every ticket will burn the same way, so stop dispatch
+    # for a cooldown and ALARM instead of grinding the queue and the budget into give-ups.
+    if [ "$rc" != "0" ] && [ "$dur" -lt 30 ]; then
+        local ff=$(( $(cat "$STATE/.fastfails" 2>/dev/null || echo 0) + 1 ))
+        echo "$ff" > "$STATE/.fastfails"
+        if [ "$ff" -ge "$BREAKER_FAILS" ]; then
+            echo "$(( $(date +%s) + BREAKER_COOLDOWN ))" > "$STATE/.breaker-until"
+            log "BREAKER: $ff consecutive instant CLI failures — pausing dispatch $(( BREAKER_COOLDOWN / 60 ))min"
+            alarm "dispatcher: the CLI itself is failing" \
+                  "$ff consecutive runs died instantly (rc!=0 in <30s) — usually a missing login (HOME_DIR / the AI CLI Agents plugin after a reboot). Dispatch paused $(( BREAKER_COOLDOWN / 60 ))min; see the last .jsonl in $DONE for the CLI's own error."
+        fi
+    else
+        rm -f "$STATE/.fastfails"
+    fi
 
     # Human-readable digest beside the raw stream.
     if command -v jq >/dev/null 2>&1; then
@@ -286,13 +321,14 @@ run_ticket() {  # $1 = queue dir, $2 = ticket filename. Returns via side effects
             *)   why="exited rc=$rc"                                ;;
         esac
         mv "$claimed" "$t"
-        log "RETRY $key — $why (attempt $attempt/$MAX_ATTEMPTS)"
+        # the CLI's own last words go in the log — "exited rc=1" alone diagnoses nothing
+        log "RETRY $key — $why (attempt $attempt/$MAX_ATTEMPTS): $(tail -c 300 "$stream" | tr '\n' ' ')"
         unraid_notify "$app: ${name%.json} -> will resume" \
                       "$why — attempt $attempt of $MAX_ATTEMPTS, resuming next run." "warning"
     else
         # Out of attempts. Give up EXPLICITLY — callback so the record leaves 'with the AI',
         # dead/ so the give-up is a visible verdict, never silent rot.
-        log "GIVEUP $key after $attempt attempts (rc=$rc)"
+        log "GIVEUP $key after $attempt attempts (rc=$rc): $(tail -c 300 "$stream" | tr '\n' ' ')"
         alarm "$app: ${name%.json} -> gave up" \
               "Unfinished after $MAX_ATTEMPTS attempts (rc=$rc). Needs a human."
         [ "$app" = "vo-merge" ] && vo_callback "${name%.json}" "gave-up" \
@@ -321,21 +357,39 @@ pass() {
     done
     check_vo
 
+    # Circuit breaker open? Heartbeat and cross-watch keep running (the dispatcher is alive,
+    # its CLI is what's broken) but no runs start until the cooldown passes.
+    if [ -f "$STATE/.breaker-until" ]; then
+        if [ "$(date +%s)" -lt "$(cat "$STATE/.breaker-until" 2>/dev/null || echo 0)" ]; then
+            return 0
+        fi
+        rm -f "$STATE/.breaker-until" "$STATE/.fastfails"
+        log "breaker cooldown over — resuming dispatch"
+    fi
+
     # Unfinished work first: a ticket that already has attempts must be finished before any new
     # one is started, or a busy queue leaves half-done jobs behind indefinitely. Oldest first
-    # within each class (ticket names carry no whitespace).
-    local tickets=() entry app key
+    # within each class (ticket names carry no whitespace). A ticket attempted less than
+    # RETRY_WAIT ago is skipped this pass — loop mode must not burn a ticket's whole attempt
+    # budget in ninety seconds the way a 30s poll otherwise would.
+    local tickets=() entry app key now
+    now=$(date +%s)
     for d in "${TICKET_DIRS[@]}"; do
         app=$(basename "$(dirname "$d")")
         for name in $(ls -tr "$d" 2>/dev/null | grep '\.json$'); do
             key="${app}-${name%.json}"
-            if [ -f "$STATE/$key.attempt" ]; then tickets=("$d|$name" "${tickets[@]}")
-            else                                  tickets+=("$d|$name"); fi
+            if [ -f "$STATE/$key.attempt" ]; then
+                [ $(( now - $(stat -c %Y "$STATE/$key.attempt" 2>/dev/null || echo 0) )) -lt "$RETRY_WAIT" ] && continue
+                tickets=("$d|$name" "${tickets[@]}")
+            else
+                tickets+=("$d|$name")
+            fi
         done
     done
 
     for entry in ${tickets[@]+"${tickets[@]}"}; do
         [ "$handled" -ge "$PER_INVOCATION" ] && break
+        [ -f "$STATE/.breaker-until" ] && break    # tripped mid-pass — stop immediately
         if [ "$runs" -ge "$MAX_RUNS" ]; then
             if [ ! -f "$BUDGET.warned" ]; then      # once a day, not once a firing
                 alarm "Daily AI budget reached ($MAX_RUNS)" \
