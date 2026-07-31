@@ -1461,3 +1461,34 @@ def test_ai_paging_holds_while_a_scan_churns_statuses(app_env, monkeypatch):
         pipeline.SCAN_LOCK.release()
     pipeline.ai_health_check(cfg)                       # scan over -> paged promptly
     assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+
+
+def test_promote_cannot_reassign_a_burned_release_or_steal_another_donors_record(app_env):
+    """The engine of the worst observed loop (Bleach S17E25, 29 attempts): promote mapped a
+    completed pack onto any non-merged episode WITHOUT consulting its blocklist, so a donor the
+    merge had just rejected was re-assigned every minute — and when the on-call agent
+    force-grabbed the right release, promote hijacked the record back to the bad pack before
+    the new donor finished downloading. The blocklist must bind promote like it binds search,
+    and a record downloading under a different hash belongs to that download."""
+    import time as _t
+    from app import tv, pipeline
+    cfg = dict(app_env.DEFAULTS)
+    app_env.upsert_episode({"id": "18:17:25", "series_id": 18, "series_title": "Bleach",
+                            "tvdb_id": 74796, "season": 17, "episode": 25,
+                            "french_path": "/media/Anime/Bleach/S17E25.mkv", "quality": "1080p"})
+    ep = lambda: app_env.get_episode("18:17:25")
+    # burned release (rejected by the merge): promote must refuse to re-assign it
+    app_env.set_ep_status("18:17:25", "pending",
+                          tried=json.dumps([["breeze-pack-rid", _t.time()], ["HASHY", _t.time()]]))
+    assert tv._claimable(ep(), "breeze-pack-rid", "otherhash", cfg) is False, "burned dl_id"
+    assert tv._claimable(ep(), "other-rid", "HASHY", cfg) is False, "burned torrent hash"
+    assert tv._claimable(ep(), "fresh-rid", "freshhash", cfg) is True, "an unburned release may claim"
+    # the agent's deliberate re-grab: downloading under a different hash is not promote's to take
+    app_env.set_ep_status("18:17:25", "downloading", dl_hash="kaf-single-hash", tried="[]")
+    assert tv._claimable(ep(), "breeze-pack-rid", "breeze-hash", cfg) is False, \
+        "another donor is on its way — do not hijack the record"
+    assert tv._claimable(ep(), "kaf-rid", "kaf-single-hash", cfg) is True, \
+        "the record's OWN download still promotes it"
+    # queued/merging stay undisturbed, as before
+    app_env.set_ep_status("18:17:25", "ready")
+    assert tv._claimable(ep(), "x", "y", cfg) is False

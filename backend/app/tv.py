@@ -1159,6 +1159,31 @@ def promote_completed(cfg=None):
         TV_PROMOTE_LOCK.release()
 
 
+def _claimable(tgt, rid, h, cfg):
+    """May this completed download claim `tgt` for merging? The mapping loop used to ask only
+    "is it already queued/merging" — which made promote a BACK DOOR around the blocklist, and
+    the engine of the worst observed loop: a completed pack that can't help an episode (a
+    Dual-Audio eng+jpn donor for a fre-audio gap) sat in qB kept alive by its siblings, and
+    every minute the promote sweep re-assigned it to the episode that had just rejected it —
+    29 merge attempts on one episode, and when the on-call agent force-grabbed the RIGHT
+    release, promote hijacked the record back to the bad pack before the new donor finished
+    downloading. Two refusals close it:
+
+    - a release identity this record has already BURNED (its `tried` list holds the release id
+      or the torrent hash) is never re-assigned by promote — same rule every search obeys;
+    - an episode already `downloading` under a DIFFERENT hash belongs to that download (often
+      the agent's deliberate re-grab); its own promote will claim it when it lands."""
+    if tgt["status"] in ("ready", "merging"):
+        return False                     # already queued or being merged — don't disturb
+    from .pipeline import tried_active
+    blocked = tried_active(tgt, cfg)
+    if (rid and rid in blocked) or (h and h in blocked):
+        return False
+    if tgt["status"] == "downloading" and tgt.get("dl_hash") and tgt["dl_hash"] != h:
+        return False
+    return True
+
+
 def _promote_completed(cfg=None):
     """Fast sweep: map completed pack/episode downloads onto episodes and queue them for
     merging. No ffmpeg here — just a qB poll and a directory walk."""
@@ -1223,8 +1248,8 @@ def _promote_completed(cfg=None):
             if not tgt:
                 continue
             mapped += 1
-            if tgt["id"] in taken or tgt["status"] in ("ready", "merging"):
-                continue                       # already queued or being merged — don't disturb
+            if tgt["id"] in taken or not _claimable(tgt, eps[0].get("dl_id"), h, cfg):
+                continue           # queued/merging, a burned release, or another donor's record
             # conditional on the status we just read: if the worker claimed it in between,
             # this fails and we leave the live merge alone (never re-queue a merging episode)
             if core.claim_episode(tgt["id"], tgt["status"], "ready", en_file=vid,
@@ -1237,11 +1262,13 @@ def _promote_completed(cfg=None):
             core.log(f"tv queued: {t['name'][:50]} -> {claimed} episode(s) on the merge queue")
         elif mapped:
             # The pack DOES contain these episodes — they were simply already queued, already
-            # merging, or claimed by a concurrent pass a moment ago. Claiming nothing here is a
-            # no-op, NOT a failure: erroring on it (which this used to do, because `claimed == 0`
-            # was treated as "nothing matched") overwrote perfectly good `ready` records and
-            # produced the nonsense "parsed X, wanted X" with both sides identical.
-            core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already queued/merging")
+            # merging, claimed by a concurrent pass a moment ago, or refused by _claimable
+            # (this release is on their blocklist, or another donor is already on its way).
+            # Claiming nothing here is a no-op, NOT a failure: erroring on it (which this used
+            # to do, because `claimed == 0` was treated as "nothing matched") overwrote
+            # perfectly good `ready` records and produced the nonsense "parsed X, wanted X".
+            core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already "
+                     f"queued/merging/blocklisted")
         elif not files:
             # complete, dir present, but ZERO parseable video -> dead release
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")
