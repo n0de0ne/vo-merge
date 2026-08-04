@@ -263,3 +263,27 @@ def test_vostfr_suppresses_the_french_hint():
 
 def test_hint_lang_needs_whole_tokens():
     assert media.hint_lang("Buffering") is None       # not 'fr' inside a word
+
+
+# ------------------------------------------------------------------ VOF (French original)
+def test_vof_is_a_french_audio_marker():
+    """VOF = "Version Originale Française": a French-ORIGINAL title, French audio only. It
+    matched nothing — the bare `VF` marker refuses a letter before it (the O) and the VOST-family
+    `VO` refuses one after (the F) — so a VOF release advertised no language, was never rejected,
+    and got grabbed for files missing ENGLISH, which it can never carry."""
+    from app import media
+    t = "OSS.117.Alerte.rouge.en.Afrique.noire.2021.VOF.1080p.BluRay.AAC.x265-k7"
+    langs, multi, orig = media.release_langs(t)
+    assert langs == {"fre"} and not multi and not orig
+    # a French film missing ENGLISH: VOF can never help -> rejected
+    assert media.useless_release(t, {"eng"}, "OSS 117 Alerte rouge en Afrique noire") is True
+    # ...but it IS the answer when French audio is what's missing
+    assert media.useless_release(t, {"fre"}, "OSS 117") is False
+    assert media.lang_hits(t, {"fre"}) == 1
+    # neighbours must not regress
+    assert media.release_langs("Movie.2019.VF.1080p")[0] == {"fre"}
+    assert media.release_langs("Movie.2019.VOSTFR.1080p")[0] == set()
+    assert media.release_langs("Movie.2019.VOSTFR.1080p")[2] is True
+    assert media.release_langs("Movie.2019.MULTI.VOF.1080p")[1] is True    # MULTI still wins
+    # and a VOF filename resolves an untagged (und) audio track to French
+    assert media.hint_lang("OSS.117.2021.VOF.1080p.mkv") == "fre"

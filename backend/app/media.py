@@ -77,7 +77,7 @@ _ALIAS = {
 # every pattern here must be unambiguous about the AUDIO language. `vf`/`fr` are safe as whole
 # tokens because "vostfr"/"subfrench" have no word boundary before their "fr".
 _NAME_HINTS = (
-    (re.compile(r'(?<![a-z])(vff|vfq|vfi|vf|truefrench|french|francais|français)(?![a-z])', re.I), "fre"),
+    (re.compile(r'(?<![a-z])(vff|vfq|vfi|vof|vf|truefrench|french|francais|français)(?![a-z])', re.I), "fre"),
     (re.compile(r'(?<![a-z])(english|anglais|eng)(?![a-z])', re.I), "eng"),
     (re.compile(r'(?<![a-z])(japanese|japonais|jpn)(?![a-z])', re.I), "jpn"),
     (re.compile(r'(?<![a-z])(spanish|espanol|español|castellano)(?![a-z])', re.I), "spa"),
@@ -395,7 +395,12 @@ def wanted_audio(donor_info, base_info, want, extra=()):
 # deliberately absent: they collide with resolution/source tokens and with ordinary title words,
 # and a false positive here REJECTS a good release.
 _DUB_MARKERS = {
-    "fre": r'VFF|VFQ|VFI|VF2|VFNF|TRUEFRENCH|FRENCH|FRANCAIS|FRAN[CÇ]AIS|(?<![A-Z])VF(?![A-Z])',
+    # VOF = "Version Originale Française": a FRENCH-ORIGINAL title, so the release carries
+    # French audio and nothing else. It used to match NOTHING here — the bare `VF` alternative
+    # refuses a letter before it (the O blocks it) and the VOST-family `VO` refuses a letter
+    # after it (the F blocks that) — so a VOF release advertised no language at all, was never
+    # rejected, and got picked for files whose gap is English, which it can never carry.
+    "fre": r'VFF|VFQ|VFI|VF2|VFNF|VOF|TRUEFRENCH|FRENCH|FRANCAIS|FRAN[CÇ]AIS|(?<![A-Z])VF(?![A-Z])',
     "eng": r'ENGLISH|(?<![A-Z])ENG(?![A-Z])',
     "ger": r'GERMAN|DEUTSCH|(?<![A-Z])GER(?![A-Z])',
     "spa": r'SPANISH|ESPANOL|ESPA[NÑ]OL|CASTELLANO|LATINO|(?<![A-Z])SPA(?![A-Z])',

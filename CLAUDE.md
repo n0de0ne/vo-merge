@@ -659,6 +659,17 @@ title alone advertises nothing, while `The German Doctor 2013 GERMAN 1080p` adve
 Two-letter codes (NL, DE, IT…) are deliberately absent from the table — they collide with
 source/resolution tokens, and a false positive here **rejects** a good release.
 
+**`VOF` is a French-audio marker, and it matched nothing for a long time.** "Version Originale
+Française" = a French-ORIGINAL title, so the release carries French and nothing else — but the
+bare `VF` alternative refuses a letter *before* it (the `O` blocks it) and the VOST-family `VO`
+refuses one *after* (the `F` blocks it), so VOF fell between both guards, advertised no language
+at all, and was scored on seeders alone. A French film missing ENGLISH would happily grab one.
+It now sits in the `fre` markers (and in `_NAME_HINTS`, so a VOF filename also resolves an
+untagged `und` audio track to French). Note the deliberate cost: a French BluRay of a French
+film often *does* embed English subtitles its name never mentions, so a subtitle-only gap loses
+that occasional donor — the same trade `FRENCH` already made, and Bazarr is the cheaper tool for
+subtitles anyway.
+
 `_place_multi` (films) and the direct-remux branch (TV) ask the same generalised question of the
 *probed* release: `media.gap_langs(...)` reporting no audio gap means the download alone
 satisfies the profile. Both were literal `fre`+`eng` checks before.
