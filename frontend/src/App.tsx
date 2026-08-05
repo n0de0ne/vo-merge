@@ -574,8 +574,8 @@ function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
     );
   const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped">
+      <div className="row panel-head">
         <b>Language coverage</b>
         <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
           files meet their target · {pct}%
@@ -583,7 +583,9 @@ function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
         {goto && <><div className="spacer" />
           <button className="btn sec" onClick={() => goto("library")}>Browse files →</button></>}
       </div>
-      {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+      <div className="panel-body">
+        {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+      </div>
     </div>
   );
 }
@@ -729,15 +731,15 @@ function Library() {
   const pages = Math.ceil((d?.total ?? 0) / PAGE);
   return (
     <>
-      <div className="panel">
-        <div className="row" style={{ marginBottom: 8 }}>
+      <div className="panel capped full">
+        <div className="row panel-head">
           <b>Library</b>
           <span className="muted">every file the scanner has read, scored against its language target</span>
           <div className="spacer" />
           <RescanButton scope="all" label="files" primary />
           <RescanButton scope="all" label="everything" full />
         </div>
-        <div className="row libfilters">
+        <div className="row libfilters panel-head">
           <div className="segbtns">
             {tabs.map(([k, label, n]) => (
               <button key={k} className={state === k ? "active" : ""} onClick={() => pick(setState)(k)}>
@@ -769,11 +771,11 @@ function Library() {
               : "Nothing here matches those filters."}
           </div>}
         {d && d.total > 0 && <>
-          <div className="libhead">
+          <div className="libhead panel-head">
             <span>title</span><span>on the file</span><span>gap</span>
           </div>
-          <div className="liblist">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
-          <div className="row" style={{ marginTop: 10 }}>
+          <div className="liblist panel-body">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
+          <div className="row panel-foot">
             <span className="muted">
               showing {(page * PAGE + 1).toLocaleString()}–{(page * PAGE + shown).toLocaleString()}
               {" "}of {d.total.toLocaleString()}</span>
@@ -820,7 +822,7 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
         {!list && !err && <div className="muted" style={{ marginTop: 12 }}>searching indexers… (this can take a few seconds)</div>}
         {list && list.length === 0 && <div className="muted" style={{ marginTop: 12 }}>No releases found.</div>}
         {list && list.length > 0 &&
-          <div className="rel-list">
+          <div className="rel-list scroll-y tall">
             {list.map(c => (
               <div className={"rel-row" + (c.tried ? " tried" : "")} key={c.rid}>
                 <div className="rel-main">
@@ -884,20 +886,22 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
     <div className="card">
       <Poster src={m.poster} alt={m.title} />
       <div className="card-body">
-        <div className="card-title">{m.title} <span className="muted">({m.year})</span></div>
-        <div className="sub">→ {m.original_title} · {m.original_lang}{m.quality ? " · " + m.quality : ""}</div>
+        <div className="card-title" title={`${m.title} (${m.year})`}>{m.title} <span className="muted">({m.year})</span></div>
         <div className="card-row"><Pill s={m.status} />
           {m.status === "sync_fail" && m.sync_delta != null && <span className="sub">Δ {m.sync_delta.toFixed(1)}s</span>}
           <div className="spacer" />
           <MovieActions m={m} busy={busy} act={act} onRelease={onRelease} onTune={onTune} />
         </div>
-        {m.status === "downloading" && <DownloadBar dl={dl} />}
-        {m.status === "ready" && <QueuedLine />}
-        {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
-        <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
-        {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
-        <DriftBadge d={m.sync_drift} />
-        {m.error && <div className="sub bad">{m.error}</div>}
+        <div className="card-scroll">
+          <div className="sub">→ {m.original_title} · {m.original_lang}{m.quality ? " · " + m.quality : ""}</div>
+          {m.status === "downloading" && <DownloadBar dl={dl} />}
+          {m.status === "ready" && <QueuedLine />}
+          {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
+          <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
+          {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
+          <DriftBadge d={m.sync_drift} />
+          {m.error && <div className="sub bad">{m.error}</div>}
+        </div>
       </div>
     </div>
   );
@@ -1042,89 +1046,95 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       <ForecastPanel />
 
       <div className="dash-cols">
-        <div className="panel">
-          <div className="row" style={{ marginBottom: 8 }}><b>Active now</b>
+        <div className="panel capped tall">
+          <div className="row panel-head"><b>Active now</b>
             <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span>
             <div className="spacer" /><LiveDot /></div>
-          {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
-          {d.active.map(a => (
-            <div className="dashrow" key={a.key}>
-              <Poster src={a.poster} alt={a.title} />
-              <div className="dashrow-main">
-                <div className="dashrow-title">{a.title}
-                  {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
-                {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
-                {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
-                {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
-                {a.status === "merging" && a.progress &&
-                  <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
+          <div className="panel-body">
+            {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
+            {d.active.map(a => (
+              <div className="dashrow" key={a.key}>
+                <Poster src={a.poster} alt={a.title} />
+                <div className="dashrow-main">
+                  <div className="dashrow-title">{a.title}
+                    {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
+                  {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
+                  {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
+                  {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
+                  {a.status === "merging" && a.progress &&
+                    <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
+                </div>
+                <Pill s={a.status} />
               </div>
-              <Pill s={a.status} />
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
 
         <div>
-          <div className="panel">
+          <div className="panel capped">
             {/* Only what the on-call AI could not resolve, plus `review` (a human decision by
                 definition). Everything else that failed is still with the AI and is counted,
                 not listed — otherwise this is a list of things already being worked on. */}
-            <div className="row" style={{ marginBottom: 8 }}><b>Needs attention</b>
+            <div className="row panel-head"><b>Needs attention</b>
               {(d.ai_working ?? 0) > 0 &&
                 <span className="muted" title="failed records the AI is still working on — they appear here only if it can't fix them">
                   {d.ai_working} with the AI</span>}
               {attention > 0 && <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
                 onClick={() => goto("review")}>Open review →</button>}</div>
-            {d.attention.length === 0 && <div className="muted">
-              {(d.ai_working ?? 0) > 0
-                ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
-                : attention > 0
-                  ? `${attention} failure(s), none flagged for you yet.`
-                  : "All clear 🎉"}</div>}
-            {d.attention.map(a => (
-              // Title on ONE truncated line with the pills pinned beside it, then the message
-              // below at full width. The old shape put the pills in a right-hand COLUMN, which
-              // stole ~110px from the text and stacked them vertically as the panel narrowed.
-              <div className="attn" key={a.key}>
-                <div className="attn-head">
-                  <span className="attn-title" title={a.title}>{a.title}</span>
-                  {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
-                  <Pill s={a.status} />
-                  <AiPill s={a.ai_status} />
+            <div className="panel-body">
+              {d.attention.length === 0 && <div className="muted">
+                {(d.ai_working ?? 0) > 0
+                  ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
+                  : attention > 0
+                    ? `${attention} failure(s), none flagged for you yet.`
+                    : "All clear 🎉"}</div>}
+              {d.attention.map(a => (
+                // Title on ONE truncated line with the pills pinned beside it, then the message
+                // below at full width. The old shape put the pills in a right-hand COLUMN, which
+                // stole ~110px from the text and stacked them vertically as the panel narrowed.
+                <div className="attn" key={a.key}>
+                  <div className="attn-head">
+                    <span className="attn-title" title={a.title}>{a.title}</span>
+                    {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
+                    <Pill s={a.status} />
+                    <AiPill s={a.ai_status} />
+                  </div>
+                  {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
+                  {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                  {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
                 </div>
-                {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
-                {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
-                {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
 
           <AiHealthPanel ai={d.ai} now={d.now} />
 
-          <div className="panel">
-            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b>
+          <div className="panel capped short">
+            <div className="row panel-head"><b>Recently merged</b>
               {d.merged_kinds &&
                 <span className="muted" title="'already correct' files were never touched by vo-merge — a scan found they met their target and closed the record out">
                   {d.merged_kinds.grafted.toLocaleString()} grafted
                   {d.merged_kinds.replaced > 0 && <> · {d.merged_kinds.replaced.toLocaleString()} replaced</>}
                   {d.merged_kinds.already > 0 && <> · {d.merged_kinds.already.toLocaleString()} already correct</>}
                 </span>}</div>
-            {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
-            {d.recent.map((r, i) => (
-              <div className="dashrow" key={i}>
-                <Poster src={r.poster} alt={r.title} />
-                <div className="dashrow-main">
-                  <div className="dashrow-title">{r.title}</div>
-                  <div className="sub addrow">
-                    {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
-                    {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
-                    {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
-                    {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+            <div className="panel-body">
+              {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
+              {d.recent.map((r, i) => (
+                <div className="dashrow" key={i}>
+                  <Poster src={r.poster} alt={r.title} />
+                  <div className="dashrow-main">
+                    <div className="dashrow-title">{r.title}</div>
+                    <div className="sub addrow">
+                      {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
+                      {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
+                      {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
+                      {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+                    </div>
                   </div>
+                  <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
                 </div>
-                <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
         </div>
       </div>
@@ -1230,7 +1240,7 @@ function Films() {
         </div>
 
         {view === "grid"
-          ? <div className="cardgrid">
+          ? <div className="cardgrid fixed">
               {shown.map(m => <MovieCard key={m.tmdb_id} m={m} dl={dlOf(m)} busy={busy}
                 act={act} onRelease={setRelease} onTune={setTune} />)}
             </div>
@@ -1442,8 +1452,8 @@ function Series({ anime }: { anime: boolean }) {
         </div>
       </div>
 
-      <div className="panel">
-        <div className="row toolbar" style={{ marginBottom: 10 }}>
+      <div className="panel capped full">
+        <div className="row toolbar panel-head">
           <select value={filter} onChange={e => setFilter(e.target.value)}>
             <option value="">all states</option>
             {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
@@ -1462,10 +1472,12 @@ function Series({ anime }: { anime: boolean }) {
             <button className={view === "list" ? "active" : ""} onClick={() => setViewP("list")} title="List view">☰ List</button>
           </div>
         </div>
-        {view === "grid"
-          ? <div className="showcardgrid">{shownShows.map(renderShowCard)}</div>
-          : shownShows.map(renderShow)}
-        {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
+        <div className="panel-body">
+          {view === "grid"
+            ? <div className="showcardgrid fixed">{shownShows.map(renderShowCard)}</div>
+            : shownShows.map(renderShow)}
+          {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
+        </div>
       </div>
       {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
@@ -1537,8 +1549,8 @@ function Review() {
 
   return (
     <>
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped tall">
+      <div className="row panel-head">
         <b>Needs review</b>
         <span className="muted">{rows.length} item{rows.length === 1 ? "" : "s"}
           {needHuman > 0 && <> · <span className="bad">{needHuman} the AI couldn’t fix</span></>}</span>
@@ -1549,9 +1561,10 @@ function Review() {
             onClick={() => act(api.retryAllErrors)}>↻ Retry {retryable} failed</button>}
         <LiveDot />
       </div>
-      {rows.length === 0
-        ? <div className="muted">Nothing needs review 🎉</div>
-        : <table>
+      <div className="panel-body">
+        {rows.length === 0
+          ? <div className="muted">Nothing needs review 🎉</div>
+          : <table>
             <thead><tr><th>Title</th><th>Reason</th><th>AI review</th><th>Actions</th></tr></thead>
             <tbody>
               {rows.map(r => {
@@ -1605,7 +1618,8 @@ function Review() {
                 );
               })}
             </tbody>
-          </table>}
+            </table>}
+      </div>
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
       {release && <ReleaseModal title={release.title}
         load={() => api.candidates(release.tmdb_id)}
@@ -1638,8 +1652,8 @@ function AiSolvedPanel() {
     ["resolved", "Solved"], ["failed", "Couldn’t fix"],
     ["needs_human", "Handed back"], ["all", "All"]];
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: open ? 10 : 0 }}>
+    <div className="panel capped">
+      <div className="row panel-head" style={{ marginBottom: open ? 10 : 0 }}>
         <button className="btn sec" style={{ padding: "2px 8px" }}
           onClick={() => setOpen(o => !o)}>{open ? "▾" : "▸"}</button>
         <b>🤖 What the AI did</b>
@@ -1653,9 +1667,10 @@ function AiSolvedPanel() {
             </button>))}
         </div>}
       </div>
-      {open && (d.items.length === 0
-        ? <div className="muted">Nothing in this category yet.</div>
-        : <table>
+      {open && <div className="panel-body">
+        {d.items.length === 0
+          ? <div className="muted">Nothing in this category yet.</div>
+          : <table>
             <thead><tr><th>Title</th><th>What it did</th><th>Now</th><th>When</th></tr></thead>
             <tbody>
               {d.items.map(i => (
@@ -1671,7 +1686,8 @@ function AiSolvedPanel() {
                   <td className="muted" style={{ whiteSpace: "nowrap" }}>{fmtAgo(i.ai_at, d.now)}</td>
                 </tr>))}
             </tbody>
-          </table>)}
+            </table>}
+      </div>}
     </div>
   );
 }
@@ -1743,7 +1759,10 @@ function Settings() {
       <span className={tests[k] === "ok" ? "ok" : "bad"}> {tests[k]}</span>}</button>;
 
   return (
-    <div className="panel">
+    <div className="panel capped full">
+      {/* The form is metres long, so it scrolls inside the panel — but Save must never scroll
+          out of reach, so it sits in the pinned foot below rather than inside this body. */}
+      <div className="panel-body">
       <div className="section-title">Integrations</div>
       <div className="form-grid">
         <label>Prowlarr URL</label>{Text("prowlarr_url")}{TestBtn("prowlarr")}
@@ -1906,7 +1925,8 @@ function Settings() {
         <label>Pipeline enabled</label>{Check("enabled")}<span />
       </div>
 
-      <div className="row" style={{ marginTop: 18 }}>
+      </div>
+      <div className="row panel-foot">
         <button className="btn" onClick={save}>Save</button>
         {saved && <span className="ok">saved ✓</span>}
       </div>
@@ -1922,12 +1942,12 @@ function Logs() {
   useEffect(() => { refresh(); /* always load once on mount */ /* eslint-disable-next-line */ }, []);
   usePoll(() => { if (auto) refresh().catch(() => {}); }, 5000, [auto]);
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped full">
+      <div className="row panel-head">
         <button className="btn sec" onClick={refresh}>Refresh</button>
         <label className="muted"><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} /> auto</label>
       </div>
-      <pre className="logs">{lines.join("")}</pre>
+      <pre className="logs panel-body">{lines.join("")}</pre>
     </div>
   );
 }
