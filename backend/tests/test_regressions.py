@@ -1492,3 +1492,49 @@ def test_promote_cannot_reassign_a_burned_release_or_steal_another_donors_record
     # queued/merging stay undisturbed, as before
     app_env.set_ep_status("18:17:25", "ready")
     assert tv._claimable(ep(), "x", "y", cfg) is False
+
+
+def test_merged_log_pages_both_tables_as_one_stream(app_env):
+    """The dashboard panel shows the ten most recent merges; everything older had no way to be
+    seen. /api/merged is the full history behind it — and it must page movies and episodes as ONE
+    ordered stream: with a LIMIT per table, page 2 re-shows rows page 1 already displayed as soon
+    as one table runs ahead. It also has to count the SAME thing the panel counts, so `already`
+    (a scan closing out a file that was correct on its own — work nobody did) stays out."""
+    import time as _t
+    from app import main
+    base = _t.time()
+    for i in range(6):                                   # interleave the two tables in time
+        app_env.upsert_movie({"tmdb_id": 100 + i, "imdb_id": f"tt{i}", "radarr_id": i,
+                              "title": f"Film {i}", "original_title": f"Film {i}", "year": 2020,
+                              "original_lang": "french", "french_path": f"/m{i}.mkv",
+                              "quality": "1080p"})
+        app_env.set_status(100 + i, "merged", added_langs="eng", merge_kind="grafted",
+                           merged_at=base - i * 200)
+        app_env.upsert_episode({"id": f"7:1:{i}", "series_id": 7, "series_title": "Show",
+                                "tvdb_id": 7, "season": 1, "episode": i,
+                                "french_path": f"/e{i}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(f"7:1:{i}", "merged", added_subs="fre", merge_kind="grafted",
+                              merged_at=base - i * 200 - 100)
+    # work nobody did: must not appear anywhere in the history or its total
+    app_env.upsert_movie({"tmdb_id": 999, "imdb_id": "tt9", "radarr_id": 9, "title": "Untouched",
+                          "original_title": "Untouched", "year": 2020, "original_lang": "french",
+                          "french_path": "/u.mkv", "quality": "1080p"})
+    app_env.set_status(999, "merged", added_langs="", added_subs="", merge_kind="already",
+                       merged_at=base)
+
+    first = main.merged_log(limit=5, offset=0)
+    assert first["total"] == 12, "12 real merges, the 'already' row excluded"
+    assert [r["ts"] for r in first["items"]] == sorted((r["ts"] for r in first["items"]),
+                                                      reverse=True), "newest first"
+    assert first["items"][0]["title"] == "Film 0"
+    assert any(r["title"] == "Show S01E00" for r in first["items"]), "both tables in one stream"
+
+    second = main.merged_log(limit=5, offset=5)
+    ids = [(r["kind"], r["title"], r["ts"]) for r in first["items"] + second["items"]]
+    assert len(set(ids)) == 10, "paging must not re-show or skip rows across the two tables"
+    assert not any(r["title"] == "Untouched" for r in main.merged_log(limit=50)["items"])
+
+    hits = main.merged_log(limit=50, q="Show")
+    assert hits["total"] == 6 and all(r["kind"] == "episode" for r in hits["items"]), \
+        "search filters the film title AND the series title, and the total follows the filter"
+    assert main.merged_log(limit=50, q="nothingmatches")["total"] == 0

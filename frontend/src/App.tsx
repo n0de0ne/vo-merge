@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
   CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState,
-  Forecast } from "./api";
+  Forecast, DashRecent } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -938,6 +938,85 @@ function Tile({ label, value, sub, tone, onClick }:
 // `needs_human` is mostly the no-callback flip. A wall of needs_human with no callback ever means
 // the dispatcher isn't running — which, without saying so, looks exactly like "it looked at
 // everything and gave up".
+/* One merged row — shared by the dashboard panel and the full-history modal, so the two can
+   never drift apart in what they show or how they say it. */
+function MergedRow({ r, now }: { r: DashRecent; now: number }) {
+  return (
+    <div className="dashrow">
+      <Poster src={r.poster} alt={r.title} />
+      <div className="dashrow-main">
+        <div className="dashrow-title">{r.title}</div>
+        <div className="sub addrow">
+          {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
+          {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
+          {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
+          {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+        </div>
+      </div>
+      <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, now)}</span>
+    </div>
+  );
+}
+
+/* The whole merge history. The dashboard panel is a ten-row window onto this; everything older
+   had no way to be seen at all. Paged rather than fetched whole — this is a few thousand rows on
+   a working install — and searchable, because "did X ever get done?" is the actual question you
+   bring to a list this long. */
+function AllMergedModal({ onClose }: { onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const [rows, setRows] = useState<DashRecent[]>([]);
+  const [meta, setMeta] = useState<{ total: number; now: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const PAGE = 50;
+
+  // Refetch from the top whenever the query changes, debounced so typing doesn't hammer the API.
+  useEffect(() => {
+    let dead = false;
+    setBusy(true);
+    const t = setTimeout(() => {
+      api.mergedLog(PAGE, 0, q)
+        .then(d => { if (!dead) { setRows(d.items); setMeta({ total: d.total, now: d.now }); } })
+        .finally(() => { if (!dead) setBusy(false); });
+    }, q ? 250 : 0);
+    return () => { dead = true; clearTimeout(t); };
+  }, [q]);
+
+  const more = () => {
+    setBusy(true);
+    api.mergedLog(PAGE, rows.length, q)
+      .then(d => { setRows(r => [...r, ...d.items]); setMeta({ total: d.total, now: d.now }); })
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="row panel-head">
+          <b>Everything merged</b>
+          {meta && <span className="muted">{meta.total.toLocaleString()} total</span>}
+          <div className="spacer" />
+          <input className="search" placeholder="Search title…" value={q}
+                 onChange={e => setQ(e.target.value)} autoFocus />
+          <button className="btn sec" onClick={onClose}>✕</button>
+        </div>
+        <div className="scroll-y tall">
+          {rows.length === 0 && !busy &&
+            <div className="muted">{q ? "Nothing merged matches that." : "No merges yet."}</div>}
+          {rows.map((r, i) => <MergedRow key={i} r={r} now={meta?.now || Date.now() / 1000} />)}
+        </div>
+        <div className="row panel-foot">
+          <span className="muted" style={{ fontSize: 12 }}>
+            {busy ? "loading…" : `showing ${rows.length.toLocaleString()} of ${(meta?.total || 0).toLocaleString()}`}
+          </span>
+          <div className="spacer" />
+          {meta && rows.length < meta.total &&
+            <button className="btn sec" onClick={more} disabled={busy}>Load 50 more</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
   if (!ai || !ai.enabled) return null;
   const seen = ai.pending + ai.resolved + ai.failed + ai.needs_human;
@@ -995,6 +1074,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const [dls, setDls] = useState<Record<string, DL>>({});
   const [logLines, setLogLines] = useState<string[]>([]);
   const [err, setErr] = useState("");
+  const [allMerged, setAllMerged] = useState(false);
 
   usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
     .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
@@ -1119,22 +1199,18 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                 </span>}</div>
             <div className="panel-body">
               {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
-              {d.recent.map((r, i) => (
-                <div className="dashrow" key={i}>
-                  <Poster src={r.poster} alt={r.title} />
-                  <div className="dashrow-main">
-                    <div className="dashrow-title">{r.title}</div>
-                    <div className="sub addrow">
-                      {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
-                      {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
-                      {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
-                      {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
-                    </div>
-                  </div>
-                  <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
-                </div>
-              ))}
+              {d.recent.map((r, i) => <MergedRow key={i} r={r} now={d.now} />)}
             </div>
+            {/* The panel shows the ten most recent; everything older is only reachable through
+                here, so the foot carries the count it is a window onto. */}
+            {d.recent.length > 0 &&
+              <div className="row panel-foot">
+                <span className="muted" style={{ fontSize: 12 }}>the 10 most recent</span>
+                <div className="spacer" />
+                <button className="btn sec small" onClick={() => setAllMerged(true)}>
+                  See all →
+                </button>
+              </div>}
           </div>
         </div>
       </div>
@@ -1151,6 +1227,8 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           {d.next_runs.stall != null && <span className="chip">next stall sweep <b>{fmtIn(d.next_runs.stall, d.now)}</b></span>}
         </div>
       </div>
+
+      {allMerged && <AllMergedModal onClose={() => setAllMerged(false)} />}
     </>
   );
 }

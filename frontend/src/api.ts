@@ -136,6 +136,11 @@ export interface DashRecent {
   subs?: string | null;    // subtitle languages grafted in
   how?: string;            // "grafted" (tracks added) | "replaced" (download became the file)
 }
+// One page of the full merge history. Rows are DashRecent, so the dashboard panel and the full
+// list render through the same component and can never drift apart.
+export interface MergedLog {
+  items: DashRecent[]; total: number; offset: number; limit: number; now: number;
+}
 // How the on-call AI dispatcher is actually doing. `resolved`/`failed` are verdicts it produced
 // itself; `needs_human` is mostly the no-callback flip, so a wall of it with last_callback null
 // means the dispatcher never ran — which otherwise looks identical to "it examined and gave up".
@@ -246,6 +251,10 @@ export const api = {
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
     j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),
+  // the full Recently-merged history behind the dashboard panel's top ten
+  mergedLog: (limit = 50, offset = 0, q = "") =>
+    j<MergedLog>(`/api/merged?limit=${limit}&offset=${offset}`
+                 + (q ? `&q=${encodeURIComponent(q)}` : "")),
   epAiSend: (id: string) =>
     j<{ ok: boolean; queued: boolean }>(`/api/episode/${encodeURIComponent(id)}/ai`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),

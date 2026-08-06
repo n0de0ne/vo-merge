@@ -1245,6 +1245,50 @@ def episode_ai_result(ep_id: str, body: AiResultIn):
     return {"ok": True}
 
 
+@api.get("/merged")
+def merged_log(limit: int = 50, offset: int = 0, q: str = ""):
+    """The FULL recently-merged history, paginated — what the dashboard panel shows the top ten
+    of. Same `DID_WORK` predicate as that panel, the 24h/7d counters and the forecast, so the
+    list you can page through can never disagree with the number above it about what counts as
+    a merge vo-merge actually performed (`already` — a scan closing out a file that was correct
+    on its own — is work nobody did, and stays out of all four).
+
+    Movies and episodes are paginated as ONE ordered stream via UNION ALL rather than fetched
+    per-table and merged in Python: with a LIMIT per table, page 2 would re-show rows page 1
+    already displayed as soon as one table ran ahead of the other.
+
+    `q` filters on the title (film title, or the series title for an episode), which is the only
+    way to answer "did X ever get done?" against a few thousand rows."""
+    lim = max(1, min(limit, 200))
+    off = max(0, offset)
+    like = f"%{q.strip()}%" if q.strip() else None
+    mq = f"status='merged' AND {DID_WORK}" + (" AND title LIKE ?" if like else "")
+    eq = f"status='merged' AND {DID_WORK}" + (" AND series_title LIKE ?" if like else "")
+    one = [like] if like else []
+    args = one + one                       # the UNION binds the filter once per branch
+    with core.db() as c:
+        total = (c.execute(f"SELECT COUNT(*) n FROM movies WHERE {mq}", one).fetchone()["n"]
+                 + c.execute(f"SELECT COUNT(*) n FROM episodes WHERE {eq}", one).fetchone()["n"])
+        rows = c.execute(
+            f"""SELECT 'movie' AS kind, title AS title, NULL AS season, NULL AS episode,
+                       added_langs, added_subs, merge_kind, poster,
+                       COALESCE(merged_at, updated) AS ts
+                FROM movies WHERE {mq}
+                UNION ALL
+                SELECT 'episode', series_title, season, episode,
+                       added_langs, added_subs, merge_kind, poster,
+                       COALESCE(merged_at, updated) FROM episodes WHERE {eq}
+                ORDER BY ts DESC LIMIT ? OFFSET ?""",
+            tuple(args) + (lim, off)).fetchall()
+    items = [{"kind": r["kind"],
+              "title": (r["title"] if r["kind"] == "movie"
+                        else f"{r['title']} S{r['season']:02d}E{r['episode']:02d}"),
+              "langs": r["added_langs"], "subs": r["added_subs"],
+              "how": r["merge_kind"] or "grafted", "poster": r["poster"], "ts": r["ts"]}
+             for r in rows]
+    return {"items": items, "total": total, "offset": off, "limit": lim, "now": time.time()}
+
+
 @api.get("/ai_log")
 def ai_log(outcome: str = "resolved", limit: int = 50):
     """What the on-call AI has actually reported back, newest first.
