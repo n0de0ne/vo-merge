@@ -519,6 +519,103 @@ def season_candidates(series_id, season, cfg=None):
     return out
 
 
+# A release that covers the WHOLE show, however the scene spelled it. "Batch" is the anime
+# convention and was missing entirely — `[Judas] … (Complete Series + Movies) … (Batch)` is the
+# exact shape this exists for.
+COMPLETE_RX = re.compile(r'(?<![a-z])(complete|int[eé]grale|integrale|batch|all\s+seasons'
+                         r'|full\s+series|s01\s*[-–~]\s*s?\d{2})(?![a-z])', re.I)
+
+
+def series_candidates(series_id, cfg=None):
+    """Scored candidates for the WHOLE SHOW — the complete-series batches.
+
+    Every other pack search composes `Title Sxx`, which is exactly why a complete-series batch
+    could never be found: an indexer asked for "Hunter x Hunter (2011) S01" does not return
+    "[Judas] Hunter x Hunter (2011) (Complete Series + Movies) … (Batch)". The pipeline could
+    already CLAIM such a release (`_pack_seasons` reads complete/intégrale as "every season" and
+    `_assign_pack` fans it out over the whole show) — there was simply no way to search for one.
+
+    So: query the bare title, and keep releases that cover more than one season — a complete
+    batch, a multi-season range, or a per-season pack (offered too, since one season of a long
+    show is often the only thing seeded). Single episodes are left to the per-episode search.
+    Scoring prefers what actually helps: a complete batch first, then the missing languages."""
+    cfg = cfg or core.load_config()
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id]
+    if not eps:
+        return []
+    gap = [e for e in eps if e["status"] not in ("merged", "ignored")] or eps
+    title = eps[0]["series_title"]
+    need = {x for e in gap for x in (e.get("need_audio") or "").split(",") if x}
+    need_s = {x for e in gap for x in (e.get("need_subs") or "").split(",") if x}
+    subs_only = _subs_only(need, need_s)
+    lang_need = set(need) | need_s if subs_only else need
+    # every season a RELEASE would use for this show, so a multi-season pack can be recognised
+    rseasons = sorted({_release_se(e, cfg)[0] for e in gap})
+    from .pipeline import tried_active
+    tried = set()
+    for e in gap:
+        tried |= tried_active(e, cfg)
+    pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
+    try:
+        results = pro.search(title, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+    except Exception as e:
+        core.log(f"series_candidates: {e}")
+        raise SearchUnavailable(str(e)) from e
+    qt = _toks(title); out = []
+    for r in results:
+        t = r.get("title", ""); tl = t.lower()
+        if media.useless_release(t, lang_need, title, orig=gap[0].get("orig_lang"),
+                                 need_subs=need_s):
+            continue
+        if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
+            continue
+        if SXXEXX.search(t):
+            continue                      # a single episode is not a whole-show answer
+        complete = bool(COMPLETE_RX.search(t))
+        seasons = _pack_seasons(t, -1)    # -1 = "advertised no season of its own"
+        multi_season = seasons is None or (seasons and seasons != {-1} and len(seasons) > 1)
+        covers = seasons is None or bool(seasons and (set(seasons) & set(rseasons)))
+        if not (complete or multi_season or covers):
+            continue
+        sc = min(int(r.get("seeders") or 0), 100)
+        if complete:
+            sc += 150                     # the thing this search exists to surface
+        elif multi_season:
+            sc += 80
+        else:
+            sc += 40                      # a single-season pack: still useful, ranked below
+        if subs_only:      sc += _size_bonus(r)
+        elif RES.search(t): sc += 20
+        if re.search(r"\bMULTI\b", t, re.I): sc += 40 if subs_only else 200
+        sc += 120 * media.lang_hits(t, lang_need, title)
+        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                    "title": t, "indexer": r.get("indexer"), "pack": True, "complete": complete,
+                    "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
+                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def grab_series(series_id, link, rid=None, title=None, cfg=None):
+    """Grab a whole-show release and claim every gap episode it covers.
+
+    The seasons come from the release NAME, exactly as a pack grab does — but with one extra
+    rule: a title that advertises no season at all was picked by the operator AT SERIES LEVEL,
+    so it means the whole show rather than "season -1". That is the common case here, because a
+    complete batch usually names no season."""
+    cfg = cfg or core.load_config()
+    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_ALL", cfg)
+    if not h:
+        raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
+    s = _pack_seasons(title, -1)
+    seasons = None if (s is None or s == {-1}) else s
+    n = _assign_pack(series_id, seasons, h, rid, title, cfg)
+    core.log(f"tv grab SERIES {series_id} (seasons {sorted(seasons) if seasons else 'ALL'}): "
+             f"{n} ep(s) <- {title}")
+    return n
+
+
 def _pack_seasons(title, default_season):
     """Seasons a release title advertises. None = ALL seasons (complete/intégrale). Only expands
     beyond {default_season} on a clear multi-season signal (range like S01-S03, or list like

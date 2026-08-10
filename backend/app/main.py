@@ -2037,6 +2037,28 @@ def tv_scan():
     return _bg_scan("tv")
 
 
+@api.get("/tv/{series_id}/candidates")
+def tv_series_candidates(series_id: int):
+    """Whole-show releases: complete-series batches and multi-season packs.
+
+    Every other pack search composes `Title Sxx`, so an indexer never returns a release called
+    "(Complete Series + Movies) … (Batch)" — the one release that can fill a 150-episode gap in
+    a single grab was unreachable, however many times the per-season search ran."""
+    from . import tv
+    try:
+        return tv.series_candidates(series_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
+
+
+@api.post("/tv/{series_id}/grab")
+def tv_series_grab(series_id: int, body: GrabIn):
+    """Grab a whole-show release and claim every gap episode it covers."""
+    from . import tv
+    n = tv.grab_series(series_id, body.link, body.rid, body.title)
+    return {"ok": True, "episodes": n}
+
+
 @api.get("/tv/{series_id}/{season}/candidates")
 def tv_season_candidates(series_id: int, season: int):
     from . import tv

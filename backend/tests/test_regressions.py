@@ -1567,3 +1567,63 @@ def test_single_series_search_touches_only_that_series(app_env, monkeypatch):
     seen.clear()
     tv.stage_search(cfg)                      # the sweep itself is unchanged
     assert sorted(seen) == [11, 22]
+
+
+JUDAS = ("[Judas] Hunter x Hunter (2011) (Complete Series + Movies) "
+         "[BD 1080p][HEVC x265 10bit][Dual-Audio][Eng-Subs] (Batch)")
+
+
+def test_a_complete_series_batch_is_found_and_claims_every_episode(app_env, monkeypatch):
+    """The one release that can fill a 150-episode gap in a single grab was unreachable: every
+    pack search composes 'Title Sxx', and an indexer asked for 'Hunter x Hunter (2011) S01' does
+    not return '(Complete Series + Movies) … (Batch)'. The pipeline could already CLAIM such a
+    release — it just had no way to search for one."""
+    from app import tv, media
+    # the scene spells 'whole show' several ways; all of them have to read as complete
+    for t in (JUDAS, "Show INTEGRALE FRENCH 1080p", "Show Complete Series 1080p",
+              "Show S01-S06 1080p BluRay"):
+        assert tv.COMPLETE_RX.search(t), t
+    assert not tv.COMPLETE_RX.search("Show S01 1080p WEB-DL"), "one season is not the whole show"
+    # a complete title advertises no season of its own -> claims EVERY season (None), and the
+    # grab path must read that as the whole show rather than as season -1
+    assert tv._pack_seasons(JUDAS, -1) is None
+    assert tv._pack_seasons("Show S01+S02 1080p", -1) == {1, 2}
+
+    for sid, season, ep in ((5, 1, 1), (5, 1, 2), (5, 2, 1)):
+        eid = f"{sid}:{season}:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": sid, "series_title": "Hunter x Hunter",
+                                "tvdb_id": sid, "season": season, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "pending", need_audio="eng", need_subs="eng")
+    monkeypatch.setattr(tv, "_grab", lambda link, savepath, cfg: "HASH123")
+    monkeypatch.setattr(tv, "_numbering", lambda s, cfg=None: ({}, {}))
+    n = tv.grab_series(5, "magnet:?xt=urn:btih:x", rid="judas-rid", title=JUDAS,
+                       cfg=dict(app_env.DEFAULTS))
+    assert n == 3, "a complete batch claims every gap episode, across every season"
+    for eid in ("5:1:1", "5:1:2", "5:2:1"):
+        e = app_env.get_episode(eid)
+        assert e["status"] == "downloading" and e["dl_hash"] == "HASH123"
+        assert e["dl_id"] == "judas-rid", "the release identity every retry path blocklists"
+
+
+def test_series_candidates_prefers_complete_and_drops_single_episodes(app_env, monkeypatch):
+    """Ranking has to put the batch first — and a single episode is never a whole-show answer."""
+    from app import tv
+    app_env.upsert_episode({"id": "6:1:1", "series_id": 6, "series_title": "Hunter x Hunter",
+                            "tvdb_id": 6, "season": 1, "episode": 1,
+                            "french_path": "/a.mkv", "quality": "1080p"})
+    app_env.set_ep_status("6:1:1", "pending", need_audio="eng", need_subs="eng", orig_lang="Japanese")
+    results = [
+        {"title": JUDAS, "seeders": 20, "size": 10 ** 11, "guid": "g1", "indexer": "nyaa"},
+        {"title": "Hunter x Hunter (2011) S01 1080p WEB-DL", "seeders": 90, "size": 10 ** 10,
+         "guid": "g2", "indexer": "nyaa"},
+        {"title": "Hunter x Hunter (2011) S01E05 1080p WEB-DL", "seeders": 99, "size": 10 ** 9,
+         "guid": "g3", "indexer": "nyaa"},
+    ]
+    monkeypatch.setattr(tv, "_numbering", lambda s, cfg=None: ({}, {}))
+    monkeypatch.setattr(tv.Prowlarr, "search", lambda self, q, ids: results)
+    out = tv.series_candidates(6, dict(app_env.DEFAULTS))
+    titles = [c["title"] for c in out]
+    assert titles[0] == JUDAS, "the complete batch ranks first even on far fewer seeders"
+    assert out[0]["complete"] is True
+    assert all("S01E05" not in t for t in titles), "single episodes are not whole-show answers"

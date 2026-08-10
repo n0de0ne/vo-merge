@@ -831,7 +831,11 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
                       ? <a href={c.info_url} target="_blank" rel="noreferrer" title="Open tracker page"
                            style={{ color: "#9ecbff", textDecoration: "none" }}>{c.title} ↗</a>
                       : c.title}
-                    {c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
+                    {/* COMPLETE outranks PACK: it claims every episode of the show in one grab,
+                        which is a different promise from "one season". */}
+                    {c.complete
+                      ? <span className="multi-badge" style={{ background: "#2a2440", color: "#c9a6ff", borderColor: "#4a3d70" }}>COMPLETE</span>
+                      : c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
                     {c.multi && <span className="multi-badge">MULTI</span>}
                     {c.tried && <span className="tried-mark">tried</span>}
                   </div>
@@ -1379,6 +1383,7 @@ function Series({ anime }: { anime: boolean }) {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
+  const [relSeries, setRelSeries] = useState<{ seriesId: number; title: string } | null>(null);
   const [relEp, setRelEp] = useState<Episode | null>(null);
   const [searchMsg, setSearchMsg] = useState("");
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
@@ -1498,6 +1503,14 @@ function Series({ anime }: { anime: boolean }) {
     <button className="btn sec small" disabled={busy}
       title="Re-read every file of this show (bypassing the probe cache) and search for whatever it still lacks"
       onClick={e => { e.stopPropagation(); rescanShow(sh.sid, sh.title); }}>↻ Re-read</button>;
+  /* Whole-show releases. The per-season search composes "Title Sxx", which an indexer never
+     answers with a complete-series batch — so the one release that can fill a 150-episode gap
+     in a single grab had no way to be found. */
+  const completeBtn = (sh: typeof shows[number]) =>
+    sh.sid ? <button className="btn sec small"
+      title="Find a COMPLETE-series release (a batch covering every season) and claim every episode with it"
+      onClick={e => { e.stopPropagation(); setRelSeries({ seriesId: sh.sid!, title: sh.title }); }}>
+      ⧉ Complete…</button> : null;
 
   const renderShow = (sh: typeof shows[number]) => {
     const isOpen = open.has(sh.title);
@@ -1507,7 +1520,7 @@ function Series({ anime }: { anime: boolean }) {
           <span className="caret">{isOpen ? "▾" : "▸"}</span>
           <Poster src={sh.poster} alt={sh.title} />
           <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
-          {rescanBtn(sh)}
+          {rescanBtn(sh)}{completeBtn(sh)}
           <div className="spacer" />
           <span className="chips">{statusPills(sh)}</span>
         </div>
@@ -1525,7 +1538,7 @@ function Series({ anime }: { anime: boolean }) {
           <Poster src={sh.poster} alt={sh.title} />
           <div className="showcard-meta">
             <div className="showcard-title">{sh.title}</div>
-            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}</div>
+            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}{completeBtn(sh)}</div>
             <div className="chips">{statusPills(sh)}</div>
           </div>
         </div>
@@ -1584,6 +1597,10 @@ function Series({ anime }: { anime: boolean }) {
           {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
         </div>
       </div>
+      {relSeries && <ReleaseModal title={`${relSeries.title} — complete series`}
+        load={() => api.seriesCandidates(relSeries.seriesId)}
+        onGrab={c => api.seriesGrab(relSeries.seriesId, c.link, c.rid, c.title)}
+        onClose={() => setRelSeries(null)} onGrabbed={refresh} />}
       {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
         onGrab={c => api.seasonGrab(relSeason.seriesId, relSeason.season, c.link, c.rid, c.title)}

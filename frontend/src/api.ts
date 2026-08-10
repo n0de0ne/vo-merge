@@ -119,6 +119,7 @@ export interface DL {
 export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
   multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean; info_url?: string | null;
+  complete?: boolean;      // covers the whole show (a complete-series / batch release)
 }
 export interface DashActive {
   kind: string; key: string; title: string; sub?: string | null; status: string;
@@ -310,6 +311,13 @@ export const api = {
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+  // whole-show releases: complete-series batches and multi-season packs. A per-season query can
+  // never surface these — an indexer asked for "Title S01" doesn't return "(Complete Series)".
+  seriesCandidates: (seriesId: number) =>
+    j<Candidate[]>(`/api/tv/${seriesId}/candidates`),
+  seriesGrab: (seriesId: number, link: string, rid: string, title: string) =>
+    j<{ ok: boolean; episodes: number }>(`/api/tv/${seriesId}/grab`,
+      { method: "POST", body: JSON.stringify({ link, rid, title }) }),
   seasonCandidates: (seriesId: number, season: number) =>
     j<Candidate[]>(`/api/tv/${seriesId}/${season}/candidates`),
   seasonGrab: (seriesId: number, season: number, link: string, rid: string, title: string) =>
