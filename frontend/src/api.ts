@@ -251,6 +251,14 @@ export const api = {
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
     j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),
+  // Re-read ONE title's files (probe cache bypassed) and act on what is now missing — the unit
+  // an operator works in after replacing a show's or a film's files by hand.
+  rescanSeries: (seriesId: number, search = true) =>
+    j<{ ok: boolean; started: boolean; scope?: string; note?: string }>(
+      `/api/tv/${seriesId}/rescan?search=${search}`, { method: "POST" }),
+  rescanMovie: (tmdbId: number, search = true) =>
+    j<{ ok: boolean; outcome: string; searched: boolean; movie: Movie }>(
+      `/api/movie/${tmdbId}/rescan?search=${search}`, { method: "POST" }),
   // the full Recently-merged history behind the dashboard panel's top ten
   mergedLog: (limit = 50, offset = 0, q = "") =>
     j<MergedLog>(`/api/merged?limit=${limit}&offset=${offset}`

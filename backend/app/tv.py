@@ -682,7 +682,12 @@ def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
     return 1 + extra
 
 
-def stage_search(cfg=None):
+def stage_search(cfg=None, only_series=None):
+    """The TV search sweep. `only_series` narrows it to ONE Sonarr series — what the operator's
+    per-show "re-scan and search" does, so a show that was just re-imported (a fresh MULTI rip,
+    say) is searched for its remaining gap immediately instead of waiting for the hourly sweep to
+    reach it behind a few thousand other records. Everything downstream is unchanged: the same
+    grouping, the same pack-vs-episode decision, the same brakes and budget."""
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
         return
@@ -694,6 +699,8 @@ def stage_search(cfg=None):
         core.log(f"tv search: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
         return
     pend = core.get_episodes("pending")
+    if only_series is not None:
+        pend = [e for e in pend if e["series_id"] == only_series]
     cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0   # ramp gradually, don't flood indexers
     # Group by the season a RELEASE would use, not the season the library filed it under. An
     # absolute-as-S01 anime library otherwise lumps every episode into one S01 group, searches

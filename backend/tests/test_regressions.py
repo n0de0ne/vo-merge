@@ -1538,3 +1538,32 @@ def test_merged_log_pages_both_tables_as_one_stream(app_env):
     assert hits["total"] == 6 and all(r["kind"] == "episode" for r in hits["items"]), \
         "search filters the film title AND the series title, and the total follows the filter"
     assert main.merged_log(limit=50, q="nothingmatches")["total"] == 0
+
+
+def test_single_series_search_touches_only_that_series(app_env, monkeypatch):
+    """Re-reading ONE show is the unit an operator works in (you replaced Hunter x Hunter's
+    files; a library-wide re-read is minutes over tens of thousands of files, and the hourly
+    sweep may not reach that show for ages). The search half must stay scoped to it — searching
+    the whole backlog off one show's button would burn the grab budget on unrelated titles."""
+    from app import tv
+    seen = []
+    monkeypatch.setattr(tv, "grab_budget", lambda cfg: 50)
+    monkeypatch.setattr(tv, "hold_reason", lambda cfg=None: None)
+    # no Sonarr in a test: _release_se asks it for the aired<->absolute table per episode
+    monkeypatch.setattr(tv, "_numbering", lambda sid, cfg=None: ({}, {}))
+    monkeypatch.setattr(tv, "_search_season",
+                        lambda sid, title, season, eps, rel, cfg, n, cap: seen.append(sid) or n + 1)
+    for sid, title in ((11, "Hunter x Hunter"), (22, "Other Show")):
+        for ep in (1, 2):
+            eid = f"{sid}:1:{ep}"
+            app_env.upsert_episode({"id": eid, "series_id": sid, "series_title": title,
+                                    "tvdb_id": sid, "season": 1, "episode": ep,
+                                    "french_path": f"/{eid}.mkv", "quality": "1080p"})
+            app_env.set_ep_status(eid, "pending", need_audio="eng", need_subs="eng")
+    cfg = dict(app_env.DEFAULTS, enabled=True, scope_series=True)
+
+    tv.stage_search(cfg, only_series=11)
+    assert seen == [11], "a per-show search must not sweep the whole backlog"
+    seen.clear()
+    tv.stage_search(cfg)                      # the sweep itself is unchanged
+    assert sorted(seen) == [11, 22]

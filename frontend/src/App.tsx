@@ -864,6 +864,9 @@ function MovieActions({ m, busy, act, onRelease, onTune }:
         B("Search again", () => act(() => api.research(m.tmdb_id)))}
       {["grabbed", "downloading", "no_release", "error", "sync_fail"].includes(m.status) &&
         B("Pick another", () => act(() => api.another(m.tmdb_id)))}
+      {/* The file on disk changed (replaced by hand, remuxed, subtitles dropped beside it):
+          re-read it and act on whatever it is now missing, without waiting for a sweep. */}
+      {B("↻ Re-read file", () => act(() => api.rescanMovie(m.tmdb_id)))}
       {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
       {m.status === "merged" && B("Tune sync", () => onTune(m))}
       {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
@@ -1399,7 +1402,7 @@ function Series({ anime }: { anime: boolean }) {
       for (const e of list) { let a = sm.get(e.season); if (!a) { a = []; sm.set(e.season, a); } a.push(e); }
       const seasons = [...sm.entries()].sort((a, b) => a[0] - b[0]);
       for (const [, seps] of seasons) seps.sort((a, b) => a.episode - b.episode);
-      return { title, poster: list[0]?.poster, eps: list, byStatus, seasons };
+      return { title, poster: list[0]?.poster, sid: list[0]?.series_id, eps: list, byStatus, seasons };
     });
   }, [kindEps]);
   const shownShows = useMemo(() => {
@@ -1473,6 +1476,29 @@ function Series({ anime }: { anime: boolean }) {
     <span className={`pill ${s}`} key={s}>{n} {s.replace("_", " ")}</span>);
 
   // list row (accordion)
+  /* Re-read one show's files and act on the result. The unit an operator works in: after
+     replacing a whole show's files by hand (a fresh MULTI rip), a library-wide re-read is
+     minutes over tens of thousands of files and the hourly sweep may not reach this show for
+     ages. Runs in the background — progress shows on the scan state like any other scan. */
+  const rescanShow = async (sid: number | undefined, title: string) => {
+    if (!sid) { setSearchMsg("no Sonarr id on these records"); return; }
+    setBusy(true); setSearchMsg("");
+    try {
+      const r = await api.rescanSeries(sid);
+      setSearchMsg(r.started ? `re-reading ${title} and searching what's still missing…`
+                             : (r.note || "a scan is already running"));
+    } catch (e: any) {
+      setSearchMsg(e.message || "re-read failed");
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
+  const rescanBtn = (sh: typeof shows[number]) =>
+    <button className="btn sec small" disabled={busy}
+      title="Re-read every file of this show (bypassing the probe cache) and search for whatever it still lacks"
+      onClick={e => { e.stopPropagation(); rescanShow(sh.sid, sh.title); }}>↻ Re-read</button>;
+
   const renderShow = (sh: typeof shows[number]) => {
     const isOpen = open.has(sh.title);
     return (
@@ -1481,6 +1507,7 @@ function Series({ anime }: { anime: boolean }) {
           <span className="caret">{isOpen ? "▾" : "▸"}</span>
           <Poster src={sh.poster} alt={sh.title} />
           <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
+          {rescanBtn(sh)}
           <div className="spacer" />
           <span className="chips">{statusPills(sh)}</span>
         </div>
@@ -1498,7 +1525,7 @@ function Series({ anime }: { anime: boolean }) {
           <Poster src={sh.poster} alt={sh.title} />
           <div className="showcard-meta">
             <div className="showcard-title">{sh.title}</div>
-            <div className="sub">{sh.eps.length} ep</div>
+            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}</div>
             <div className="chips">{statusPills(sh)}</div>
           </div>
         </div>

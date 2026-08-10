@@ -748,6 +748,94 @@ def library_repair_state():
     return pipeline.REPAIR_STATE
 
 
+@api.post("/tv/{series_id}/rescan")
+def tv_series_rescan(series_id: int, search: bool = True):
+    """Re-read every file of ONE show, then search for whatever it still lacks.
+
+    The unit the operator actually works in. A library-wide re-read is minutes of mkvmerge over
+    tens of thousands of files, and the hourly sweep is a sweep — so after replacing one show's
+    files (a fresh MULTI rip of a long-running anime, say) there was no way to say "re-read THIS
+    and act on it now". The Sonarr webhook already does exactly this per import; this is the same
+    path with a button on it.
+
+    The probe cache is bypassed (`refresh=True`) — the point of asking is that the files on disk
+    changed, and the cache is keyed on size+mtime, which a re-download does change but a remux in
+    place might not resolve within the cache's tolerance.
+
+    Runs in a thread under SCAN_LOCK: one heavy file pass at a time, and a 148-episode show is
+    148 probes, far longer than any HTTP client waits. Progress comes back on `GET /api/rescan`
+    like every other scan. `search=false` re-reads without acting."""
+    import threading
+    from . import tv
+    cfg = core.load_config()
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan is already running",
+                "state": pipeline.SCAN_STATE}
+    try:
+        title = (Sonarr(cfg["sonarr_url"], cfg["sonarr_key"]).series_one(series_id)
+                 or {}).get("title") or f"series {series_id}"
+    except Exception:
+        title = f"series {series_id}"
+
+    def _run():
+        st = pipeline.SCAN_STATE
+        st.update(running=True, scope=title, started=time.time(), finished=0, phase="reading files",
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None,
+                  full=True)
+        media.reset_stats()
+        try:
+            st["episodes"] = tv.scan(cfg, only_series=series_id, refresh=True)
+            # Searching is ACTING, so unlike the read above it honours the operator's own brakes
+            # (paused / scope_series / the in-flight cap). stage_search logs which one held it.
+            if search:
+                st["phase"] = "searching"
+                tv.stage_search(cfg, only_series=series_id)
+            st["phase"] = "done"
+            core.log(f"rescan({title}): {st['episodes']} episode gap(s) · "
+                     f"read {media.STATS['probed']} file(s)")
+        except Exception as e:
+            st["error"] = str(e); st["phase"] = "error"
+            core.log(f"rescan({title}) failed: {e}")
+        finally:
+            st.update(running=False, finished=time.time())
+            st["read"], st["reused"] = media.STATS["probed"], media.STATS["cached"]
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "scope": title, "searching": bool(search)}
+
+
+@api.post("/movie/{tmdb_id}/rescan")
+def movie_rescan(tmdb_id: int, search: bool = True):
+    """The film mirror of tv_series_rescan — re-read THIS file and act on it.
+
+    One file is one probe, so unlike a whole show this runs inline. Goes through
+    `pipeline.ingest_movie`, the same function the library sweep and the Radarr webhook use, so a
+    re-scan can never judge a file differently from the way it would have been judged anyway."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    if not mv.get("radarr_id"):
+        raise HTTPException(409, "no Radarr id on this record — nothing to re-read it from")
+    cfg = core.load_config()
+    try:
+        m = Radarr(cfg["radarr_url"], cfg["radarr_key"]).movie(mv["radarr_id"])
+    except Exception as e:
+        raise HTTPException(503, f"Radarr unavailable: {core.redact(str(e))}")
+    if not m:
+        raise HTTPException(404, "Radarr no longer has this movie")
+    outcome = pipeline.ingest_movie(m, cfg, refresh=True)
+    rec = core.get_movie(tmdb_id) or {}
+    searched = False
+    if search and rec.get("status") == "pending" and not pipeline.hold_reason(cfg):
+        try:
+            pipeline.search_movie(tmdb_id, cfg)
+            searched = True
+        except pipeline.SearchUnavailable as e:
+            raise HTTPException(503, f"re-read OK, but the indexer is unavailable: {e}")
+    return {"ok": True, "outcome": outcome, "searched": searched, "movie": core.get_movie(tmdb_id)}
+
+
 @api.post("/recheck")
 def do_recheck(scope: str = "all"):
     """Treat everything below target NOW, whatever settled state it is parked in.
