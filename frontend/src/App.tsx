@@ -868,9 +868,20 @@ function MovieActions({ m, busy, act, onRelease, onTune }:
         B("Search again", () => act(() => api.research(m.tmdb_id)))}
       {["grabbed", "downloading", "no_release", "error", "sync_fail"].includes(m.status) &&
         B("Pick another", () => act(() => api.another(m.tmdb_id)))}
+      {/* A merge is a sync detect plus a multi-GB remux; without this the only ways to stop one
+          going wrong were to wait out mux_timeout_min (4h) or restart the container. */}
+      {["merging", "ready"].includes(m.status) &&
+        B("⛔ Abort merge", () => act(() => api.abortMovie(m.tmdb_id)))}
       {/* The file on disk changed (replaced by hand, remuxed, subtitles dropped beside it):
           re-read it and act on whatever it is now missing, without waiting for a sweep. */}
       {B("↻ Re-read file", () => act(() => api.rescanMovie(m.tmdb_id)))}
+      {B("↺ Start over", () => {
+        if (confirm(`Start "${m.title}" from scratch?\n\nStops any merge, DELETES its download, `
+          + `and clears the blocklist, attempts, candidates and sync data.\n\n`
+          + `Your library file is NOT deleted — but tracks already merged into it stay merged, `
+          + `so it is re-read afterwards to see what it actually contains now.`))
+          act(() => api.resetMovie(m.tmdb_id));
+      })}
       {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
       {m.status === "merged" && B("Tune sync", () => onTune(m))}
       {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
@@ -1466,6 +1477,10 @@ function Series({ anime }: { anime: boolean }) {
             <td><div className="row">
               {!["ignored", "merged"].includes(e.status) &&
                 <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Interactive…</button>}
+              {["merging", "ready"].includes(e.status) &&
+                <button className="btn sec" disabled={busy}
+                  title="Kill the decode/mux running now, or take it off the merge queue"
+                  onClick={() => act(() => api.abortEpisode(e.id))}>⛔ Abort</button>}
               {["pending", "no_release", "error", "sync_fail"].includes(e.status) &&
                 <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
               {!["ignored", "merged"].includes(e.status) &&
@@ -1511,6 +1526,29 @@ function Series({ anime }: { anime: boolean }) {
       title="Find a COMPLETE-series release (a batch covering every season) and claim every episode with it"
       onClick={e => { e.stopPropagation(); setRelSeries({ seriesId: sh.sid!, title: sh.title }); }}>
       ⧉ Complete…</button> : null;
+  /* Start the whole show over. Deletes DOWNLOADS, never library files — the confirm says so,
+     because "delete everything" is the one instruction that must not be ambiguous. */
+  const resetShow = async (sh: typeof shows[number]) => {
+    if (!sh.sid) { setSearchMsg("no Sonarr id on these records"); return; }
+    if (!confirm(`Start "${sh.title}" (${sh.eps.length} episodes) from scratch?\n\n`
+      + `• stops any merge in progress\n• DELETES the downloads it grabbed\n`
+      + `• clears the blocklist, attempts, candidates, sync data and AI verdicts\n`
+      + `• re-reads every file afterwards\n\n`
+      + `Your library files are NOT deleted. Tracks already merged into them stay merged — `
+      + `the re-read is what records what each file actually contains now.`)) return;
+    setBusy(true); setSearchMsg("");
+    try {
+      const r = await api.resetSeries(sh.sid);
+      setSearchMsg(`${sh.title}: ${r.episodes} episode(s) reset, ${r.donors_deleted} download(s) `
+        + `deleted, ${r.merges_stopped} merge(s) stopped — re-reading the files…`);
+    } catch (e: any) {
+      setSearchMsg(e.message || "reset failed");
+    } finally { setBusy(false); refresh(); }
+  };
+  const resetBtn = (sh: typeof shows[number]) =>
+    <button className="btn sec small danger" disabled={busy}
+      title="Start this show over: stop merges, delete its downloads, clear all pipeline state, re-read the files"
+      onClick={e => { e.stopPropagation(); resetShow(sh); }}>↺ Start over</button>;
 
   const renderShow = (sh: typeof shows[number]) => {
     const isOpen = open.has(sh.title);
@@ -1520,7 +1558,7 @@ function Series({ anime }: { anime: boolean }) {
           <span className="caret">{isOpen ? "▾" : "▸"}</span>
           <Poster src={sh.poster} alt={sh.title} />
           <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
-          {rescanBtn(sh)}{completeBtn(sh)}
+          {rescanBtn(sh)}{completeBtn(sh)}{resetBtn(sh)}
           <div className="spacer" />
           <span className="chips">{statusPills(sh)}</span>
         </div>
@@ -1538,7 +1576,7 @@ function Series({ anime }: { anime: boolean }) {
           <Poster src={sh.poster} alt={sh.title} />
           <div className="showcard-meta">
             <div className="showcard-title">{sh.title}</div>
-            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}{completeBtn(sh)}</div>
+            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}{completeBtn(sh)}{resetBtn(sh)}</div>
             <div className="chips">{statusPills(sh)}</div>
           </div>
         </div>

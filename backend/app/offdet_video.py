@@ -8,6 +8,7 @@ the music/effects beds differ. Returns (offset_ms, confidence); offset_ms > 0 me
 file_b is shifted later than file_a.
 """
 import re, subprocess
+from . import core
 import numpy as np
 
 TIMEOUT_RC = -9        # our own marker for "killed on timeout" (see _run)
@@ -29,7 +30,8 @@ def _run(path, start, dur, thresh, scale, threads, hwaccel, device, timeout=None
     cmd = pre + ["-ss", str(start), "-t", str(dur), "-i", path,
                  "-vf", vf, "-an", "-sn", "-f", "null", "-"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # core.run_proc: same contract, but killable by an operator abort
+        r = core.run_proc(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         # A hung decode (the iGPU driver wedging is the known one) used to block the merge worker
         # forever. TIMEOUT is reported as its own return code so scene_cuts does NOT then retry in

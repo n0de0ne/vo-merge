@@ -156,7 +156,8 @@ def test_run_mux_kills_and_cleans_up_on_timeout(app_env, tmp_path, monkeypatch):
 
     def fake_run(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    # the mux runs through core.run_proc now (subprocess.run, but killable by an operator abort)
+    monkeypatch.setattr(pipeline.core, "run_proc", fake_run)
     ok, err = pipeline.run_mux(["mkvmerge"], out, {"mux_timeout_min": 240})
     assert ok is False and "exceeded 240min" in err
     assert not os.path.exists(out)
@@ -172,9 +173,15 @@ def test_every_subprocess_call_has_a_timeout():
         for node in ast.walk(ast.parse(f.read_text())):
             if isinstance(node, ast.Call) and \
                ast.unparse(node.func) in ("subprocess.run", "subprocess.check_output",
-                                          "subprocess.call"):
+                                          "subprocess.call", "core.run_proc"):
                 if not any(k.arg == "timeout" for k in node.keywords):
                     missing.append(f"{f.name}:{node.lineno}")
+            # Popen has no timeout of its own — the wait does — so raw Popen anywhere but inside
+            # core.run_proc (which registers it, waits with a timeout, and kills it on an abort)
+            # would be both unbounded and unkillable.
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.Popen" \
+               and f.name != "core.py":
+                missing.append(f"{f.name}:{node.lineno} (raw Popen — use core.run_proc)")
     assert not missing, f"subprocess calls with no timeout: {missing}"
 
 
@@ -1627,3 +1634,101 @@ def test_series_candidates_prefers_complete_and_drops_single_episodes(app_env, m
     assert titles[0] == JUDAS, "the complete batch ranks first even on far fewer seeders"
     assert out[0]["complete"] is True
     assert all("S01E05" not in t for t in titles), "single episodes are not whole-show answers"
+
+
+# ------------------------------------------------------------------ abort & start-over
+def test_a_running_merge_can_actually_be_killed(app_env):
+    """A merge is a sync detect plus a multi-GB remux. Once it started, NOTHING could stop it:
+    the operator watching it go wrong could only wait out mux_timeout_min (4h) or restart the
+    container, losing every other in-flight download. The abort has to kill the process that is
+    running right now, not politely ask the next stage."""
+    import threading
+    import time as _t
+    from app import core
+    started, out = threading.Event(), {}
+
+    def worker():
+        with core.job("m42"):
+            started.set()
+            try:
+                core.run_proc(["sleep", "30"], timeout=60)
+                out["r"] = "completed"
+            except core.Aborted:
+                out["r"] = "aborted"
+
+    t = threading.Thread(target=worker, daemon=True)
+    t0 = _t.time()
+    t.start()
+    assert started.wait(5)
+    _t.sleep(0.3)                                  # let Popen actually spawn
+    assert core.cancel_job("m42") is True
+    t.join(10)
+    assert out["r"] == "aborted"
+    assert _t.time() - t0 < 10, "the kill is immediate, not a wait for the timeout"
+    assert core.cancel_job("m42") is False, "a finished job is no longer cancellable"
+
+
+def test_a_cancellation_is_not_swallowed_as_an_ordinary_failure(app_env):
+    """The merge path is full of `except Exception` handlers that turn a failed decode into
+    'try the next window'. That is right for a failure and exactly wrong for a cancellation —
+    which is why Aborted inherits BaseException."""
+    from app import core
+    assert issubclass(core.Aborted, BaseException) and not issubclass(core.Aborted, Exception)
+    with core.job("m7"):
+        core.cancel_job("m7")
+        try:
+            core.run_proc(["true"], timeout=5)
+        except core.Aborted:
+            pass
+        except Exception:                          # pragma: no cover — the bug this pins
+            raise AssertionError("a cancellation must not be catchable as a plain failure")
+
+
+def test_aborting_a_queued_merge_takes_it_off_the_queue(app_env):
+    """'It hasn't started yet' is a race, not a state: the worker polls every ten seconds. So an
+    abort on a queued record has to be a real transition, or it silently merges anyway."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "ready")
+    assert pipeline.abort_merge("movie", 1) == "dequeued"
+    assert app_env.get_movie(1)["status"] == "review"
+    assert app_env.get_movie(1)["ai_status"] == "needs_human", \
+        "an operator decision must not page the AI"
+    assert pipeline.abort_merge("movie", 1) == "not running"
+
+
+def test_reset_clears_the_pipeline_but_never_the_library_file(app_env, monkeypatch, tmp_path):
+    """'Delete everything and start over' means the DOWNLOADS and the records — never the
+    operator's media. The one endpoint allowed to delete media is the audio-less repair."""
+    from app import pipeline
+    lib = tmp_path / "ep.mkv"
+    lib.write_text("the operator's media")
+    app_env.upsert_episode({"id": "9:1:1", "series_id": 9, "series_title": "Hunter x Hunter",
+                            "tvdb_id": 9, "season": 1, "episode": 1,
+                            "french_path": str(lib), "quality": "1080p"})
+    app_env.set_ep_status("9:1:1", "merged", tried=json.dumps([["burned", 1.0]]), attempts=4,
+                          dl_hash="HASH1", dl_id="rid1", en_file="/downloads/x.mkv",
+                          sync_offset_ms=38000, sync_manual=1, search_rounds=3,
+                          candidate_title="some release", merge_kind="grafted",
+                          added_langs="eng", error="boom", ai_status="needs_human",
+                          ai_verdict="gave up")
+    killed = []
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def delete(self, hashes, delete_files=False): killed.append((sorted(hashes), delete_files))
+    monkeypatch.setattr(pipeline, "QBittorrent", FakeQB)
+
+    out = pipeline.reset_records(episodes=[app_env.get_episode("9:1:1")],
+                                 cfg=dict(app_env.DEFAULTS))
+    assert out["episodes"] == 1 and out["donors_deleted"] == 1
+    assert killed == [(["hash1"], True)], "the DONOR is deleted with its files"
+    assert lib.exists() and lib.read_text() == "the operator's media", "media is never touched"
+    e = app_env.get_episode("9:1:1")
+    assert e["status"] == "pending" and e["french_path"] == str(lib)
+    for col in ("dl_hash", "dl_id", "en_file", "error", "ai_status", "ai_verdict",
+                "merge_kind", "candidate_title", "merged_file"):
+        assert not e[col], f"{col} survived the reset"
+    assert e["tried"] == "[]" and e["attempts"] == 0 and e["search_rounds"] == 0
+    assert e["sync_offset_ms"] == 0 and not e["sync_manual"]

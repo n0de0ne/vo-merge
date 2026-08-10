@@ -311,6 +311,21 @@ export const api = {
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+  // Stop a merge that is going wrong: kills the decode/mux running right now, or takes the
+  // record off the queue if it has not started.
+  abortMovie: (tmdbId: number) =>
+    j<{ ok: boolean; result: string }>(`/api/movie/${tmdbId}/abort`, { method: "POST" }),
+  abortEpisode: (epId: string) =>
+    j<{ ok: boolean; result: string }>(`/api/episode/${encodeURIComponent(epId)}/abort`,
+      { method: "POST" }),
+  // Start a title over: stops merges, deletes the DOWNLOADS (never the library files) and
+  // clears every trace the pipeline left on the records, then re-reads what is on disk now.
+  resetSeries: (seriesId: number, rescan = true) =>
+    j<{ ok: boolean; episodes: number; donors_deleted: number; merges_stopped: number }>(
+      `/api/tv/${seriesId}/reset?rescan=${rescan}`, { method: "POST" }),
+  resetMovie: (tmdbId: number, rescan = true) =>
+    j<{ ok: boolean; movies: number; donors_deleted: number; merges_stopped: number }>(
+      `/api/movie/${tmdbId}/reset?rescan=${rescan}`, { method: "POST" }),
   // whole-show releases: complete-series batches and multi-season packs. A per-season query can
   // never surface these — an indexer asked for "Title S01" doesn't return "(Complete Series)".
   seriesCandidates: (seriesId: number) =>

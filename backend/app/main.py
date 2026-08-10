@@ -748,6 +748,63 @@ def library_repair_state():
     return pipeline.REPAIR_STATE
 
 
+@api.post("/movie/{tmdb_id}/abort")
+def movie_abort(tmdb_id: int):
+    """Stop this film's merge — kill the decode or mux running right now, or take it off the
+    queue if it hasn't started. Until this existed the only ways to stop a merge that was going
+    wrong were to wait out `mux_timeout_min` (4 hours) or restart the container, which drops
+    every other in-flight download with it."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    return {"ok": True, "result": pipeline.abort_merge("movie", tmdb_id)}
+
+
+@api.post("/episode/{ep_id}/abort")
+def episode_abort(ep_id: str):
+    """Episode mirror of movie_abort."""
+    if not core.get_episode(ep_id):
+        raise HTTPException(404, "unknown episode")
+    return {"ok": True, "result": pipeline.abort_merge("episode", ep_id)}
+
+
+@api.post("/tv/{series_id}/reset")
+def tv_series_reset(series_id: int, rescan: bool = True):
+    """Start a whole show over. Stops any merge of its episodes, deletes their DOWNLOADS, and
+    clears every trace the pipeline left on the records — blocklist, attempts, candidates, sync
+    measurements, AI verdicts, merge outcomes.
+
+    **The library files are never touched** — this deletes donors, not media. A graft that
+    already happened cannot be undone (those tracks are part of the file now), which is exactly
+    why `rescan=true` re-reads every file afterwards: whatever each episode contains TODAY
+    becomes the starting point, instead of a stale record claiming a merge that has been
+    thrown away."""
+    from . import tv
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id]
+    if not eps:
+        raise HTTPException(404, "no records for this series")
+    out = pipeline.reset_records(episodes=eps)
+    if rescan:
+        r = tv_series_rescan(series_id, search=False)   # re-read first; searching is a decision
+        out["rescan"] = r.get("started", False)
+        out["note"] = r.get("note", "")
+    return {"ok": True, **out}
+
+
+@api.post("/movie/{tmdb_id}/reset")
+def movie_reset(tmdb_id: int, rescan: bool = True):
+    """Film mirror of tv_series_reset — see it for what is and is not touched."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    out = pipeline.reset_records(movies=[mv])
+    if rescan:
+        try:
+            out["rescan"] = movie_rescan(tmdb_id, search=False).get("outcome")
+        except HTTPException as e:
+            out["note"] = f"reset done, re-read skipped: {e.detail}"
+    return {"ok": True, **out}
+
+
 @api.post("/tv/{series_id}/rescan")
 def tv_series_rescan(series_id: int, search: bool = True):
     """Re-read every file of ONE show, then search for whatever it still lacks.

@@ -1776,6 +1776,81 @@ def start_repair(paths, cfg):
     return True
 
 
+def abort_merge(kind, ident):
+    """Stop a merge. Returns what actually happened: "killed" (it was running — its decode or
+    mux was killed and the worker parks it as `review`), "dequeued" (it was only waiting, so it
+    is taken off the queue before the worker can claim it), or "not running".
+
+    Aborting a QUEUED item has to be a real transition, not a no-op: the worker polls every ten
+    seconds, so "it isn't running yet" is a race, not a state."""
+    key = f"{'m' if kind == 'movie' else 'e'}{ident}"
+    if core.cancel_job(key):
+        return "killed"
+    claim = core.claim_movie if kind == "movie" else core.claim_episode
+    if claim(ident, "ready", "review", progress="",
+             error="taken off the merge queue by the operator",
+             ai_status="needs_human", ai_verdict="merge cancelled by the operator"):
+        core.log(f"abort: {key} taken off the merge queue")
+        return "dequeued"
+    return "not running"
+
+
+# Everything a record accumulates while the pipeline works on it. Reset puts a title back to the
+# state it had before vo-merge ever saw it — EXCEPT that it never touches the library file
+# itself (see reset_records) or `priority`, which is a standing instruction from the operator,
+# not pipeline residue.
+RESET_FIELDS = dict(DONOR_RESET, **AI_RESET, tried="[]", attempts=0, search_rounds=0,
+                    error=None, progress="", candidate_title=None, candidate_score=None,
+                    candidate_seeders=None, merge_kind=None, added_langs="", added_subs="",
+                    merged_file=None, sync_delta=None)
+
+
+def reset_records(movies=(), episodes=(), cfg=None, drop_downloads=True):
+    """Start a title over: stop what is running, throw away the DOWNLOADS, and clear every trace
+    the pipeline left on the records — blocklist, attempt counters, candidates, sync
+    measurements, AI verdicts, merge outcomes — so the next scan+search runs as if the title had
+    just been discovered.
+
+    **The library files are never touched.** Those are the operator's media, and the only
+    endpoint in this app that may delete media is the audio-less repair, which has its own
+    guards. What a reset CANNOT undo is a graft that already happened: tracks muxed into a
+    library file are part of that file now. That is not a gap in the reset — it is why the reset
+    is followed by a re-read, which records what each file ACTUALLY contains today and makes
+    that the honest starting point.
+
+    Donors are deleted with their files (they are throwaway downloads by construction), unless
+    `drop_downloads=False`."""
+    cfg = cfg or core.load_config()
+    movies, episodes = list(movies), list(episodes)
+    hashes, aborted = set(), 0
+    for m in movies:
+        if abort_merge("movie", m["tmdb_id"]) != "not running":
+            aborted += 1
+        if m.get("dl_hash"):
+            hashes.add(str(m["dl_hash"]).lower())
+    for e in episodes:
+        if abort_merge("episode", e["id"]) != "not running":
+            aborted += 1
+        if e.get("dl_hash"):
+            hashes.add(str(e["dl_hash"]).lower())
+    dropped = 0
+    if drop_downloads and hashes:
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            qb.delete(sorted(hashes), delete_files=True)
+            dropped = len(hashes)
+        except Exception as e:
+            core.log(f"reset: qB delete failed ({e}) — records still reset")
+    for m in movies:
+        core.set_status(m["tmdb_id"], "pending", **RESET_FIELDS)
+    for e in episodes:
+        core.set_ep_status(e["id"], "pending", **RESET_FIELDS)
+    core.log(f"reset: {len(movies)} movie(s) / {len(episodes)} episode(s) back to pending, "
+             f"{dropped} donor torrent(s) deleted, {aborted} in-flight merge(s) stopped")
+    return {"movies": len(movies), "episodes": len(episodes), "donors_deleted": dropped,
+            "merges_stopped": aborted}
+
+
 def prune_library(cfg=None):
     """Drop probes and records whose file has VANISHED — the delete half of keeping the
     inventory honest. A scan only ever adds and updates, so a title removed from the library
@@ -1888,10 +1963,16 @@ def run_mux(cmd, out, cfg=None):
     cfg = cfg or core.load_config()
     timeout = max(60, int(cfg.get("mux_timeout_min", 240)) * 60)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = core.run_proc(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         _unlink(out)
         return False, f"mkvmerge exceeded {timeout // 60}min and was killed"
+    except core.Aborted:
+        # An abort must not leave a half-written file in the library folder any more than a
+        # failure does — and Aborted is a BaseException precisely so the handler below can't
+        # quietly turn a cancellation into "mkvmerge failed to start".
+        _unlink(out)
+        raise
     except Exception as e:
         _unlink(out)
         return False, f"mkvmerge failed to start: {e}"
@@ -2733,20 +2814,33 @@ def merge_next(cfg=None):
     for kind, rid, _ts in merge_queue(cfg):
         key = f"{'m' if kind == 'movie' else 'e'}{rid}"
         claim = core.claim_movie if kind == "movie" else core.claim_episode
+        setter = core.set_status if kind == "movie" else core.set_ep_status
         # atomic ready -> merging: if we lose the race, another claimer has it
         if not claim(rid, "ready", "merging", progress="starting…"):
             continue
         with _MERGING_NOW_LOCK:
             _MERGING_NOW.add(key)
         try:
-            if kind == "movie":
-                merge_movie(rid, cfg)
-            else:
-                _tv.merge_ready_episode(rid, cfg)
+            # core.job: registers this thread's subprocesses under `key`, so an operator abort
+            # can kill the decode or the mux that is running RIGHT NOW rather than waiting out
+            # mux_timeout_min (4h) or restarting the container.
+            with core.job(key):
+                if kind == "movie":
+                    merge_movie(rid, cfg)
+                else:
+                    _tv.merge_ready_episode(rid, cfg)
+        except core.Aborted as a:
+            # Someone chose this, so it is not a failure to diagnose: park it as `review` (a
+            # human decision by definition), stamp needs_human so the AI is not paged about it,
+            # and leave the donor alone — an abort is usually the first half of "let me fix
+            # something and try again", not "this release is bad".
+            setter(rid, "review", progress="", error=f"merge aborted by the operator ({a})",
+                   ai_status="needs_human", ai_verdict="merge aborted by the operator",
+                   ai_at=time.time())
+            core.log(f"merge {key}: ABORTED by the operator")
         except Exception as e:
             # never let one bad item kill the worker (the old inline merge aborted the
             # whole finish cycle, stranding every record behind it)
-            setter = core.set_status if kind == "movie" else core.set_ep_status
             setter(rid, "error", error=f"merge: {e}", progress="")
             core.log(f"merge {key} FAILED: {e}")
         finally:

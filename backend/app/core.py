@@ -1,5 +1,5 @@
 """Config persistence + SQLite state + the per-movie pipeline state machine."""
-import json, os, re, shutil, sqlite3, threading, time
+import json, os, re, shutil, sqlite3, subprocess, threading, time
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get("VO_CONFIG", "/config")
@@ -537,6 +537,103 @@ def tail_log(n=300):
     except OSError:
         return []
     return [ln + "\n" for ln in text.splitlines()[-want:]]
+
+
+# ---------------------------------------------------------------- killable work
+# A merge is a sync detect (several minute-long ffmpeg decodes) plus a remux of a multi-GB file,
+# and once it started NOTHING could stop it: the operator watching it go wrong could only wait
+# out `mux_timeout_min` (4 hours by default) or restart the container, which loses every other
+# in-flight download too. These few functions make a merge interruptible.
+#
+# `Aborted` deliberately inherits BaseException, not Exception. The merge path is full of
+# `except Exception` handlers that turn a failed decode into "this window didn't resolve, try the
+# next one" — correct for a failure, exactly wrong for a cancellation, which would be swallowed
+# and the merge would grind on through the remaining windows. Only code that explicitly wants to
+# know about a cancellation sees one; the same reason KeyboardInterrupt sits where it does.
+class Aborted(BaseException):
+    """The operator aborted the job running on this thread."""
+
+
+_JOBS = {}                        # job key -> {"procs": set(Popen), "cancel": bool}
+_JOBS_LOCK = threading.Lock()
+_CUR = threading.local()          # the job key owned by THIS thread
+
+
+@contextmanager
+def job(key):
+    """Mark the calling thread as running job `key`, so its subprocesses can be killed by name.
+    The merge worker wraps each claimed record in this."""
+    with _JOBS_LOCK:
+        _JOBS[key] = {"procs": set(), "cancel": False}
+    prev = getattr(_CUR, "key", None)
+    _CUR.key = key
+    try:
+        yield
+    finally:
+        _CUR.key = prev
+        with _JOBS_LOCK:
+            _JOBS.pop(key, None)
+
+
+def _here():
+    with _JOBS_LOCK:
+        return _JOBS.get(getattr(_CUR, "key", None))
+
+
+def cancel_job(key):
+    """Signal a running job to stop and kill whatever it is currently executing. Returns False
+    when no such job is running — the caller then knows the record was not mid-flight."""
+    with _JOBS_LOCK:
+        j = _JOBS.get(key)
+        procs = list(j["procs"]) if j else []
+        if j:
+            j["cancel"] = True
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    if j:
+        log(f"abort: {key} signalled, killed {len(procs)} running process(es)")
+    return bool(j)
+
+
+def cancelled():
+    j = _here()
+    return bool(j and j["cancel"])
+
+
+def run_proc(cmd, timeout=None, capture_output=False, text=False, **kw):
+    """`subprocess.run`, but killable and cancellation-aware.
+
+    Identical contract (a CompletedProcess, TimeoutExpired on timeout, the timeout still enforced
+    — see the AST test that requires one on every call), with two additions: the process is
+    registered against this thread's job so an abort can kill it, and an abort raises `Aborted`
+    rather than returning a mysterious rc=-9 that the caller would read as a corrupt file and
+    blocklist a perfectly good release for."""
+    if cancelled():
+        raise Aborted(f"aborted before starting {cmd[0] if cmd else '?'}")
+    if capture_output:
+        kw.setdefault("stdout", subprocess.PIPE)
+        kw.setdefault("stderr", subprocess.PIPE)
+    p = subprocess.Popen(cmd, text=text, **kw)
+    j = _here()
+    if j is not None:
+        with _JOBS_LOCK:
+            j["procs"].add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise
+    finally:
+        if j is not None:
+            with _JOBS_LOCK:
+                j["procs"].discard(p)
+    if cancelled():
+        raise Aborted(f"{cmd[0] if cmd else 'process'} killed by an operator abort")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 @contextmanager
