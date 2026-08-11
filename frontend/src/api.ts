@@ -132,6 +132,17 @@ export interface DashAttention {
   ai_status?: string | null; ai_verdict?: string | null;
   count?: number;            // episodes sharing this status+error (a failed pack groups into one)
 }
+export interface QueueItem {
+  pos: number; kind: string; key: string; title: string; sub?: string | null;
+  poster?: string | null; priority: number; waiting_s: number; merging: boolean;
+}
+// The merge queue in drain order, plus WHY it is or is not draining — a deliberate hold
+// (paused, low disk) and a dead worker used to look identical from the dashboard.
+export interface QueueView {
+  items: QueueItem[]; total: number; merging_now: number; workers: number;
+  hold: string | null; disk: { low: boolean; free_gb: number | null; paths?: Record<string, number | null> };
+  now: number;
+}
 export interface DashRecent {
   kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
   subs?: string | null;    // subtitle languages grafted in
@@ -167,6 +178,8 @@ export interface Dash {
   // was correct on its own and the scan simply closed the record out
   merged_kinds?: { grafted: number; replaced: number; already: number };
   inflight: number | null; inflight_cap: number; merge_cap: number;
+  merge_hold?: string | null;   // why the merger is idle, in words (null = queue empty)
+  merge_workers?: number;
   disk: { path: string; total: number; free: number } | null;
   next_runs: Record<string, number>; now: number;
 }
@@ -311,6 +324,10 @@ export const api = {
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+  queue: (limit = 100) => j<QueueView>(`/api/queue?limit=${limit}`),
+  queueTop: (kind: string, key: string) =>
+    j<{ ok: boolean; priority: number }>("/api/queue/top",
+      { method: "POST", body: JSON.stringify({ kind, key }) }),
   // Stop a merge that is going wrong: kills the decode/mux running right now, or takes the
   // record off the queue if it has not started.
   abortMovie: (tmdbId: number) =>

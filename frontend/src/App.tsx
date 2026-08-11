@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
   CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState,
-  Forecast, DashRecent } from "./api";
+  Forecast, DashRecent, QueueView } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -1035,6 +1035,64 @@ function AllMergedModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+/* The merge queue, in the order it will actually be drained — and the controls the operator
+   was missing: move an item to the front, or stop it. Until this existed the queue was a number
+   on a tile, so "why is that episode still waiting behind 300 others" had no answer and no
+   remedy. */
+function QueueModal({ onClose }: { onClose: () => void }) {
+  const [q, setQ] = useState<QueueView | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => api.queue(200).then(setQ).catch(() => {});
+  usePoll(load, 4000);
+  const act = (fn: () => Promise<any>) => {
+    setBusy(true);
+    fn().catch(() => {}).finally(() => { setBusy(false); load(); });
+  };
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="row panel-head">
+          <b>Merge queue</b>
+          {q && <span className="muted">{q.total} waiting · {q.merging_now} merging ·
+            {" "}{q.workers} worker{q.workers === 1 ? "" : "s"}</span>}
+          <div className="spacer" />
+          <button className="btn sec" onClick={onClose}>✕</button>
+        </div>
+        {/* the whole point of the panel: a held queue says so, in words */}
+        {q?.hold && <div className="panel warnbar" style={{ marginBottom: 10 }}>
+          ⏸ Nothing is merging — {q.hold}.
+          {q.disk?.paths && <span className="muted"> (library {q.disk.paths.media?.toFixed(0) ?? "?"} GB
+            free, /config {q.disk.paths.config?.toFixed(0) ?? "?"} GB)</span>}
+        </div>}
+        <div className="scroll-y tall">
+          {q && q.items.length === 0 && <div className="muted">Nothing is queued to merge.</div>}
+          {q?.items.map(it => (
+            <div className="dashrow" key={`${it.kind}${it.key}`}>
+              <span className="muted" style={{ width: 30, textAlign: "right" }}>{it.pos}</span>
+              <Poster src={it.poster} alt={it.title} />
+              <div className="dashrow-main">
+                <div className="dashrow-title">
+                  {it.priority > 0 && <span className="prio" title="prioritised">★</span>}
+                  {it.title}
+                </div>
+                <div className="sub">{it.merging ? "merging now"
+                  : `waiting ${fmtAgo(q.now - it.waiting_s, q.now)}`}{it.sub ? ` · ${it.sub}` : ""}</div>
+              </div>
+              {!it.merging &&
+                <button className="btn sec small" disabled={busy} title="Move to the front of the queue"
+                  onClick={() => act(() => api.queueTop(it.kind, it.key))}>⤒ Top</button>}
+              <button className="btn sec small" disabled={busy}
+                title={it.merging ? "Kill the decode/mux running now" : "Take it off the queue"}
+                onClick={() => act(() => it.kind === "movie"
+                  ? api.abortMovie(Number(it.key)) : api.abortEpisode(it.key))}>⛔</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
   if (!ai || !ai.enabled) return null;
   const seen = ai.pending + ai.resolved + ai.failed + ai.needs_human;
@@ -1093,6 +1151,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const [logLines, setLogLines] = useState<string[]>([]);
   const [err, setErr] = useState("");
   const [allMerged, setAllMerged] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
 
   usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
     .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
@@ -1127,9 +1186,15 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
         <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
           sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
           tone={d.inflight == null ? "warn" : undefined} />
+        {/* "0/2 · idle" beside five finished downloads is indistinguishable from a broken app,
+            so the tile carries the REASON the worker isn't running (merge_hold) and opens the
+            queue itself. */}
         <Tile label="Merging" value={<>{merging.length}<span className="t-cap"> / {d.merge_cap}</span></>}
-          sub={merging.length ? merging[0].title
-            : queued.length ? `${queued.length} queued` : "idle"} />
+          tone={d.merge_hold ? "warn" : undefined}
+          onClick={() => setQueueOpen(true)}
+          sub={d.merge_hold ? `held · ${d.merge_hold}`
+            : merging.length ? merging[0].title
+            : queued.length ? `${queued.length} queued — open` : "idle"} />
         <Tile label="Attention" value={attention} tone={attention ? "bad" : undefined}
           onClick={() => goto("review")}
           sub={<>{both("review")} review · {both("sync_fail")} sync · {both("error")} error</>} />
@@ -1247,6 +1312,7 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       </div>
 
       {allMerged && <AllMergedModal onClose={() => setAllMerged(false)} />}
+      {queueOpen && <QueueModal onClose={() => setQueueOpen(false)} />}
     </>
   );
 }

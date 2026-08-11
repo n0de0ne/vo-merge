@@ -748,6 +748,64 @@ def library_repair_state():
     return pipeline.REPAIR_STATE
 
 
+@api.get("/queue")
+def queue(limit: int = 100):
+    """The merge queue, in the order it will actually be drained, plus WHY it is or isn't
+    draining. The dashboard could show that five downloads had finished and that the merger was
+    idle, but never the connection between them — a deliberate hold (paused, low disk) and a
+    dead worker looked identical."""
+    cfg = core.load_config()
+    lim = max(1, min(limit, 500))
+    items, now = [], time.time()
+    live = pipeline._merging_now()
+    for pos, (kind, rid, ts) in enumerate(pipeline.merge_queue(cfg), start=1):
+        rec = (core.get_movie(rid) if kind == "movie" else core.get_episode(rid)) or {}
+        items.append({
+            "pos": pos, "kind": kind, "key": str(rid),
+            "title": (rec.get("title") if kind == "movie" else
+                      f"{rec.get('series_title', '')} "
+                      f"S{(rec.get('season') or 0):02d}E{(rec.get('episode') or 0):02d}"),
+            "sub": rec.get("candidate_title"), "poster": rec.get("poster"),
+            "priority": rec.get("priority") or 0, "waiting_s": now - (rec.get("updated") or now),
+            "merging": f"{'m' if kind == 'movie' else 'e'}{rid}" in live,
+        })
+        if len(items) >= lim:
+            break
+    return {"items": items, "total": len(pipeline.merge_queue(cfg)),
+            "merging_now": len(live), "workers": scheduler.merge_workers_alive(),
+            "hold": pipeline.merge_hold_reason(cfg), "disk": dict(pipeline.DISK_STATE),
+            "now": now}
+
+
+class QueueTopIn(BaseModel):
+    kind: str                    # "movie" | "episode"
+    key: str
+
+
+@api.post("/queue/top")
+def queue_top(body: QueueTopIn):
+    """Move one item to the front of the merge queue.
+
+    Priority is what both queues already order on, so "jump the queue" is one number rather than
+    a second ordering mechanism to keep in sync: this sets it above every other waiting item.
+    It is not cleared when the item finishes — see core.set_priority."""
+    if body.kind not in ("movie", "episode"):
+        raise HTTPException(422, "kind must be movie or episode")
+    ident = int(body.key) if body.kind == "movie" else body.key
+    rec = core.get_movie(ident) if body.kind == "movie" else core.get_episode(ident)
+    if not rec:
+        raise HTTPException(404, "unknown record")
+    top = 0
+    with core.db() as c:
+        for t in ("movies", "episodes"):
+            r = c.execute(f"SELECT MAX(COALESCE(priority,0)) p FROM {t} "
+                          "WHERE status IN ('ready','pending')").fetchone()
+            top = max(top, r["p"] or 0)
+    core.set_priority(body.kind, ident, top + 1)
+    core.log(f"queue: {body.kind} {ident} moved to the front (priority {top + 1})")
+    return {"ok": True, "priority": top + 1}
+
+
 @api.post("/movie/{tmdb_id}/abort")
 def movie_abort(tmdb_id: int):
     """Stop this film's merge — kill the decode or mux running right now, or take it off the
@@ -1998,6 +2056,11 @@ def dashboard():
             "merged_24h": merged_24h, "merged_7d": merged_7d, "merged_kinds": mk,
             "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
             "merge_cap": pipeline.MERGE_GATE.limit(cfg),
+            # WHY the merger is idle. "0/2 · idle" beside five finished downloads is
+            # indistinguishable from a broken app; every brake that can stop the worker
+            # answers here (see pipeline.merge_hold_reason).
+            "merge_hold": pipeline.merge_hold_reason(cfg),
+            "merge_workers": scheduler.merge_workers_alive(),
             "disk": disk, "next_runs": next_runs, "now": now}
 
 

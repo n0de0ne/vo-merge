@@ -7,6 +7,13 @@ _sched = BackgroundScheduler(daemon=True)
 _merge_threads = {}          # pool slot index -> worker thread
 
 
+def merge_workers_alive():
+    """How many merge worker threads are actually running. A thread that died hard (OOM, an
+    interpreter-level error) leaves the queue draining at zero with nothing else to show for it,
+    so the dashboard reports this rather than making the operator infer it."""
+    return sum(1 for t in _merge_threads.values() if t.is_alive())
+
+
 def ensure_merge_workers():
     """Size the merge worker pool to `max_parallel_merges`. Raising it spawns the missing
     workers immediately; lowering it lets the surplus workers retire themselves."""

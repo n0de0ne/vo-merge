@@ -1249,7 +1249,7 @@ def check_deps(cfg=None):
 # half-writes compound the very disk-full that causes them. `hold_until` exists because a
 # 60 GB pair can fail to fit while the GLOBAL floor is fine: without a cooldown the worker
 # would re-claim, re-probe and re-refuse the same pair every ten seconds.
-DISK_STATE = {"low": False, "free_gb": None, "hold_until": 0}
+DISK_STATE = {"low": False, "free_gb": None, "hold_until": 0, "paths": {}}
 
 
 def disk_headroom_ok(paths, outdir, cfg):
@@ -1282,35 +1282,83 @@ def hold_for_disk(kind, ident, free, need, cfg):
                 f"free some space to resume sooner.", cfg=cfg)
 
 
+def _free_gb(path):
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except OSError:
+        return None                       # an absent mount is the prune guard's problem, not ours
+
+
 def check_disk(cfg=None):
-    """Alarm when free space under the library mount or /config drops below `disk_floor_gb`,
-    and flip the flag the merge gate honours. Restores itself when space frees."""
+    """Hold merging when the LIBRARY mount runs out of room, and alarm on either filesystem.
+
+    Only the library mount gates merging, because that is where the output is written: a mux
+    builds the whole file in `<libdir>/_merged/` before swapping it in. `/config` holds the DB,
+    the logs and the tickets — megabytes — and taking the WORST of the two (which this did)
+    meant a tight appdata share silently held every merge in the app while the dashboard showed
+    terabytes free on the disk that actually mattered. That is a stop with no symptom, which is
+    the one thing this codebase keeps proving it cannot afford.
+
+    /config still gets a floor of its own, an order of magnitude smaller: a full appdata share
+    breaks SQLite, so it deserves an alarm — just not a merge freeze it cannot fix."""
     from . import notify
     cfg = cfg or core.load_config()
     floor = max(0.0, float(cfg.get("disk_floor_gb", 10)))
-    worst = None
-    for path in (cfg.get("media_mount", "/media"), core.CONFIG_DIR):
-        try:
-            free = shutil.disk_usage(path).free / 1e9
-        except OSError:
-            continue                      # an absent mount is the prune guard's problem, not ours
-        worst = free if worst is None else min(worst, free)
-    DISK_STATE["free_gb"] = worst
-    if worst is None:
+    media_path = cfg.get("media_mount", "/media")
+    media, conf = _free_gb(media_path), _free_gb(core.CONFIG_DIR)
+    DISK_STATE["paths"] = {"media": media, "config": conf}
+    DISK_STATE["free_gb"] = media
+    # /config: alarm only, on a floor sized for a database rather than for 60 GB remuxes
+    conf_floor = min(floor, 2.0)
+    if conf is not None and conf_floor and conf < conf_floor:
+        notify.send("disk-config", f"/config is nearly full ({conf:.1f} GB free)",
+                    f"{core.CONFIG_DIR} is below {conf_floor} GB. That is where the database, "
+                    f"the logs and the AI tickets live — SQLite fails when it fills. Merging is "
+                    f"NOT held for this (the output is written to the library, not here).",
+                    cfg=cfg)
+    elif conf is not None:
+        notify.clear("disk-config")
+    if media is None:
         return
-    if floor and worst < floor:
+    if floor and media < floor:
         if not DISK_STATE["low"]:
-            core.log(f"disk: {worst:.1f} GB free < floor {floor} GB -> holding new merges")
+            core.log(f"disk: {media:.1f} GB free on {media_path} < floor {floor} GB "
+                     f"-> holding new merges")
         DISK_STATE["low"] = True
-        notify.send("disk", f"low disk: {worst:.1f} GB free",
-                    f"Free space is below the {floor} GB floor. New merges are held (a mux "
+        notify.send("disk", f"low disk: {media:.1f} GB free",
+                    f"{media_path} is below the {floor} GB floor. New merges are held (a mux "
                     f"writes the whole output before the swap); downloads and scans continue. "
                     f"Merging resumes on its own once space frees.", cfg=cfg)
     elif DISK_STATE["low"]:
-        core.log(f"disk: {worst:.1f} GB free — merges resume")
+        core.log(f"disk: {media:.1f} GB free on {media_path} — merges resume")
         DISK_STATE["low"] = False
         notify.clear("disk")
         MERGE_WAKE.set()
+
+
+def merge_hold_reason(cfg=None):
+    """Why nothing is merging right now, in words, or None when the queue is simply empty.
+
+    "MERGING 0/2 · idle" next to five finished downloads is indistinguishable from a broken
+    app — the operator has no way to tell a deliberate hold from a dead worker. Every brake that
+    can stop the merge worker answers here, and the dashboard shows it."""
+    cfg = cfg or core.load_config()
+    if not cfg.get("enabled"):
+        return "the pipeline is disabled"
+    if cfg.get("paused"):
+        return "paused"
+    if DISK_STATE.get("low"):
+        free = DISK_STATE.get("free_gb")
+        return (f"low disk: {free:.0f} GB free on {cfg.get('media_mount', '/media')}, "
+                f"floor is {cfg.get('disk_floor_gb', 10)} GB"
+                if free is not None else "low disk")
+    left = DISK_STATE.get("hold_until", 0) - time.time()
+    if left > 0:
+        return f"waiting for disk space (retrying in {int(left / 60) + 1} min)"
+    from . import scheduler
+    if not scheduler.merge_workers_alive():
+        return "no merge worker is running"
+    return None
 
 
 def check_dispatcher(cfg=None):

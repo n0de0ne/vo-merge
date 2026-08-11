@@ -1732,3 +1732,48 @@ def test_reset_clears_the_pipeline_but_never_the_library_file(app_env, monkeypat
         assert not e[col], f"{col} survived the reset"
     assert e["tried"] == "[]" and e["attempts"] == 0 and e["search_rounds"] == 0
     assert e["sync_offset_ms"] == 0 and not e["sync_manual"]
+
+
+def test_only_the_library_mount_gates_merging(app_env, monkeypatch, tmp_path):
+    """The disk gate took the WORST of the library mount and /config, so a tight appdata share
+    silently held EVERY merge in the app while the dashboard showed terabytes free on the disk
+    that actually mattered. The mux writes its output next to the library file; /config holds a
+    database and some logs."""
+    from app import pipeline, notify
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda k, t, b, cfg=None, force=False: sent.append(k))
+    monkeypatch.setattr(notify, "clear", lambda k: None)
+    cfg = dict(app_env.DEFAULTS, media_mount="/media", disk_floor_gb=10)
+    free = {"/media": 8738.0, str(app_env.CONFIG_DIR): 0.4}     # the live shape: TBs vs a full cache
+    monkeypatch.setattr(pipeline, "_free_gb", lambda p: free.get(p, 100.0))
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+    pipeline.check_disk(cfg)
+    assert pipeline.DISK_STATE["low"] is False, "a full /config must not stop merging"
+    assert "disk-config" in sent, "...but it IS worth an alarm — SQLite fails when it fills"
+    assert pipeline.merge_hold_reason(dict(cfg, enabled=True)) != "low disk"
+    # the library mount running out is what genuinely holds a mux
+    free["/media"] = 3.0
+    pipeline.check_disk(cfg)
+    assert pipeline.DISK_STATE["low"] is True
+    hold = pipeline.merge_hold_reason(dict(cfg, enabled=True))
+    assert hold and "low disk" in hold and "3 GB" in hold, hold
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+
+
+def test_merge_hold_reason_names_every_brake(app_env, monkeypatch):
+    """'MERGING 0/2 · idle' beside five finished downloads is indistinguishable from a broken
+    app. Every brake that can stop the worker has to answer in words."""
+    import time as _t
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "_free_gb", lambda p: 500.0)
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=False)) \
+        == "the pipeline is disabled"
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True, paused=True)) == "paused"
+    pipeline.DISK_STATE["hold_until"] = _t.time() + 300
+    hold = pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True))
+    assert hold and "waiting for disk space" in hold
+    pipeline.DISK_STATE["hold_until"] = 0
+    # no workers running is the silent one: the queue drains at zero with nothing to show for it
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True)) \
+        == "no merge worker is running"
