@@ -778,32 +778,82 @@ def queue(limit: int = 100):
 
 
 class QueueTopIn(BaseModel):
-    kind: str                    # "movie" | "episode"
-    key: str
+    kind: str | None = None      # "movie" | "episode" — one record
+    key: str | None = None
+    hash: str | None = None      # ...or every record sharing this donor (a folded pack row)
 
 
-@api.post("/queue/top")
-def queue_top(body: QueueTopIn):
-    """Move one item to the front of the merge queue.
-
-    Priority is what both queues already order on, so "jump the queue" is one number rather than
-    a second ordering mechanism to keep in sync: this sets it above every other waiting item.
-    It is not cleared when the item finishes — see core.set_priority."""
-    if body.kind not in ("movie", "episode"):
-        raise HTTPException(422, "kind must be movie or episode")
-    ident = int(body.key) if body.kind == "movie" else body.key
-    rec = core.get_movie(ident) if body.kind == "movie" else core.get_episode(ident)
-    if not rec:
-        raise HTTPException(404, "unknown record")
+def _priority_ceiling():
+    """One above the highest priority anything unfinished currently carries, so "to the front"
+    really is the front. Read across both tables and every state the ordering touches."""
     top = 0
     with core.db() as c:
         for t in ("movies", "episodes"):
             r = c.execute(f"SELECT MAX(COALESCE(priority,0)) p FROM {t} "
-                          "WHERE status IN ('ready','pending')").fetchone()
+                          "WHERE status NOT IN ('merged','ignored')").fetchone()
             top = max(top, r["p"] or 0)
-    core.set_priority(body.kind, ident, top + 1)
-    core.log(f"queue: {body.kind} {ident} moved to the front (priority {top + 1})")
-    return {"ok": True, "priority": top + 1}
+    return top + 1
+
+
+@api.post("/queue/top")
+def queue_top(body: QueueTopIn):
+    """Move an item — or a whole season pack — to the front of the queue.
+
+    Priority is what BOTH queues already order on (`get_movies`/`get_episodes` for the search
+    sweep, `merge_queue` for merging), so "jump the queue" is one number rather than a second
+    ordering to keep in sync. It survives the item finishing, deliberately: see
+    core.set_priority.
+
+    `hash` exists because the dashboard folds a season pack into ONE row — 28 episodes behind a
+    single torrent. Bumping the row has to bump the pack, or the operator moves one episode to
+    the front and the other 27 stay where they were."""
+    top = _priority_ceiling()
+    if body.hash:
+        h = body.hash.lower()
+        n = 0
+        for m in core.get_movies():
+            if (m.get("dl_hash") or "").lower() == h and m["status"] not in ("merged", "ignored"):
+                core.set_priority("movie", m["tmdb_id"], top); n += 1
+        for e in core.get_episodes():
+            if (e.get("dl_hash") or "").lower() == h and e["status"] not in ("merged", "ignored"):
+                core.set_priority("episode", e["id"], top); n += 1
+        if not n:
+            raise HTTPException(404, "no unfinished records use that download")
+        core.log(f"queue: {n} record(s) on donor {h[:12]} moved to the front (priority {top})")
+        return {"ok": True, "priority": top, "records": n}
+    if body.kind not in ("movie", "episode") or not body.key:
+        raise HTTPException(422, "give kind+key, or hash")
+    ident = int(body.key) if body.kind == "movie" else body.key
+    if not (core.get_movie(ident) if body.kind == "movie" else core.get_episode(ident)):
+        raise HTTPException(404, "unknown record")
+    core.set_priority(body.kind, ident, top)
+    core.log(f"queue: {body.kind} {ident} moved to the front (priority {top})")
+    return {"ok": True, "priority": top, "records": 1}
+
+
+@api.post("/downloads/{dl_hash}/cancel")
+def download_cancel(dl_hash: str):
+    """Drop a download and send every record behind it back for a different release.
+
+    The counterpart of "move to the front" on the same row: a season pack that has finished but
+    can never be used (wrong numbering, no usable audio) otherwise sits in a grab slot with no
+    control over it but the qB UI, where deleting it just strands the records. This blocklists
+    the release, deletes the torrent with its files, and re-queues every record it owned —
+    which is exactly what the automatic stall handling does, on demand."""
+    from . import tv
+    h = dl_hash.lower()
+    movies = [m for m in core.get_movies() if (m.get("dl_hash") or "").lower() == h]
+    eps = [e for e in core.get_episodes() if (e.get("dl_hash") or "").lower() == h]
+    if not movies and not eps:
+        raise HTTPException(404, "no records use that download")
+    for m in movies:
+        pipeline.abort_merge("movie", m["tmdb_id"])
+        pipeline.retry_movie(m["tmdb_id"])
+    for e in eps:
+        pipeline.abort_merge("episode", e["id"])
+        tv.retry_episode(e["id"])
+    core.log(f"cancel {h[:12]}: dropped, {len(movies)} movie(s) / {len(eps)} episode(s) re-queued")
+    return {"ok": True, "movies": len(movies), "episodes": len(eps)}
 
 
 @api.post("/movie/{tmdb_id}/abort")

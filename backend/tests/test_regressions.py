@@ -1804,3 +1804,30 @@ def test_a_completed_download_that_cannot_move_says_why(app_env, monkeypatch):
     # `updated` means "when the pipeline state last changed"; explaining a stall is not a state
     # change, and bumping it would reshuffle Needs-attention every minute this sweep runs
     assert e["updated"] == before
+
+
+def test_bumping_a_folded_pack_row_bumps_the_whole_pack(app_env):
+    """The dashboard folds a season pack into ONE row — 28 episodes behind a single torrent. A
+    bump that moved only the row's representative episode would leave the other 27 exactly where
+    they were, which is indistinguishable from the button doing nothing."""
+    from app import main
+    for ep in range(1, 4):
+        eid = f"31:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 31, "series_title": "Pack Show",
+                                "tvdb_id": 31, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="PACKHASH")
+    # a finished episode on the same donor must NOT be dragged back into the ordering
+    app_env.upsert_episode({"id": "31:1:9", "series_id": 31, "series_title": "Pack Show",
+                            "tvdb_id": 31, "season": 1, "episode": 9,
+                            "french_path": "/done.mkv", "quality": "1080p"})
+    app_env.set_ep_status("31:1:9", "merged", dl_hash="PACKHASH")
+    _seed_error_movie(app_env, 77)
+    app_env.set_status(77, "pending", priority=5)          # something already prioritised
+
+    out = main.queue_top(main.QueueTopIn(hash="packhash"))  # case-insensitive, as qB reports it
+    assert out["records"] == 3 and out["priority"] == 6, "one above the current ceiling"
+    assert all(app_env.get_episode(f"31:1:{e}")["priority"] == 6 for e in (1, 2, 3))
+    assert app_env.get_episode("31:1:9")["priority"] in (0, None), "a finished episode is not queued"
+    # priority is orthogonal to state: bumping must not touch status or reshuffle `updated`
+    assert app_env.get_episode("31:1:1")["status"] == "downloading"

@@ -1080,7 +1080,7 @@ function QueueModal({ onClose }: { onClose: () => void }) {
               </div>
               {!it.merging &&
                 <button className="btn sec small" disabled={busy} title="Move to the front of the queue"
-                  onClick={() => act(() => api.queueTop(it.kind, it.key))}>⤒ Top</button>}
+                  onClick={() => act(() => api.queueTop({ kind: it.kind, key: it.key }))}>⤒ Top</button>}
               <button className="btn sec small" disabled={busy}
                 title={it.merging ? "Kill the decode/mux running now" : "Take it off the queue"}
                 onClick={() => act(() => it.kind === "movie"
@@ -1152,6 +1152,13 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const [err, setErr] = useState("");
   const [allMerged, setAllMerged] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
+  const [actBusy, setActBusy] = useState(false);
+  // one place for the Active-now row actions: run, then refresh the dashboard
+  const actA = (fn: () => Promise<any>) => {
+    setActBusy(true);
+    fn().catch(e => setErr(e.message || "action failed"))
+      .finally(() => { setActBusy(false); api.dashboard().then(setD).catch(() => {}); });
+  };
 
   usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
     .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
@@ -1227,7 +1234,36 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                   {a.status === "merging" && a.progress &&
                     <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
                 </div>
-                <Pill s={a.status} />
+                <div className="col-end">
+                  <Pill s={a.status} />
+                  {/* This is the list the operator actually watches, so the controls belong
+                      here. Both act on the whole row: a folded pack is one torrent behind 28
+                      episodes, and bumping one of them would leave the other 27 behind. */}
+                  <div className="row" style={{ gap: 4 }}>
+                    {a.status !== "merging" &&
+                      <button className="btn sec small" disabled={actBusy}
+                        title="Move to the front of the queue (the whole pack, if this row is one)"
+                        onClick={() => actA(() => api.queueTop(a.dl_hash
+                          ? { hash: a.dl_hash }
+                          : { kind: a.kind, key: a.key.slice(1) }))}>⤒</button>}
+                    <button className="btn sec small" disabled={actBusy}
+                      title={a.status === "merging"
+                        ? "Kill the decode/mux running now"
+                        : "Drop this download, blocklist the release and search for another"}
+                      onClick={() => {
+                        if (a.status === "merging") {
+                          actA(() => a.kind === "movie"
+                            ? api.abortMovie(Number(a.key.slice(1))) : api.abortEpisode(a.key.slice(1)));
+                        } else if (a.dl_hash && confirm(
+                          `Drop this download and look for a different release?\n\n${a.title}`
+                          + `${a.count > 1 ? ` (${a.count} episodes)` : ""}\n\n`
+                          + `The torrent and its files are deleted, the release is blocklisted, `
+                          + `and the records go back to searching. Your library files are untouched.`)) {
+                          actA(() => api.cancelDownload(a.dl_hash!));
+                        }
+                      }}>⛔</button>
+                  </div>
+                </div>
               </div>
             ))}
           </div>

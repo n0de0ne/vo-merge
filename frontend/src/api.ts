@@ -325,9 +325,13 @@ export const api = {
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
   queue: (limit = 100) => j<QueueView>(`/api/queue?limit=${limit}`),
-  queueTop: (kind: string, key: string) =>
-    j<{ ok: boolean; priority: number }>("/api/queue/top",
-      { method: "POST", body: JSON.stringify({ kind, key }) }),
+  // one record, or every record behind one donor (the dashboard folds a pack into one row)
+  queueTop: (body: { kind?: string; key?: string; hash?: string }) =>
+    j<{ ok: boolean; priority: number; records: number }>("/api/queue/top",
+      { method: "POST", body: JSON.stringify(body) }),
+  cancelDownload: (hash: string) =>
+    j<{ ok: boolean; movies: number; episodes: number }>(
+      `/api/downloads/${encodeURIComponent(hash)}/cancel`, { method: "POST" }),
   // Stop a merge that is going wrong: kills the decode/mux running right now, or takes the
   // record off the queue if it has not started.
   abortMovie: (tmdbId: number) =>
