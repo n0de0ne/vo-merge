@@ -1777,3 +1777,30 @@ def test_merge_hold_reason_names_every_brake(app_env, monkeypatch):
     # no workers running is the silent one: the queue drains at zero with nothing to show for it
     assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True)) \
         == "no merge worker is running"
+
+
+def test_a_completed_download_that_cannot_move_says_why(app_env, monkeypatch):
+    """Observed live: five downloads at 100%, the merger idle, and no reason anywhere. Every
+    skip in the promote sweep was silent, so 'complete but going nowhere' looked exactly like a
+    broken app — and promote runs every minute, so it stayed silent forever."""
+    from app import tv
+    for ep in (1, 2):
+        eid = f"12:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 12, "series_title": "Stuck Show",
+                                "tvdb_id": 12, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="GONEHASH", dl_id="rid")
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def torrents(self, cat): return []          # the torrent is not in this category
+    monkeypatch.setattr(tv, "QBittorrent", FakeQB)
+    before = app_env.get_episode("12:1:1")["updated"]
+    tv._promote_completed(dict(app_env.DEFAULTS, enabled=True, scope_series=True))
+    e = app_env.get_episode("12:1:1")
+    assert e["status"] == "downloading", "promote must not invent a state it can't verify"
+    assert "not in the" in (e["progress"] or "") and "category" in e["progress"], e["progress"]
+    # `updated` means "when the pipeline state last changed"; explaining a stall is not a state
+    # change, and bumping it would reshuffle Needs-attention every minute this sweep runs
+    assert e["updated"] == before

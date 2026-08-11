@@ -1288,6 +1288,17 @@ def _claimable(tgt, rid, h, cfg):
     return True
 
 
+def _stuck(eps, why):
+    """Explain, on the records themselves, why a COMPLETED download is not moving.
+
+    Every skip in this sweep used to be silent: the row read "100% · done" and sat there, which
+    is indistinguishable from a broken app and gave the operator nothing to act on. `progress` is
+    already rendered under the row, and writing it does not touch `updated` (see core._set_row),
+    so an explanation cannot reshuffle the attention panel."""
+    for e in eps:
+        core.set_ep_status(e["id"], e["status"], progress=why)
+
+
 def _promote_completed(cfg=None):
     """Fast sweep: map completed pack/episode downloads onto episodes and queue them for
     merging. No ffmpeg here — just a qB poll and a directory walk."""
@@ -1305,7 +1316,16 @@ def _promote_completed(cfg=None):
     queued = 0
     for h, eps in by_hash.items():
         t = torrents.get(h)
-        if not t or (t.get("progress", 0) or 0) < 1.0:
+        if not t:
+            # The record points at a torrent that is not in this category — renamed category,
+            # removed outside vo-merge, or added to the wrong one. `stage_finish` reconciles
+            # this every 10 minutes, but promote runs every MINUTE and used to skip it in
+            # silence, so a download stuck here showed "100% · done" and no reason for as long
+            # as it took someone to notice. Say it on the record, where the UI already looks.
+            _stuck(eps, f"complete, but its torrent is not in the {cfg['qb_tv_category']} "
+                        f"category in qB (hash {str(h)[:12]}) — reconciling")
+            continue
+        if (t.get("progress", 0) or 0) < 1.0:
             continue
         local = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
         root = local if os.path.isdir(local) else os.path.dirname(local)
@@ -1373,6 +1393,13 @@ def _promote_completed(cfg=None):
             # perfectly good `ready` records and produced the nonsense "parsed X, wanted X".
             core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already "
                      f"queued/merging/blocklisted")
+            # If NOTHING here is claimable and none of these episodes is queued or merging
+            # elsewhere, this download can never move them — say so on the records instead of
+            # logging it once a minute forever.
+            if not claimed and not any(e["status"] in ("ready", "merging")
+                                       for e in core.get_episodes() if e["dl_hash"] == h):
+                _stuck(eps, "complete, but every episode it covers has already blocklisted this "
+                            "release or is being served by another download")
         elif not files:
             # complete, dir present, but ZERO parseable video -> dead release
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")

@@ -2960,7 +2960,15 @@ def _promote_completed(cfg=None):
         if not t:
             t = next((x for x in torrents
                       if _owns(x.get("save_path", "") + x.get("content_path", ""), tmdb)), None)
-        if not t or (t.get("progress", 0) or 0) < 1.0:
+        if not t:
+            # Not in this category at all (renamed, removed outside vo-merge, added to the
+            # wrong one). stage_finish reconciles it every 10 min; promote runs every minute and
+            # used to skip it in silence, leaving a row reading "100% · done" with no reason.
+            core.set_status(mv["tmdb_id"], mv["status"],
+                            progress=f"complete, but its torrent is not in the "
+                                     f"{cfg['qb_category']} category in qB — reconciling")
+            continue
+        if (t.get("progress", 0) or 0) < 1.0:
             continue
         vid, local = _resolve_donor_video(mv, t, cfg)
         if vid:
