@@ -1831,3 +1831,34 @@ def test_bumping_a_folded_pack_row_bumps_the_whole_pack(app_env):
     assert app_env.get_episode("31:1:9")["priority"] in (0, None), "a finished episode is not queued"
     # priority is orthogonal to state: bumping must not touch status or reshuffle `updated`
     assert app_env.get_episode("31:1:1")["status"] == "downloading"
+
+
+def test_a_download_that_cannot_promote_escalates_instead_of_sitting_forever(app_env, monkeypatch):
+    """Observed live: packs at 100% sat in `downloading` for 24 HOURS. Annotating the reason was
+    an improvement but not an answer — an annotation nobody is watching is still a silent stall.
+    After STUCK_MAX passes the records become a real error, which is what puts them in Review and
+    in front of the on-call AI."""
+    from app import tv
+    for ep in (1, 2):
+        eid = f"41:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 41, "series_title": "Wedged",
+                                "tvdb_id": 41, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="WEDGED")
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def torrents(self, cat): return []
+    monkeypatch.setattr(tv, "QBittorrent", FakeQB)
+    monkeypatch.setattr(tv, "STUCK_MAX", 3)
+    tv._STUCK_PASSES.clear()
+    cfg = dict(app_env.DEFAULTS, enabled=True, scope_series=True)
+    for _ in range(2):
+        tv._promote_completed(cfg)
+        assert app_env.get_episode("41:1:1")["status"] == "downloading", "annotate first"
+    tv._promote_completed(cfg)                       # the pass that gives up
+    e = app_env.get_episode("41:1:1")
+    assert e["status"] == "error" and "stuck for 3 min" in e["error"], e["error"]
+    assert not e["progress"], "the annotation is replaced by the error, not left beside it"
+    tv._STUCK_PASSES.clear()

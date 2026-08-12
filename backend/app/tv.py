@@ -1288,13 +1288,34 @@ def _claimable(tgt, rid, h, cfg):
     return True
 
 
-def _stuck(eps, why):
-    """Explain, on the records themselves, why a COMPLETED download is not moving.
+# Consecutive promote passes a completed download has failed to move, per donor. The sweep runs
+# every minute, so this is also a clock: past STUCK_MAX the records stop being annotated and
+# become a real error, which is what puts them in Review and in front of the on-call AI.
+_STUCK_PASSES = {}
+STUCK_MAX = 30                       # ~30 min at the 1-min promote cadence
+
+
+def _stuck(eps, why, h=None):
+    """Explain, on the records themselves, why a COMPLETED download is not moving — and escalate
+    if it stays that way.
 
     Every skip in this sweep used to be silent: the row read "100% · done" and sat there, which
-    is indistinguishable from a broken app and gave the operator nothing to act on. `progress` is
-    already rendered under the row, and writing it does not touch `updated` (see core._set_row),
-    so an explanation cannot reshuffle the attention panel."""
+    is indistinguishable from a broken app. Worse, it sat there indefinitely — a pack observed
+    stuck for 24 hours was never going to move and nothing said so. `progress` is the pipeline's
+    own explanation field and writing it does not touch `updated` (see core._set_row), so
+    annotating a stall cannot reshuffle the attention panel; but after STUCK_MAX passes the
+    annotation has plainly not helped, and a record nobody can see is worse than an error
+    everybody can."""
+    n = 0
+    if h:
+        n = _STUCK_PASSES[h] = _STUCK_PASSES.get(h, 0) + 1
+    if n >= STUCK_MAX:
+        _STUCK_PASSES.pop(h, None)
+        for e in eps:
+            core.set_ep_status(e["id"], "error", progress="",
+                               error=f"download {why} — stuck for {STUCK_MAX} min")
+        core.log(f"tv promote: {str(h)[:12]} stuck {STUCK_MAX} passes ({why}) -> error")
+        return
     for e in eps:
         core.set_ep_status(e["id"], e["status"], progress=why)
 
@@ -1323,7 +1344,7 @@ def _promote_completed(cfg=None):
             # silence, so a download stuck here showed "100% · done" and no reason for as long
             # as it took someone to notice. Say it on the record, where the UI already looks.
             _stuck(eps, f"complete, but its torrent is not in the {cfg['qb_tv_category']} "
-                        f"category in qB (hash {str(h)[:12]}) — reconciling")
+                        f"category in qB (hash {str(h)[:12]}) — reconciling", h)
             continue
         if (t.get("progress", 0) or 0) < 1.0:
             continue
@@ -1383,6 +1404,7 @@ def _promote_completed(cfg=None):
                 claimed += 1
         if claimed:
             queued += claimed
+            _STUCK_PASSES.pop(h, None)          # it moved: the stall clock starts over
             core.log(f"tv queued: {t['name'][:50]} -> {claimed} episode(s) on the merge queue")
         elif mapped:
             # The pack DOES contain these episodes — they were simply already queued, already
@@ -1399,7 +1421,7 @@ def _promote_completed(cfg=None):
             if not claimed and not any(e["status"] in ("ready", "merging")
                                        for e in core.get_episodes() if e["dl_hash"] == h):
                 _stuck(eps, "complete, but every episode it covers has already blocklisted this "
-                            "release or is being served by another download")
+                            "release or is being served by another download", h)
         elif not files:
             # complete, dir present, but ZERO parseable video -> dead release
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")

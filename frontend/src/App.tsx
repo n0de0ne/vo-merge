@@ -1231,8 +1231,12 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
                   {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
                   {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
                   {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
-                  {a.status === "merging" && a.progress &&
-                    <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
+                  {/* `progress` is the pipeline's own explanation — the sync ticker while
+                      merging, and WHY a finished download is not moving otherwise. Rendering it
+                      only for `merging` is what kept a stuck row silent for 24h. */}
+                  {a.progress &&
+                    <div className="sub" style={{ color: a.status === "merging" ? "#5ee9a0" : "#ffcf8f" }}>
+                      {a.progress}</div>}
                 </div>
                 <div className="col-end">
                   <Pill s={a.status} />
