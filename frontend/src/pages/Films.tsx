@@ -37,10 +37,18 @@ function RescanButton({ full }: { full?: boolean }) {
   usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000,
     [st?.running]);
 
-  const go = async () => {
-    await api.rescan("films", !!full);
+  // Both endpoints answer 200 with {started:false, note} when SCAN_LOCK is already held — and
+  // the button's own `disabled={running}` cannot cover that, because the hourly search job takes
+  // the lock for its whole scan phase WITHOUT touching SCAN_STATE, so `running` is false the
+  // entire time. Discarding the body meant the click did nothing and looked like it had worked,
+  // with the previous pass's "last: …" line still on screen. runAction because this was the one
+  // action here not wrapped in it, so a 401 after a key rotation reached nobody.
+  const [note, setNote] = useState("");
+  const go = () => runAction(async () => {
+    const r = await api.rescan("films", !!full);
+    setNote(r.started ? "" : (r.note || "a scan is already running"));
     await api.rescanState().then(setSt).catch(() => {});
-  };
+  });
 
   // One scan runs at a time (SCAN_LOCK), so a pass started from another tab disables this one.
   const mine = st?.scope === "films";
@@ -64,6 +72,7 @@ function RescanButton({ full }: { full?: boolean }) {
             + "pass stopped, so it is cheap to run any time."}>
         {running && mine ? (full ? "Re-reading…" : "Scanning…") : (full ? "Re-read films" : "Scan new films")}
       </Act>
+      {note && <span className="warn">{note}</span>}
       {running && mine && <span className="muted">
         {st!.phase}…{(st!.read ?? 0) > 0 && <> · read {fmtNum(st!.read)}</>}
         {(st!.reused ?? 0) > 0 && <> · reused {fmtNum(st!.reused)}</>}</span>}
@@ -90,10 +99,12 @@ function RecheckButton() {
   usePoll(() => api.recheckState().then(setSt).catch(() => {}), st?.running ? 3000 : 60000,
     [st?.running]);
 
-  const go = async () => {
-    await api.recheck("films");
+  const [note, setNote] = useState("");
+  const go = () => runAction(async () => {
+    const r = await api.recheck("films");     // 200 + started:false while SCAN_LOCK is held
+    setNote(r.started ? "" : (r.note || "a scan or re-check is already running"));
     await api.recheckState().then(setSt).catch(() => {});
-  };
+  });
   const mine = st?.scope === "films";
   const running = !!st?.running;
   const done = mine && st && !running && st.finished > 0;
@@ -107,6 +118,7 @@ function RecheckButton() {
              + "titles are left alone."}>
         {running && mine ? "Re-checking…" : "Re-check finished"}
       </Act>
+      {note && <span className="warn">{note}</span>}
       {running && mine && <span className="muted">
         re-probed {fmtNum(st!.checked)} of {fmtNum(st!.total)} · re-opened {fmtNum(st!.reopened)}</span>}
       {done && !st.error && <span className="muted">

@@ -203,6 +203,17 @@ export function TimeSeries(
           <path key={s.key} d={pathOf(s)} fill="none" stroke={s.color} strokeWidth={2}
             strokeLinejoin="round" strokeLinecap="round" />
         ))}
+        {/* An ISOLATED sample gets a dot. SVG does not stroke a subpath that is a single moveto,
+            so a point with no neighbour draws literally nothing — which is every install on its
+            first day, when there is exactly one coverage sample and `have_coverage` is already
+            true so the empty state does not fire. The chart was silently dropping a value it had
+            been handed, which is the one thing this kit is written not to do. */}
+        {series.map(s => s.values.map((v, i) => {
+          if (v == null) return null;
+          if (s.values[i - 1] != null || s.values[i + 1] != null) return null;
+          return <circle key={`${s.key}-lone-${i}`} cx={x(i)} cy={y(v)} r={3.5}
+            fill={s.color} stroke="var(--panel)" strokeWidth={2} />;
+        }))}
         {hover >= 0 && (
           <>
             <line className="cursor" x1={x(hover)} x2={x(hover)} y1={pad.t} y2={pad.t + ih} />

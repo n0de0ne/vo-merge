@@ -59,6 +59,7 @@ function StatePills({ counts, onPick }:
 function RescanButton({ scope, label, full }:
   { scope: "anime" | "series"; label: string; full?: boolean }) {
   const [st, setSt] = useState<RescanState | null>(null);
+  const [note, setNote] = useState("");
   usePoll(() => api.rescanState().then(setSt).catch(() => {}), st?.running ? 3000 : 30000,
     [st?.running]);
 
@@ -82,10 +83,17 @@ function RescanButton({ scope, label, full }:
             + "disk, and anything an interrupted scan never reached. Picks up where the last pass "
             + "stopped, so it is cheap to run any time."}
         run={async () => {
-          await runAction(async () => { await api.rescan(scope, !!full); setSt(await api.rescanState()); });
+          // started:false (SCAN_LOCK held, often by the hourly job, which never sets SCAN_STATE
+          // so `running` is false here) must be said out loud — see Films.tsx.
+          await runAction(async () => {
+            const r = await api.rescan(scope, !!full);
+            setNote(r.started ? "" : (r.note || "a scan is already running"));
+            setSt(await api.rescanState());
+          });
         }}>
         {running && mine ? (full ? "Re-reading…" : "Scanning…") : full ? `Re-read ${label}` : `Scan new ${label}`}
       </Act>
+      {note && <span className="warn">{note}</span>}
       {running && mine && st && <span className="muted">
         {st.phase}… {(st.read ?? 0) > 0 && <>· read {fmtNum(st.read)}</>}
         {(st.reused ?? 0) > 0 && <> · reused {fmtNum(st.reused)}</>}</span>}
@@ -106,6 +114,7 @@ function RescanButton({ scope, label, full }:
  *  looked. This re-reads the files parked in those states and re-opens the ones still short. */
 function RecheckButton({ scope }: { scope: "anime" | "series" }) {
   const [st, setSt] = useState<RecheckState | null>(null);
+  const [note, setNote] = useState("");
   usePoll(() => api.recheckState().then(setSt).catch(() => {}), st?.running ? 3000 : 60000,
     [st?.running]);
   const mine = st?.scope === scope;
@@ -119,10 +128,15 @@ function RecheckButton({ scope }: { scope: "anime" | "series" }) {
           + "stays blocklisted, so a re-opened record searches for a different one; ignored "
           + "titles are left alone."}
         run={async () => {
-          await runAction(async () => { await api.recheck(scope); setSt(await api.recheckState()); });
+          await runAction(async () => {
+            const r = await api.recheck(scope);
+            setNote(r.started ? "" : (r.note || "a scan or re-check is already running"));
+            setSt(await api.recheckState());
+          });
         }}>
         {running && mine ? "Re-checking…" : "Re-check finished"}
       </Act>
+      {note && <span className="warn">{note}</span>}
       {running && mine && st && <span className="muted">
         re-probed {fmtNum(st.checked)} of {fmtNum(st.total)} · re-opened {st.reopened}</span>}
       {last && !last.error && <span className="muted">

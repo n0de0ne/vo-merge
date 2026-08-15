@@ -151,23 +151,34 @@ def _housekeeping_job():
         # Deletions must not wait for an operator's re-read: sweep vanished files daily, with
         # the same mount-alive guard the rescan prune uses. Behind SCAN_LOCK non-blocking — a
         # rescan already running prunes on its own, so there is nothing to wait for.
+        # The coverage sample belongs INSIDE the lock, with the prune. A full re-read
+        # (`forget=true`) drops the probe rows for its scope before it starts, and it can run for
+        # hours — so sampling while one is in flight reads a near-empty inventory and upserts it
+        # over today's row, drawing a collapse that never happened. Holding the lock means we
+        # sample only when no pass is running, and a pass that IS running takes its own sample
+        # when it finishes.
         if pipeline.SCAN_LOCK.acquire(blocking=False):
             try:
                 pipeline.prune_library(cfg)
+                # Reads the inventory the prune has just corrected, so the point recorded is the
+                # library as it stands rather than as it stood before the deletions were noticed.
+                row = history.sample(cfg)
+                core.log(f"history: sampled {row['complete']}/{row['total']} complete")
+            except Exception as e:
+                core.log(f"history sample error: {e}")
             finally:
                 pipeline.SCAN_LOCK.release()
+        else:
+            core.log("housekeeping: a scan is running -> skipping the prune and the coverage "
+                     "sample (the scan takes its own when it finishes)")
         pipeline.purge_recycle(cfg)
         pipeline.revisit_ignored(cfg)
-        # One coverage sample a day is what makes the trend line exist at all. It reads the
-        # probe inventory that the prune above has just corrected, so the point recorded is the
-        # library as it stands rather than as it stood before the deletions were noticed.
         try:
-            row = history.sample(cfg)
             dropped = core.prune_events(int(cfg.get("history_keep_days", 90)))
-            core.log(f"history: sampled {row['complete']}/{row['total']} complete"
-                     + (f" · pruned {dropped} old event(s)" if dropped else ""))
+            if dropped:
+                core.log(f"history: pruned {dropped} old event(s)")
         except Exception as e:
-            core.log(f"history sample error: {e}")
+            core.log(f"history prune error: {e}")
         if cfg.get("auto_repair"):
             with core.db() as c:
                 paths = [r["path"] for r in c.execute(
