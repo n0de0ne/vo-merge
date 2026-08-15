@@ -119,6 +119,7 @@ export interface DL {
 export interface Candidate {
   score: number; seeders: number; size: number; title: string; indexer: string;
   multi: boolean; link: string; rid: string; tried: boolean; pack?: boolean; info_url?: string | null;
+  complete?: boolean;      // covers the whole show (a complete-series / batch release)
 }
 export interface DashActive {
   kind: string; key: string; title: string; sub?: string | null; status: string;
@@ -131,10 +132,26 @@ export interface DashAttention {
   ai_status?: string | null; ai_verdict?: string | null;
   count?: number;            // episodes sharing this status+error (a failed pack groups into one)
 }
+export interface QueueItem {
+  pos: number; kind: string; key: string; title: string; sub?: string | null;
+  poster?: string | null; priority: number; waiting_s: number; merging: boolean;
+}
+// The merge queue in drain order, plus WHY it is or is not draining — a deliberate hold
+// (paused, low disk) and a dead worker used to look identical from the dashboard.
+export interface QueueView {
+  items: QueueItem[]; total: number; merging_now: number; workers: number;
+  hold: string | null; disk: { low: boolean; free_gb: number | null; paths?: Record<string, number | null> };
+  now: number;
+}
 export interface DashRecent {
   kind: string; title: string; langs?: string | null; poster?: string | null; ts: number;
   subs?: string | null;    // subtitle languages grafted in
   how?: string;            // "grafted" (tracks added) | "replaced" (download became the file)
+}
+// One page of the full merge history. Rows are DashRecent, so the dashboard panel and the full
+// list render through the same component and can never drift apart.
+export interface MergedLog {
+  items: DashRecent[]; total: number; offset: number; limit: number; now: number;
 }
 // How the on-call AI dispatcher is actually doing. `resolved`/`failed` are verdicts it produced
 // itself; `needs_human` is mostly the no-callback flip, so a wall of it with last_callback null
@@ -161,6 +178,8 @@ export interface Dash {
   // was correct on its own and the scan simply closed the record out
   merged_kinds?: { grafted: number; replaced: number; already: number };
   inflight: number | null; inflight_cap: number; merge_cap: number;
+  merge_hold?: string | null;   // why the merger is idle, in words (null = queue empty)
+  merge_workers?: number;
   disk: { path: string; total: number; free: number } | null;
   next_runs: Record<string, number>; now: number;
 }
@@ -246,6 +265,18 @@ export const api = {
   aiSend: (id: number) => j<{ ok: boolean; queued: boolean }>(`/api/movie/${id}/ai`, { method: "POST" }),
   aiLog: (outcome: "resolved" | "failed" | "needs_human" | "all" = "resolved", limit = 50) =>
     j<AiLog>(`/api/ai_log?outcome=${outcome}&limit=${limit}`),
+  // Re-read ONE title's files (probe cache bypassed) and act on what is now missing — the unit
+  // an operator works in after replacing a show's or a film's files by hand.
+  rescanSeries: (seriesId: number, search = true) =>
+    j<{ ok: boolean; started: boolean; scope?: string; note?: string }>(
+      `/api/tv/${seriesId}/rescan?search=${search}`, { method: "POST" }),
+  rescanMovie: (tmdbId: number, search = true) =>
+    j<{ ok: boolean; outcome: string; searched: boolean; movie: Movie }>(
+      `/api/movie/${tmdbId}/rescan?search=${search}`, { method: "POST" }),
+  // the full Recently-merged history behind the dashboard panel's top ten
+  mergedLog: (limit = 50, offset = 0, q = "") =>
+    j<MergedLog>(`/api/merged?limit=${limit}&offset=${offset}`
+                 + (q ? `&q=${encodeURIComponent(q)}` : "")),
   epAiSend: (id: string) =>
     j<{ ok: boolean; queued: boolean }>(`/api/episode/${encodeURIComponent(id)}/ai`, { method: "POST" }),
   another: (id: number) => j<Movie>(`/api/movie/${id}/another`, { method: "POST" }),
@@ -293,6 +324,36 @@ export const api = {
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   epIgnore: (id: string) =>
     j<{ ok: boolean }>(`/api/episode/${encodeURIComponent(id)}/ignore`, { method: "POST" }),
+  queue: (limit = 100) => j<QueueView>(`/api/queue?limit=${limit}`),
+  // one record, or every record behind one donor (the dashboard folds a pack into one row)
+  queueTop: (body: { kind?: string; key?: string; hash?: string }) =>
+    j<{ ok: boolean; priority: number; records: number }>("/api/queue/top",
+      { method: "POST", body: JSON.stringify(body) }),
+  cancelDownload: (hash: string) =>
+    j<{ ok: boolean; movies: number; episodes: number }>(
+      `/api/downloads/${encodeURIComponent(hash)}/cancel`, { method: "POST" }),
+  // Stop a merge that is going wrong: kills the decode/mux running right now, or takes the
+  // record off the queue if it has not started.
+  abortMovie: (tmdbId: number) =>
+    j<{ ok: boolean; result: string }>(`/api/movie/${tmdbId}/abort`, { method: "POST" }),
+  abortEpisode: (epId: string) =>
+    j<{ ok: boolean; result: string }>(`/api/episode/${encodeURIComponent(epId)}/abort`,
+      { method: "POST" }),
+  // Start a title over: stops merges, deletes the DOWNLOADS (never the library files) and
+  // clears every trace the pipeline left on the records, then re-reads what is on disk now.
+  resetSeries: (seriesId: number, rescan = true) =>
+    j<{ ok: boolean; episodes: number; donors_deleted: number; merges_stopped: number }>(
+      `/api/tv/${seriesId}/reset?rescan=${rescan}`, { method: "POST" }),
+  resetMovie: (tmdbId: number, rescan = true) =>
+    j<{ ok: boolean; movies: number; donors_deleted: number; merges_stopped: number }>(
+      `/api/movie/${tmdbId}/reset?rescan=${rescan}`, { method: "POST" }),
+  // whole-show releases: complete-series batches and multi-season packs. A per-season query can
+  // never surface these — an indexer asked for "Title S01" doesn't return "(Complete Series)".
+  seriesCandidates: (seriesId: number) =>
+    j<Candidate[]>(`/api/tv/${seriesId}/candidates`),
+  seriesGrab: (seriesId: number, link: string, rid: string, title: string) =>
+    j<{ ok: boolean; episodes: number }>(`/api/tv/${seriesId}/grab`,
+      { method: "POST", body: JSON.stringify({ link, rid, title }) }),
   seasonCandidates: (seriesId: number, season: number) =>
     j<Candidate[]>(`/api/tv/${seriesId}/${season}/candidates`),
   seasonGrab: (seriesId: number, season: number, link: string, rid: string, title: string) =>

@@ -6,6 +6,7 @@ constant offset between an added audio track and the base. Returns (offset_ms,
 confidence). offset_ms > 0 means `shift` track lags `ref` (plays late).
 """
 import json, subprocess
+from . import core
 import numpy as np
 
 
@@ -25,7 +26,7 @@ def _pcm(path, ai, start, dur, sr, timeout=None):
     An empty array leaves the caller below its minimum-samples gate, so a wedged ffmpeg degrades
     to "no audio answer" instead of blocking the merge worker forever."""
     try:
-        p = subprocess.run(["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2",
+        p = core.run_proc(["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2",
                             "-ss", str(start), "-t", str(dur),
                             "-i", path, "-map", f"0:a:{ai}", "-ac", "1", "-ar", str(sr),
                             "-f", "f32le", "-"], capture_output=True, timeout=timeout)

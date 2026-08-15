@@ -7,7 +7,7 @@ import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
 from . import agent, core, sync, media
-from .clients import Prowlarr, Radarr, QBittorrent, Plex
+from .clients import Prowlarr, Radarr, Sonarr, QBittorrent, Plex
 
 class _MergeGate:
     """Admission control for concurrent merges (sync-detect + mux), covering every trigger:
@@ -289,8 +289,10 @@ def reopen_status(prev, updated, cfg):
 # forgotten: each retry path cleared the download fields inline and left `sync_offset_ms` behind, so
 # the next donor was muxed with the previous donor's offset and detection was skipped entirely.
 # Anything donor-specific added later belongs here, not in the individual call sites.
+# `transient_fails` rides along: a record sent back for a fresh run gets a fresh
+# infrastructure-failure budget too (see `transient`), same reasoning as `attempts=0` on re-open.
 DONOR_RESET = dict(dl_hash=None, dl_id=None, en_file=None,
-                   sync_offset_ms=0, sync_drift=None, sync_manual=0)
+                   sync_offset_ms=0, sync_drift=None, sync_manual=0, transient_fails=0)
 
 # The AI's verdict describes the attempt that FAILED. Once a record is re-queued for a fresh one
 # it is void, and leaving it behind is what kept retried records sitting in the Review tab flagged
@@ -303,6 +305,36 @@ AI_RESET = dict(ai_status=None, ai_verdict=None, ai_at=None)
 # ...but a record whose status still IS a problem keeps its verdict, and so does `ignored`: that
 # is a deliberate give-up (usually the AI's own /unfixable), and the reason is the point of it.
 AI_KEEP_STATES = ("error", "review", "sync_fail", "ignored")
+
+
+def transient(kind, ident, reason, cfg=None, back_to="pending", **extra):
+    """Route a failure a RETRY can fix back for another automatic attempt, instead of minting an
+    `error` record. An `error` pages the AI within 3 minutes — and a momentary qB outage, an NFS
+    hiccup on a probe, or a torrent fetch that timed out once are all things the next sweep fixes
+    for free. Burning an agent run (or, with the dispatcher down, a human's attention) on those
+    is the single biggest source of avoidable escalations.
+
+    Bounded, because "transient" is a hypothesis: after `transient_max` CONSECUTIVE failures the
+    condition is evidently not transient (qB is misconfigured, the mount is gone) and the record
+    becomes a real `error` carrying the count. The counter lives in `transient_fails` and resets
+    with DONOR_RESET — a fresh run gets a fresh budget — so only an unbroken run of
+    infrastructure failures can exhaust it.
+
+    Returns True while retrying, False once it gave up into `error`."""
+    cfg = cfg or core.load_config()
+    get = core.get_movie if kind == "movie" else core.get_episode
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    rec = get(ident) or {}
+    n = (rec.get("transient_fails") or 0) + 1
+    cap = max(1, int(cfg.get("transient_max", 5)))
+    if n >= cap:
+        setter(ident, "error", error=f"{reason} — {n} consecutive attempts", progress="",
+               transient_fails=n, **extra)
+        core.log(f"transient {kind} {ident}: {reason} -> error after {n} attempts")
+        return False
+    setter(ident, back_to, error=reason, progress="", transient_fails=n, **extra)
+    core.log(f"transient {kind} {ident}: {reason} -> will retry ({n}/{cap})")
+    return True
 
 
 def _beat(kind, ident, progress):
@@ -324,12 +356,45 @@ def blocklist(rec):
     Every path that sends a record back for a different release has to do this, or "different"
     isn't guaranteed: the search re-runs, scores the same candidates the same way, and picks the
     identical top release. The vanished-torrent reconcile skipped it, which is what turned a
-    silently-failed grab into an endless grab -> reconcile -> re-grab loop."""
+    silently-failed grab into an endless grab -> reconcile -> re-grab loop.
+
+    Entries are now `[rid, ts]` so they can AGE (see tried_active): the list only ever grew, and
+    a release that stalled once — 0 seeds on a bad day — was burned forever, which for some
+    titles is the only release that exists. Legacy plain-string entries are stamped `now` at the
+    first rewrite, so they age out `tried_ttl_days` from the upgrade rather than all at once."""
     import json as _json
-    tried = _json.loads(rec.get("tried") or "[]")
-    if rec.get("dl_id") and rec["dl_id"] not in tried:
-        tried.append(rec["dl_id"])
-    return _json.dumps(tried)
+    now = time.time()
+    entries, seen = [], set()
+    for e in _json.loads(rec.get("tried") or "[]"):
+        rid, ts = (e[0], e[1]) if isinstance(e, list) and len(e) >= 2 else (e, now)
+        if rid and rid not in seen:
+            seen.add(rid)
+            entries.append([rid, ts])
+    if rec.get("dl_id") and rec["dl_id"] not in seen:
+        entries.append([rec["dl_id"], now])
+    return _json.dumps(entries)
+
+
+def tried_active(rec, cfg=None):
+    """The release identities this record must not pick again — `tried` minus what has aged out.
+
+    Every reader goes through here (searches, candidate lists, pack blocklists): reading the raw
+    JSON breaks twice over — timestamped entries are lists (unhashable in a set), and an expired
+    entry would still be honoured. TTL <= 0 preserves the old never-expire behaviour; a legacy
+    plain-string entry has no timestamp to age from, so it stays blocked until some retry path
+    rewrites the list (blocklist() stamps it then)."""
+    import json as _json
+    cfg = cfg or core.load_config()
+    ttl = float(cfg.get("tried_ttl_days", 30)) * 86400
+    now = time.time()
+    out = set()
+    for e in _json.loads(rec.get("tried") or "[]"):
+        if isinstance(e, list) and len(e) >= 2:
+            if ttl <= 0 or now - float(e[1] or 0) < ttl:
+                out.add(e[0])
+        elif e:
+            out.add(e)
+    return out
 
 # ...but the donor FILES must survive until the merge consumes them, so the orphan sweep keeps
 # its hands off ready/merging (and review/sync_fail, kept for manual resync). `error` is included
@@ -376,10 +441,26 @@ def sweep_orphan_donors(cfg=None):
     if not tors:
         return
     keep = _dl_hashes(KEEP_DONOR_STATES)
+    # Donors kept ONLY for parked failure states exist so /assign and /set_sync can still use
+    # them — but with a dead or ignoring actor they pin gigabytes forever. Past donor_keep_days
+    # they are freed; a later merge attempt then finds the donor gone and self-heals through the
+    # donor-vanished reject path (blocklist + another release).
+    live_hashes = _dl_hashes(("downloading", "ready", "merging"))
+    parked = _dl_hashes(("review", "sync_fail", "error")) - live_hashes
+    ttl = max(0.0, float(cfg.get("donor_keep_days", 14))) * 86400
     now = time.time()
     for t in tors:
         h = (t.get("hash") or "").lower()
-        if not h or h in keep:
+        if not h:
+            continue
+        if h in keep:
+            if ttl and h in parked and now - (t.get("added_on") or now) > ttl:
+                try:
+                    qb.delete([h], delete_files=True)
+                    core.log(f"parked donor expired after {int(ttl / 86400)}d "
+                             f"(review/sync_fail/error owner only): {t.get('name', '')[:50]}")
+                except Exception as e:
+                    core.log(f"orphan sweep: expire {h[:12]} failed: {e}")
             continue
         if now - (t.get("added_on") or now) < 1800:
             continue
@@ -570,7 +651,8 @@ def _scan_tagged(cfg):
 
 
 # ---------------------------------------------------------------- SEARCH + SCORE
-def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need_subs=()):
+def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need_subs=(),
+                  orig=None):
     """Score a Prowlarr result for this title, or None to reject it.
 
     `need` = the audio languages this file is still missing (its `need_audio`), and it drives
@@ -605,8 +687,8 @@ def score_release(r, otitle, year, imdb, tmdb, want_res, want_src, need=(), need
               any(str(year + d) in t for d in (-1, 0, 1)))
     if not titleok:
         return None
-    if media.useless_release(t, lang_need, otitle):
-        return None                      # advertises only dubs we already have -> adds nothing
+    if media.useless_release(t, lang_need, otitle, orig=orig, need_subs=need_subs):
+        return None      # advertises only audio we already have (dub OR checkable VOST claim)
     sc = min(int(r.get("seeders") or 0), 100)
     if subs_only:
         # smaller is strictly better: we keep the text track and throw the rest away
@@ -629,46 +711,80 @@ class SearchUnavailable(Exception):
     real answer that legitimately settles a record into `no_release`."""
 
 
+def _movie_queries(mv, cfg):
+    """The query ladder for one movie, most-likely first. The built-in search composes ONE query
+    from the library title, so a title it never matches can never be found however often it
+    re-searches — the /search_releases docstring has said so all along, and the manual escape
+    hatch it describes (try the original / English / alternate-transliteration name) is a list a
+    loop can walk. Radarr's alternateTitles are only fetched once a record has already burned a
+    fruitless round (`search_rounds`), so the common case stays one Prowlarr query."""
+    otitle = mv["original_title"] or mv["title"]
+    if not _toks(otitle):                 # non-Latin original title (JP/KR/etc.) tokenizes to
+        otitle = mv["title"]              # nothing -> query+match on Radarr's English title instead
+    queries = [otitle]
+    if mv.get("title") and _toks(mv["title"]) and mv["title"] not in queries:
+        queries.append(mv["title"])
+    if (mv.get("search_rounds") or 0) >= 1 and mv.get("radarr_id"):
+        try:
+            m = Radarr(cfg["radarr_url"], cfg["radarr_key"]).movie(mv["radarr_id"]) or {}
+            for a in m.get("alternateTitles") or []:
+                t = (a.get("title") or "").strip()
+                if t and _toks(t) and t not in queries:
+                    queries.append(t)
+                if len(queries) >= 5:
+                    break
+        except Exception as e:
+            core.log(f"candidates {mv['tmdb_id']}: alternate titles unavailable ({e})")
+    return queries
+
+
 def candidates(tmdb_id, cfg=None, include_tried=False):
     """Scored English/MULTI release candidates for a movie (no grab) — powers the UI's
-    interactive search and the auto-picker."""
+    interactive search and the auto-picker. Walks the query ladder: the first query that yields
+    any scored candidate wins, so extra Prowlarr round-trips are only spent on titles the
+    primary query has already failed."""
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
     if not mv:
         return []
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
-    otitle = mv["original_title"] or mv["title"]; year = mv["year"]
-    if not _toks(otitle):                 # non-Latin original title (JP/KR/etc.) tokenizes to
-        otitle = mv["title"]              # nothing -> query+match on Radarr's English title instead
+    year = mv["year"]
     want_res = (RES.search(mv["quality"] or "") or [None])[0]
     want_src = (SRC.search(mv["quality"] or "") or [None])[0]
     need = {x for x in (mv.get("need_audio") or "").split(",") if x}
     need_s = {x for x in (mv.get("need_subs") or "").split(",") if x}
-    try:
-        results = pro.search(otitle, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
-    except Exception as e:
-        # An empty list is a VERDICT — "nothing suitable exists" — and the caller writes
-        # `no_release`, which then sits out `no_release_retry_h` (24h by default). A Prowlarr
-        # restart or a network blip during a sweep is not that verdict, and returning [] made a
-        # transient failure indistinguishable from one, parking a slice of the backlog for a day
-        # on a decision nobody made.
-        core.log(f"candidates {tmdb_id}: {e}")
-        raise SearchUnavailable(str(e)) from e
-    import json as _json
-    tried = set(_json.loads(mv.get("tried") or "[]"))
+    tried = tried_active(mv, cfg)
     out = []
-    for r in results:
-        sc = score_release(r, otitle, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src,
-                           need=need, need_subs=need_s)
-        if sc is None:
-            continue
-        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
-        if rid in tried and not include_tried:
-            continue
-        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
-                    "title": r.get("title"), "indexer": r.get("indexer"),
-                    "multi": bool(re.search(r"\bMULTI\b", r.get("title", ""), re.I)),
-                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
+    for qi, q in enumerate(_movie_queries(mv, cfg)):
+        try:
+            results = pro.search(q, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+        except Exception as e:
+            # An empty list is a VERDICT — "nothing suitable exists" — and the caller writes
+            # `no_release`, which then sits out `no_release_retry_h` (24h by default). A Prowlarr
+            # restart or a network blip during a sweep is not that verdict, and returning [] made
+            # a transient failure indistinguishable from one, parking a slice of the backlog for
+            # a day on a decision nobody made.
+            core.log(f"candidates {tmdb_id}: {e}")
+            raise SearchUnavailable(str(e)) from e
+        for r in results:
+            # tokens are matched against the query actually used — results found via an
+            # alternate title would otherwise all fail the 0.6 overlap test against the primary
+            sc = score_release(r, q, year, mv["imdb_id"], mv["tmdb_id"], want_res, want_src,
+                               need=need, need_subs=need_s, orig=mv.get("original_lang"))
+            if sc is None:
+                continue
+            link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+            if rid in tried and not include_tried:
+                continue
+            out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                        "title": r.get("title"), "indexer": r.get("indexer"),
+                        "multi": bool(re.search(r"\bMULTI\b", r.get("title", ""), re.I)),
+                        "link": link, "rid": rid, "tried": rid in tried,
+                        "info_url": r.get("infoUrl")})
+        if out:
+            if qi:
+                core.log(f"candidates {tmdb_id}: query ladder matched on {q!r}")
+            break
     out.sort(key=lambda x: -x["score"])
     return out
 
@@ -698,7 +814,10 @@ def search_movie(tmdb_id, cfg=None, do_grab=None):
         core.log(f"search {tmdb_id}: indexer unavailable ({e}) -> left pending for the next sweep")
         raise
     if not cand or cand[0]["score"] < cfg["score_threshold"] or cand[0]["seeders"] < cfg["min_seeders"]:
+        # search_rounds counts SEPARATE fruitless rounds — it widens the next round's query
+        # ladder and, past no_release_escalate_rounds, pages the AI once (ai_health_check)
         core.set_status(tmdb_id, "no_release",
+                        search_rounds=(mv.get("search_rounds") or 0) + 1,
                         candidate_title=(cand[0]["title"] if cand else None),
                         candidate_score=(cand[0]["score"] if cand else 0))
         core.log(f"search {tmdb_id}: no usable release (best={cand[0]['score'] if cand else 'none'})")
@@ -733,10 +852,14 @@ def grab(tmdb_id, link, cfg=None):
         h = qb_grab(qb, link, cfg["qb_category"], savepath)
         if not h:
             raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
-        core.set_status(tmdb_id, "downloading", dl_hash=h)
+        core.set_status(tmdb_id, "downloading", dl_hash=h, error=None, transient_fails=0,
+                        search_rounds=0)
         core.log(f"grab tmdb={tmdb_id}: added to qB ({savepath}) hash={h}")
     except Exception as e:
-        core.set_status(tmdb_id, "error", error=f"grab: {e}")
+        # A grab failure is usually a fetch timeout, a dead tracker link or a qB blip — things
+        # the next sweep retries for free. Minting an `error` here paged the AI for a network
+        # hiccup; `transient` self-retries and only escalates a run of consecutive failures.
+        transient("movie", tmdb_id, f"grab: {e}", cfg)
         core.log(f"grab tmdb={tmdb_id} FAILED: {e}")
 
 
@@ -786,11 +909,8 @@ def _is_stalled(t, cfg):
 def drop_stalled(mv, t, cfg):
     """Delete a stalled download, blocklist that release, and grab another (better-seeded)
     candidate — or give up after max_sync_retries."""
-    import json as _json
     tmdb_id = mv["tmdb_id"]
-    tried = _json.loads(mv.get("tried") or "[]")
-    if mv.get("dl_id") and mv["dl_id"] not in tried:
-        tried.append(mv["dl_id"])
+    tried = blocklist(mv)
     attempts = (mv.get("attempts") or 0) + 1
     try:
         qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
@@ -802,11 +922,11 @@ def drop_stalled(mv, t, cfg):
     core.log(f"stall {tmdb_id}: '{t.get('name','')[:50]}' stalled "
              f"({int((t.get('time_active',0) or 0)/60)}min, {seeds} seeds) -> blocklisted, re-searching")
     if attempts >= cfg.get("max_sync_retries", 4):
-        core.set_status(tmdb_id, "no_release", tried=_json.dumps(tried), attempts=attempts,
+        core.set_status(tmdb_id, "no_release", tried=tried, attempts=attempts,
                         **DONOR_RESET, progress="",
                         error=f"all candidate releases stalled after {attempts} tries")
         return
-    core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
+    core.set_status(tmdb_id, "pending", tried=tried, attempts=attempts,
                     **DONOR_RESET, error=None, progress="")
     # Dropping the dead torrent is right even while paused — it frees a slot and costs nothing.
     # Starting a NEW download is not: "paused" means no new searches, grabs or merges, and a
@@ -860,97 +980,149 @@ def ai_health_check(cfg=None):
             _WEDGE_SINCE["ts"] = time.time()
     else:
         _WEDGE_SINCE["ts"] = None
-    # (b) new error / review / sync_fail records — per-record seen-set so only NEW ones page,
-    # and a standing backlog never re-pages when one more record errors. Each newly-paged record
-    # is stamped ai_status='pending' so the UI shows "AI working" until the agent reports back.
+    # A scan or recheck rewrites statuses en masse — re-opens, close-outs, transient bounces —
+    # and paging off that churn files tickets the very next sweep WITHDRAWS (the record passed
+    # through `pending`) and then re-files: dozens of create/withdraw cycles per sweep, with
+    # dispatcher runs burned on tickets about to be void. Hold the paging machinery while the
+    # scan runs, exactly like searches do; anything still failing when it ends is paged by the
+    # next 3-minute sweep. (Part (a) above stays live — a wedged cap is not scan churn.)
+    if SCAN_LOCK.locked():
+        return
+    # (b) records newly landed in error / review / sync_fail — one ticket PER RECORD, capped.
+    # The old single errors-review.json batch had queue semantics that fought the dispatcher:
+    # while one batch sat unconsumed every later failure was refused a ticket, and a batch is
+    # all-or-nothing for a consumer that handles a couple of records per run. Per-record files
+    # give the dispatcher real take/ack units (see agent.CLAIMED_DIR), the same shape the
+    # operator's Send-to-AI button already writes. The cap keeps one bad season pack (400
+    # episodes) from burying the queue: records beyond it stay unpaged AND unstamped — the
+    # staleness timer must never run on a page that was never sent — and are picked up as the
+    # queue drains. The per-record seen-set still guarantees only NEW failures page.
     now = time.time()
     seen_path = os.path.join(core.CONFIG_DIR, "ai_seen_records.json")
     try:
         seen = set(json.load(open(seen_path)))
     except Exception:
         seen = set()
-    news, live = [], set()
+    room = max(0, int(cfg.get("ai_max_tickets", 50)) - len(agent.undispatched()))
+    paged, backlog, live = 0, 0, set()
     for st in ("error", "review", "sync_fail"):
         for m in core.get_movies(st):
             rk = f"movie:{m['tmdb_id']}:{st}"
             live.add(rk)
-            if rk in seen: continue
-            seen.add(rk)
-            core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
-            news.append({"type": "movie", "status": st, "id": m["tmdb_id"],
-                         "title": m.get("title", ""), "error": (m.get("error") or "")[:200]})
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.movie_context(m)
+            # once=False: the seen-set above is the dedup; the (kind,key) guard would refuse a
+            # record that fails again months after being fixed. The "same kind already awaiting
+            # dispatch" guard stays — an unconsumed ticket for this record means don't re-file.
+            if core.ticket(f"review-m{m['tmdb_id']}", summary, ctx, once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_status(m["tmdb_id"], st, ai_status="pending", ai_at=now)
         for e in core.get_episodes(st):
             rk = f"episode:{e['id']}:{st}"
             live.add(rk)
-            if rk in seen: continue
-            seen.add(rk)
-            core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
-            news.append({"type": "episode", "status": st, "id": e["id"],
-                         "title": f"{e.get('series_title','')} S{e.get('season')}E{e.get('episode')}",
-                         "error": (e.get("error") or "")[:200]})
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.episode_context(e)
+            if core.ticket(f"review-e{e['id']}", summary, ctx, once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_ep_status(e["id"], st, ai_status="pending", ai_at=now)
+    # Exhausted no_release: after `no_release_escalate_rounds` separate fruitless rounds the
+    # built-in query — ladder included — has proven it cannot match this title. That is exactly
+    # the failure class /search_releases exists for, but no_release was never paged, so these
+    # records re-searched the same wrong query every cooldown forever. One-shot by construction:
+    # the `ai_status IS NULL` gate means a record is paged once and its verdict (resolved /
+    # failed / needs_human / the staleness flip) is the durable outcome; a record whose queued
+    # ticket is withdrawn before dispatch gets its stamp cleared below, so it can page again.
+    gate = int(cfg.get("no_release_escalate_rounds", 3))
+    if gate > 0:
+        with core.db() as c:
+            nr_m = [dict(r) for r in c.execute(
+                "SELECT * FROM movies WHERE status='no_release' AND ai_status IS NULL "
+                "AND COALESCE(search_rounds,0) >= ?", (gate,))]
+            nr_e = [dict(r) for r in c.execute(
+                "SELECT * FROM episodes WHERE status='no_release' AND ai_status IS NULL "
+                "AND COALESCE(search_rounds,0) >= ?", (gate,))]
+        hint = ("Exhausted no_release: {n} search round(s) (library title, then alternate "
+                "titles) found nothing usable, so the built-in query likely never matches this "
+                "title. POST /search_releases with the original/romaji/alternate name (drop the "
+                "year) and grab a result — or /unfixable with a one-line reason if the release "
+                "genuinely does not exist anywhere.")
+        for m in nr_m:
+            rk = f"movie:{m['tmdb_id']}:no_release"
+            live.add(rk)
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.movie_context(m)
+            ctx["hint"] = hint.format(n=m.get("search_rounds") or 0)
+            if core.ticket(f"review-m{m['tmdb_id']}", f"{summary} — search exhausted", ctx,
+                           once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_status(m["tmdb_id"], "no_release", ai_status="pending", ai_at=now)
+        for e in nr_e:
+            rk = f"episode:{e['id']}:no_release"
+            live.add(rk)
+            if rk in seen:
+                continue
+            if room <= 0:
+                backlog += 1
+                continue
+            summary, ctx = agent.episode_context(e)
+            ctx["hint"] = hint.format(n=e.get("search_rounds") or 0)
+            if core.ticket(f"review-e{e['id']}", f"{summary} — search exhausted", ctx,
+                           once=False):
+                seen.add(rk)
+                room -= 1
+                paged += 1
+                core.set_ep_status(e["id"], "no_release", ai_status="pending", ai_at=now)
     # Forget records that are no longer in a problem state. The set only ever grew before, so a
     # title the AI FIXED stayed "already seen" forever — when it failed again months later for an
     # unrelated reason it was silently never escalated, breaking the contract that every failure
-    # reaches the AI within 3 minutes. It also grew without bound, while its sibling
-    # ai_tickets_filed.json is capped at 3000. Newly-paged keys are in `live` by construction, so
-    # intersecting keeps them.
+    # reaches the AI within 3 minutes. Withdraw their still-QUEUED tickets too: the ticket now
+    # describes a solved problem, wastes a dispatcher run, and — since core.ticket refuses a
+    # same-kind overwrite — would block this record's NEXT page for as long as it sat there.
     stale = seen - live
-    filed = True
-    if news:
-        key = hashlib.sha1(",".join(sorted(str(n["id"]) for n in news)).encode()).hexdigest()[:16]
-        # once=False: the per-record dedup above already decided these are NEW pages, and the
-        # (kind,key) guard would refuse the identical record-set a second time — see core.ticket.
-        filed = core.ticket("errors-review",
-                    f"{len(news)} NEW record(s) in error/review/sync_fail",
-                    {"records": news[:60], "total_new": len(news),
-                     "api": agent._api_hint(),
-                     "report_back": (
-                         "After handling each record, POST its outcome so it leaves the operator's "
-                         "manual-review queue: movies -> /movie/{id}/ai_result, episodes -> "
-                         "/episode/{id}/ai_result, body {\"status\":\"resolved|failed|needs_human\","
-                         "\"verdict\":\"one line\",\"action_taken\":\"what you did\"}. "
-                         "Use needs_human when a person must decide."),
-                     "diagnose_first": (
-                         "GET /movie/{id}/context or /episode/{id}/context — the record, a probe "
-                         "of both files (fps/duration/audio tracks), the log lines for it, and for "
-                         "episodes every donor file with the (season,episode) the parser read plus "
-                         "the series' episode list. Read this before acting; it usually IS the "
-                         "diagnosis and saves shelling into the container. The episode context also "
-                         "carries a `numbering` block (library S/E vs the release's S/E and absolute "
-                         "number): vo-merge now translates aired<->absolute itself from Sonarr, so "
-                         "`translated: true` means the search and the donor mapping already use the "
-                         "aired numbering and a plain /retry is the right move."),
-                     "actions": [
-                         "GET  /movie|episode/{id}/candidates — scored releases (incl. already-tried)",
-                         "POST /movie/{id}/sync {\"offset_ms\":0} — re-run auto sync-detect + merge",
-                         "POST /movie|episode/{id}/set_sync {\"offset_ms\":N,\"drift\":1.0427083} — "
-                         "apply a KNOWN offset and/or rate stretch with no detection. drift is the "
-                         "donor->base ratio = donor_fps/base_fps (25/23.976=1.0427083 film->PAL, "
-                         "23.976/25=0.9590410 PAL->film). Use when fps are known but detection failed.",
-                         "POST /episode/{id}/assign {\"path\":\"/abs/file.mkv\"} — map ONE donor file "
-                         "to this episode and queue the merge. Aired-vs-absolute numbering is now "
-                         "handled automatically (Sonarr's absoluteEpisodeNumber), so reach for this "
-                         "only when the automatic mapping can't apply — Sonarr has no absolute "
-                         "numbers for the series, or the pack numbers its files some third way. "
-                         "Read /context, work out the mapping, call this per episode.",
-                         "POST /search_releases {\"query\":\"...\"} — arbitrary Prowlarr query, returns "
-                         "links. For titles the built-in query never matches, try the original / "
-                         "romaji / English / alternate-transliteration name, or drop the year. Then "
-                         "act on a result with POST /movie|episode/{id}/grab {\"link\":...}.",
-                         "POST /movie|episode/{id}/another | /research | /retry | /ignore",
-                         "POST /movie|episode/{id}/unfixable {\"reason\":\"...\"} — give up, recording why"]},
-                    key=key, once=False)
-    if stale or (news and filed):
-        # Only remember records whose ticket actually reached the directory. Marking them seen
-        # when the write was refused (a previous errors-review.json still awaiting dispatch)
-        # meant they were never paged again once it was consumed.
+    for rk in stale:
+        parts = rk.split(":")                       # movie:<tmdb>:<st> / episode:<s:i:d>:<st>
+        ident = ":".join(parts[1:-1])
+        if agent.remove(f"review-{'m' if parts[0] == 'movie' else 'e'}{ident}"):
+            # The withdrawn page never HAPPENED — clear the pending stamp, or when this record
+            # next enters a problem state the staleness sweep would flip it to needs_human
+            # claiming "the AI did not respond" about a ticket nobody was ever given.
+            if parts[0] == "movie":
+                r = core.get_movie(int(ident))
+                if r and r.get("ai_status") == "pending":
+                    core.set_status(int(ident), r["status"], ai_status=None, ai_at=None)
+            else:
+                r = core.get_episode(ident)
+                if r and r.get("ai_status") == "pending":
+                    core.set_ep_status(ident, r["status"], ai_status=None, ai_at=None)
+    if stale or paged:
         seen &= live
         with open(seen_path, "w") as f:
             json.dump(sorted(seen), f)
         if stale:
             core.log(f"ai: {len(stale)} record(s) left their problem state -> can page again")
-    elif news and not filed:
-        core.log(f"ai: {len(news)} record(s) not paged yet (a ticket is still awaiting dispatch)")
+    if paged:
+        core.log(f"ai: paged {paged} record(s)")
+    if backlog:
+        core.log(f"ai: {backlog} record(s) waiting for ticket-queue room "
+                 f"(cap {cfg.get('ai_max_tickets', 50)})")
 
     # Staleness: a record the dispatcher took and never reported on within ai_stale_min, still in
     # a problem state -> it crashed or failed silently. Flag it for a human.
@@ -968,10 +1140,15 @@ def ai_health_check(cfg=None):
         with core.db() as c:
             stale_m = [dict(r) for r in c.execute(
                 "SELECT tmdb_id, status FROM movies WHERE ai_status='pending' AND ai_at < ? "
-                "AND status IN ('error','review','sync_fail')", (stale_cut,))]
+                "AND status IN ('error','review','sync_fail','no_release')", (stale_cut,))]
+            # 'review' belongs in this list for episodes exactly as it does for movies above:
+            # episodes reach `review` too (tv sync failures with sync_review on), and omitting
+            # it here left an episode whose ticket was consumed-but-unanswered showing "AI
+            # working" forever instead of flipping to needs_human. 'no_release' covers the
+            # exhausted-search pages the same way.
             stale_e = [dict(r) for r in c.execute(
                 "SELECT id, status FROM episodes WHERE ai_status='pending' AND ai_at < ? "
-                "AND status IN ('error','sync_fail')", (stale_cut,))]
+                "AND status IN ('error','review','sync_fail','no_release')", (stale_cut,))]
         stale_m = [m for m in stale_m if f"movie:{m['tmdb_id']}" not in queued]
         stale_e = [e for e in stale_e if f"episode:{e['id']}" not in queued]
         for m in stale_m:
@@ -980,10 +1157,247 @@ def ai_health_check(cfg=None):
             core.set_ep_status(e["id"], e["status"], ai_status="needs_human", ai_verdict=verdict)
         if stale_m or stale_e:
             core.log(f"ai staleness: {len(stale_m) + len(stale_e)} record(s) had no AI callback -> needs_human")
+            notify_needs_human(cfg)
         if queued:
             core.log(f"ai staleness: {len(queued)} record(s) still awaiting dispatch -> left pending")
     except Exception as ex:
         core.log(f"ai staleness check failed: {ex}")
+
+
+def notify_needs_human(cfg=None):
+    """One out-of-band digest for records the automation has HANDED BACK — the AI failed, or
+    never answered. This is the terminal rung of the escalation ladder: at that point the only
+    remaining actor is a person, and a pull-based panel is not how you reach one on an
+    unattended install. Rate-limited by notify's own per-kind limiter (a digest per day, not a
+    page per record); called on the staleness flip and on a failed/needs_human callback."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    rows = []
+    with core.db() as c:
+        for r in c.execute("SELECT title AS t, year AS s FROM movies "
+                           "WHERE ai_status IN ('failed','needs_human') ORDER BY ai_at DESC"):
+            rows.append(f"{r['t']} ({r['s']})")
+        for r in c.execute("SELECT series_title t, season s, episode e FROM episodes "
+                           "WHERE ai_status IN ('failed','needs_human') ORDER BY ai_at DESC"):
+            rows.append(f"{r['t']} S{r['s']:02d}E{r['e']:02d}")
+    if not rows:
+        notify.clear("needs_human")
+        return
+    body = f"{len(rows)} record(s) need a human decision:\n" + "\n".join(rows[:8])
+    if len(rows) > 8:
+        body += f"\n… and {len(rows) - 8} more (Review tab)"
+    notify.send("needs_human", f"{len(rows)} record(s) need you", body, cfg=cfg)
+
+
+# name -> when it was first seen unreachable (None entries are pruned on recovery). This is the
+# piece the per-cycle "qB error, returning" logs cannot provide: DURATION. Every stage already
+# degrades correctly for one cycle; nothing knew that cycle had been repeating for three days.
+DEP_DOWN = {}
+
+
+def _dep_targets(cfg):
+    """(name, probe) pairs for every dependency this install is configured to use. Probes use
+    their own short timeout — this runs inside the 3-minute sweep, and four unreachable services
+    at the clients' 60s default would eat the whole interval."""
+    import requests as _rq
+
+    def _arr(url, key, api):
+        return lambda: _rq.get(f"{url.rstrip('/')}/api/{api}/system/status",
+                               headers={"X-Api-Key": key}, timeout=10).raise_for_status()
+
+    out = [("prowlarr", _arr(cfg["prowlarr_url"], cfg["prowlarr_key"], "v1")),
+           ("radarr", _arr(cfg["radarr_url"], cfg["radarr_key"], "v3")),
+           ("qbittorrent", lambda: _rq.post(f"{cfg['qb_url'].rstrip('/')}/api/v2/auth/login",
+                                            data={"username": cfg["qb_user"],
+                                                  "password": cfg["qb_pass"]},
+                                            timeout=10).raise_for_status())]
+    if cfg.get("scope_series"):
+        out.append(("sonarr", _arr(cfg["sonarr_url"], cfg["sonarr_key"], "v3")))
+    return out
+
+
+def check_deps(cfg=None):
+    """Track how long each dependency has been continuously unreachable, and alarm past
+    `dep_down_alarm_min`. Recovery clears the alarm's limiter so the next outage pages again."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    grace = max(1, int(cfg.get("dep_down_alarm_min", 60))) * 60
+    now = time.time()
+    for name, probe in _dep_targets(cfg):
+        try:
+            probe()
+        except Exception as e:
+            since = DEP_DOWN.setdefault(name, now)
+            if now - since >= grace:
+                mins = int((now - since) / 60)
+                notify.send(f"dep-{name}", f"{name} unreachable for {mins}min",
+                            f"{name} has been continuously unreachable since "
+                            f"{time.strftime('%H:%M', time.localtime(since))} ({e}). The "
+                            f"pipeline degrades safely meanwhile (nothing is mis-recorded), "
+                            f"but no new work that needs it can proceed.", cfg=cfg)
+            continue
+        if name in DEP_DOWN:
+            core.log(f"deps: {name} reachable again "
+                     f"(was down {int((now - DEP_DOWN[name]) / 60)}min)")
+            DEP_DOWN.pop(name, None)
+            notify.clear(f"dep-{name}")
+
+
+# Set by check_disk (global floor) and by a per-pair headroom refusal, read by the merge
+# admission gate: while the floor is breached — or within `hold_until` of a pair that didn't
+# fit — no new mux starts. A mux is the one thing here that WRITES gigabytes, and rc≥2
+# half-writes compound the very disk-full that causes them. `hold_until` exists because a
+# 60 GB pair can fail to fit while the GLOBAL floor is fine: without a cooldown the worker
+# would re-claim, re-probe and re-refuse the same pair every ten seconds.
+DISK_STATE = {"low": False, "free_gb": None, "hold_until": 0, "paths": {}}
+
+
+def disk_headroom_ok(paths, outdir, cfg):
+    """Will the mux output plausibly fit? The output is roughly the inputs' sum (both files'
+    tracks land in it before the swap frees anything), plus the floor kept free for everything
+    else. Returns (ok, free_bytes, need_bytes); unmeasurable answers ok — don't block on
+    missing evidence, the mux failure path still cleans up."""
+    try:
+        need = sum(os.path.getsize(p) for p in paths if p and os.path.exists(p)) * 1.05
+        need += max(0.0, float(cfg.get("disk_floor_gb", 10))) * 1e9
+        free = shutil.disk_usage(outdir).free
+        return free >= need, free, need
+    except OSError:
+        return True, None, None
+
+
+def hold_for_disk(kind, ident, free, need, cfg):
+    """Re-queue a merge whose output can't fit, alarm once, and cool the worker off. The record
+    goes back to `ready` un-penalised — nothing is wrong with the pair — and merging resumes by
+    itself when space frees (check_disk wakes the worker on recovery)."""
+    from . import notify
+    DISK_STATE["hold_until"] = time.time() + 900
+    setter = core.set_status if kind == "movie" else core.set_ep_status
+    setter(ident, "ready", progress="waiting for disk space")
+    core.log(f"merge {ident}: {(free or 0) / 1e9:.1f} GB free < {(need or 0) / 1e9:.1f} GB "
+             f"needed -> held for disk space")
+    notify.send("disk", "merges held: not enough space for the next mux",
+                f"The next merge needs ~{(need or 0) / 1e9:.1f} GB (inputs + floor) but only "
+                f"{(free or 0) / 1e9:.1f} GB is free. Merges hold and retry on their own; "
+                f"free some space to resume sooner.", cfg=cfg)
+
+
+def _free_gb(path):
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except OSError:
+        return None                       # an absent mount is the prune guard's problem, not ours
+
+
+def check_disk(cfg=None):
+    """Hold merging when the LIBRARY mount runs out of room, and alarm on either filesystem.
+
+    Only the library mount gates merging, because that is where the output is written: a mux
+    builds the whole file in `<libdir>/_merged/` before swapping it in. `/config` holds the DB,
+    the logs and the tickets — megabytes — and taking the WORST of the two (which this did)
+    meant a tight appdata share silently held every merge in the app while the dashboard showed
+    terabytes free on the disk that actually mattered. That is a stop with no symptom, which is
+    the one thing this codebase keeps proving it cannot afford.
+
+    /config still gets a floor of its own, an order of magnitude smaller: a full appdata share
+    breaks SQLite, so it deserves an alarm — just not a merge freeze it cannot fix."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    floor = max(0.0, float(cfg.get("disk_floor_gb", 10)))
+    media_path = cfg.get("media_mount", "/media")
+    media, conf = _free_gb(media_path), _free_gb(core.CONFIG_DIR)
+    DISK_STATE["paths"] = {"media": media, "config": conf}
+    DISK_STATE["free_gb"] = media
+    # /config: alarm only, on a floor sized for a database rather than for 60 GB remuxes
+    conf_floor = min(floor, 2.0)
+    if conf is not None and conf_floor and conf < conf_floor:
+        notify.send("disk-config", f"/config is nearly full ({conf:.1f} GB free)",
+                    f"{core.CONFIG_DIR} is below {conf_floor} GB. That is where the database, "
+                    f"the logs and the AI tickets live — SQLite fails when it fills. Merging is "
+                    f"NOT held for this (the output is written to the library, not here).",
+                    cfg=cfg)
+    elif conf is not None:
+        notify.clear("disk-config")
+    if media is None:
+        return
+    if floor and media < floor:
+        if not DISK_STATE["low"]:
+            core.log(f"disk: {media:.1f} GB free on {media_path} < floor {floor} GB "
+                     f"-> holding new merges")
+        DISK_STATE["low"] = True
+        notify.send("disk", f"low disk: {media:.1f} GB free",
+                    f"{media_path} is below the {floor} GB floor. New merges are held (a mux "
+                    f"writes the whole output before the swap); downloads and scans continue. "
+                    f"Merging resumes on its own once space frees.", cfg=cfg)
+    elif DISK_STATE["low"]:
+        core.log(f"disk: {media:.1f} GB free on {media_path} — merges resume")
+        DISK_STATE["low"] = False
+        notify.clear("disk")
+        MERGE_WAKE.set()
+
+
+def merge_hold_reason(cfg=None):
+    """Why nothing is merging right now, in words, or None when the queue is simply empty.
+
+    "MERGING 0/2 · idle" next to five finished downloads is indistinguishable from a broken
+    app — the operator has no way to tell a deliberate hold from a dead worker. Every brake that
+    can stop the merge worker answers here, and the dashboard shows it."""
+    cfg = cfg or core.load_config()
+    if not cfg.get("enabled"):
+        return "the pipeline is disabled"
+    if cfg.get("paused"):
+        return "paused"
+    if DISK_STATE.get("low"):
+        free = DISK_STATE.get("free_gb")
+        return (f"low disk: {free:.0f} GB free on {cfg.get('media_mount', '/media')}, "
+                f"floor is {cfg.get('disk_floor_gb', 10)} GB"
+                if free is not None else "low disk")
+    left = DISK_STATE.get("hold_until", 0) - time.time()
+    if left > 0:
+        return f"waiting for disk space (retrying in {int(left / 60) + 1} min)"
+    from . import scheduler
+    if not scheduler.merge_workers_alive():
+        return "no merge worker is running"
+    return None
+
+
+def check_dispatcher(cfg=None):
+    """Alarm when tickets are queuing and the dispatcher shows no sign of life.
+
+    Two independent signals, because two kinds of dispatcher exist: the sidecar keeps a
+    heartbeat (proof), a legacy host cron does not (only the queue drains). So the alarm needs
+    BOTH the oldest queued ticket to have waited past `ai_dispatcher_alarm_min` AND the
+    heartbeat to be absent or older than that — a live sidecar with a deep queue is slow, not
+    dead, and a working hourly cron never lets a ticket age past a couple of hours."""
+    from . import notify
+    cfg = cfg or core.load_config()
+    st = agent.status(cfg)
+    if not st["enabled"]:
+        return
+    limit = max(1, int(cfg.get("ai_dispatcher_alarm_min", 120))) * 60
+    hb = st.get("heartbeat_age")
+    queue_stuck = st["waiting"] > 0 and (st["oldest_age"] or 0) > limit
+    if queue_stuck and (hb is None or hb > limit):
+        seen = ("no heartbeat has ever been written" if hb is None
+                else f"last heartbeat {int(hb / 60)}min ago")
+        notify.send("dispatcher", "AI dispatcher is not consuming tickets",
+                    f"{st['waiting']} ticket(s) queued, oldest {int((st['oldest_age'] or 0) / 60)}"
+                    f"min; {seen}. Failures are piling up unexamined — every record will "
+                    f"eventually flip to needs_human. Check the dispatcher (sidecar container "
+                    f"or host user script).", cfg=cfg)
+    elif not queue_stuck and (hb is None or hb <= limit):
+        notify.clear("dispatcher")
+
+
+def watchdogs(cfg=None):
+    """The self-monitoring pass: is the automation ITSELF healthy? Runs from the 3-minute sweep,
+    each check isolated so one failing probe can't hide the others."""
+    cfg = cfg or core.load_config()
+    for fn in (check_dispatcher, check_disk, check_deps):
+        try:
+            fn(cfg)
+        except Exception as e:
+            core.log(f"watchdog {fn.__name__} error: {e}")
 
 
 def no_seed_public(cfg=None):
@@ -1059,6 +1473,69 @@ def _sync_fail_reason(m, fps_diff, drift, base_fps, donor_fps):
     return "low-confidence sync"
 
 
+def wide_probe_rescue(base, donor, base_ai, donor_ai, dur, fps_diff, cfg, tag="",
+                      on_progress=None, **fps_kw):
+    """The first line of the AI runbook, executed by the pipeline itself: before a sync failure
+    is PARKED for an actor, re-run detection once at ±`sync_probe_lag_s`.
+
+    Both ticket templates tell the agent "on any couldn't-sync, call /sync_probe FIRST, because
+    the merge path only searches ±sync_max_lag_s and a consistent offset beyond that reads as a
+    different cut". That instruction is deterministic — there is no judgement in it — so making
+    an agent (or, with the dispatcher down, a human) execute it was pure overhead. Run only on
+    the attempt that would spend the retry budget: earlier failures are cheaper to answer with a
+    different release, which needs no detection at all.
+
+    Returns (offset_ms, conf, method, drift) when the wider search resolves the pair — the
+    caller merges with it instead of parking — else None, and the parking verdict now really
+    does mean "windows disagree even at ±300s", i.e. a genuinely different cut."""
+    if not cfg.get("sync_wide_probe", True):
+        return None
+    lag = int(cfg.get("sync_probe_lag_s", 300))
+    if lag <= int(cfg.get("sync_max_lag_s", 120)):
+        return None                       # nothing wider to try than what already failed
+    wide = dict(cfg, sync_max_lag_s=lag)
+    core.log(f"sync{tag}: parking rescue — re-searching at ±{lag}s before giving this pair up")
+    if on_progress:
+        on_progress(f"sync: wide probe ±{lag}s")
+    m, conf, method, drift = sync.detect(base, donor, base_ai, donor_ai, dur, wide,
+                                         tag=f"{tag} wide", on_progress=on_progress, **fps_kw)
+    if m is None or (fps_diff and not drift):
+        return None
+    core.log(f"sync{tag}: wide probe resolved {int(m):+d}ms ({method} conf {conf:.2f}) "
+             f"-> merging with it")
+    return int(round(m)), conf, method, drift
+
+
+# How long a movie may sit in a mid-transition state before it is presumed crashed. These two
+# states had NO reader at all: stage_search walks only `pending`, stage_finish reconciles only
+# `downloading` and `merging` — so a crash between claiming pending->searching and writing the
+# outcome, or between the `grabbed` write and qB accepting the add, stranded the record forever
+# (the orphan sweep can't even see a `grabbed` one: dl_hash isn't written until `downloading`).
+STUCK_LIMITS = {"searching": 900, "grabbed": 1800}
+
+
+def sweep_stuck(cfg=None):
+    """Recover movie records stranded in `searching`/`grabbed` by a crash mid-transition.
+
+    Deliberately does NOT blocklist: the release may never have been grabbed at all, and burning
+    a healthy release because the process died is how a title loses its best candidate. In
+    approval mode `grabbed` is the waiting room for a human decision, so it is exempt there.
+    `expect=` guards the write, so a record that moved on between read and write is left alone.
+    (Episodes never pass through these states — the TV search writes downloading directly.)"""
+    cfg = cfg or core.load_config()
+    now = time.time()
+    for st, limit in STUCK_LIMITS.items():
+        if st == "grabbed" and cfg.get("grab_mode") != "auto":
+            continue
+        for mv in core.get_movies(st):
+            age = now - (mv.get("updated") or 0)
+            if age < limit:
+                continue
+            if core.set_status(mv["tmdb_id"], "pending", expect=st, progress=""):
+                core.log(f"stuck {mv['tmdb_id']}: in `{st}` for {int(age / 60)}min with no "
+                         f"outcome (crash mid-transition?) -> back to pending")
+
+
 def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
     """A grabbed release didn't sync. Blocklist it, delete its download, and re-search for
     another release — or land in `final` once max_sync_retries is spent.
@@ -1066,12 +1543,9 @@ def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
     `final="review"` asks a human instead of giving up, and KEEPS the donor: the whole point of
     that state is that someone (or the on-call AI, via /sync_probe then /set_sync) can still
     align this exact pair, and that needs the file to still be there."""
-    import json as _json
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
-    tried = _json.loads(mv.get("tried") or "[]")
-    if mv.get("dl_id") and mv["dl_id"] not in tried:
-        tried.append(mv["dl_id"])
+    tried = blocklist(mv)
     attempts = (mv.get("attempts") or 0) + 1
     spent = attempts >= cfg.get("max_sync_retries", 4)
     keep_donor = spent and final == "review"
@@ -1083,11 +1557,11 @@ def reject_and_retry(tmdb_id, reason, cfg=None, delta=None, final="sync_fail"):
         except Exception:
             pass
     if spent:
-        core.set_status(tmdb_id, final, tried=_json.dumps(tried), attempts=attempts, progress="",
+        core.set_status(tmdb_id, final, tried=tried, attempts=attempts, progress="",
                         sync_delta=delta, error=f"{reason}; no compatible release after {attempts} tries")
         core.log(f"merge {tmdb_id}: {final} after {attempts} tries ({reason})")
     else:
-        core.set_status(tmdb_id, "pending", tried=_json.dumps(tried), attempts=attempts,
+        core.set_status(tmdb_id, "pending", tried=tried, attempts=attempts,
                         **DONOR_RESET, error=None)
         core.log(f"merge {tmdb_id}: {reason} -> trying another release (attempt {attempts}/{cfg.get('max_sync_retries',4)})")
 
@@ -1098,14 +1572,10 @@ def retry_movie(tmdb_id, cfg=None):
     search. A bare flip to 'pending' would re-search and can pick the very same release again.
     `attempts` is reset because a human/AI asking for a retry means "try again" — a sync_fail
     record has already spent its budget and would otherwise fail straight back to sync_fail."""
-    import json as _json
     cfg = cfg or core.load_config()
     mv = core.get_movie(tmdb_id)
     if not mv:
         return False
-    tried = _json.loads(mv.get("tried") or "[]")
-    if mv.get("dl_id") and mv["dl_id"] not in tried:
-        tried.append(mv["dl_id"])
     if mv.get("dl_hash"):
         try:
             qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
@@ -1113,7 +1583,7 @@ def retry_movie(tmdb_id, cfg=None):
             core.log(f"retry {tmdb_id}: dropped failed donor {str(mv['dl_hash'])[:12]}")
         except Exception as ex:
             core.log(f"retry {tmdb_id}: donor drop failed: {ex}")
-    core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
+    core.set_status(tmdb_id, "pending", error=None, tried=blocklist(mv), attempts=0,
                     **DONOR_RESET, **AI_RESET, progress="")
     return True
 
@@ -1212,6 +1682,311 @@ def recheck_settled(scope="all", states=REOPEN_STATES + RETRY_STATES, cfg=None, 
     return st
 
 
+# ---------------------------------------------------------------- REPAIR (audio-less files)
+# The one probe error that describes the FILE rather than our tools: mkvmerge read the container
+# and found no audio, and ffprobe independently agreed. Nothing else may authorise a deletion —
+# "unsupported container" and "audio mkvmerge can't read" mean the file is probably fine and we
+# simply can't mux it, and "unreadable" means we know nothing at all.
+BROKEN_ERR = "no audio track"
+
+
+def _owner_index(cfg, paths):
+    """Map each /media path to the *arr record that owns it.
+
+    Radarr answers in one call (`movieFile` is embedded in the movie). Sonarr has no
+    library-wide file endpoint, so only the series whose folder actually contains one of `paths`
+    is queried — a repair of 30 files costs a handful of calls, not one per series."""
+    out, want = {}, set(paths)
+    try:
+        for m in Radarr(cfg["radarr_url"], cfg["radarr_key"]).movies() or []:
+            mf = m.get("movieFile") or {}
+            p = media.to_media(mf.get("path"), cfg) if mf.get("path") else None
+            if p in want:
+                out[p] = {"arr": "radarr", "kind": "movie", "id": m["id"],
+                          "file_id": mf["id"], "title": m.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Radarr lookup failed: {e}")
+    rest = [p for p in want if p not in out]
+    if not rest:
+        return out
+    try:
+        s = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        folders = []
+        for se in s.series() or []:
+            sp = media.to_media(se.get("path"), cfg)
+            if sp:
+                folders.append((sp.rstrip("/") + "/", se))
+        cache = {}
+        for p in rest:
+            se = next((x for pre, x in folders if p.startswith(pre)), None)
+            if not se:
+                continue
+            sid = se["id"]
+            if sid not in cache:
+                efs = {}
+                for ef in s.episode_files(sid) or []:
+                    mp = media.to_media(ef.get("path"), cfg)
+                    if mp:
+                        efs[mp] = ef["id"]
+                eps = {}
+                for e in s.episodes(sid) or []:
+                    if e.get("episodeFileId"):
+                        eps.setdefault(e["episodeFileId"], []).append(e["id"])
+                cache[sid] = (efs, eps)
+            efs, eps = cache[sid]
+            fid = efs.get(p)
+            if fid:
+                out[p] = {"arr": "sonarr", "kind": "episode", "id": sid, "file_id": fid,
+                          "episode_ids": eps.get(fid, []), "title": se.get("title") or ""}
+    except Exception as e:
+        core.log(f"repair: Sonarr lookup failed: {e}")
+    return out
+
+
+def run_repair(paths, cfg):
+    """The REAL audio-less repair pass — every guard the endpoint documents, callable by the
+    schedule too: re-probe with the cache bypassed, only BROKEN_ERR qualifies, deletion goes
+    through the owning *arr (so a replacement is searched), unknown files are skipped. The
+    caller holds SCAN_LOCK; progress lands in REPAIR_STATE either way."""
+    st = REPAIR_STATE
+    st.update(running=True, started=time.time(), finished=0, phase="verifying",
+              checked=0, total=len(paths), deleted=0, searched=0,
+              skipped=[], done=[], error=None)
+    try:
+        radarr = Radarr(cfg["radarr_url"], cfg["radarr_key"])
+        sonarr = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
+        confirmed = []
+        for p in paths:
+            st["checked"] += 1
+            if not os.path.exists(p):
+                st["skipped"].append({"path": p, "reason": "already gone"})
+                continue
+            _, _, err = media.audit(p, refresh=True)    # never trust the cache for a delete
+            if err != BROKEN_ERR:
+                st["skipped"].append({"path": p,
+                                      "reason": f"re-probe says: {err or 'the file is fine'}"})
+                continue
+            confirmed.append(p)
+        st["phase"] = "matching to Radarr/Sonarr"
+        owners = _owner_index(cfg, confirmed) if confirmed else {}
+        st["phase"] = "deleting"
+        for p in confirmed:
+            o = owners.get(p)
+            if not o:
+                st["skipped"].append({"path": p, "reason":
+                    "not in Radarr/Sonarr — deleting it would just lose the title"})
+                continue
+            try:
+                if o["arr"] == "radarr":
+                    radarr.delete_movie_file(o["file_id"])
+                    radarr.search([o["id"]])
+                else:
+                    sonarr.delete_episode_file(o["file_id"])
+                    if o["episode_ids"]:
+                        sonarr.search(o["episode_ids"])
+                    else:                  # no episode row points at it — re-scan instead
+                        sonarr.rescan(o["id"])
+                core.forget_probe(p)
+                st["deleted"] += 1
+                st["searched"] += 1
+                st["done"].append({"path": p, "title": o["title"], "kind": o["kind"]})
+                core.log(f"repair: deleted audio-less {o['kind']} "
+                         f"{o['title'] or os.path.basename(p)} and asked "
+                         f"{o['arr'].title()} to search again")
+            except Exception as e:
+                st["skipped"].append({"path": p, "reason": f"delete failed: {e}"})
+        core.prune_missing_records()
+        st["phase"] = "done"
+        core.log(f"repair: {st['deleted']} file(s) deleted and re-searched, "
+                 f"{len(st['skipped'])} skipped")
+    except Exception as e:
+        st["error"] = str(e)
+        st["phase"] = "error"
+        core.log(f"repair error: {e}")
+    finally:
+        st.update(running=False, finished=time.time())
+
+
+def start_repair(paths, cfg):
+    """Run the real repair pass on a worker thread under SCAN_LOCK (it re-probes every
+    candidate, so it is minutes-long like a scan — one heavy file pass at a time). Returns False
+    when a scan or repair is already running. Shared by the endpoint and `auto_repair`."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            run_repair(paths, cfg)
+        finally:
+            SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
+def abort_merge(kind, ident):
+    """Stop a merge. Returns what actually happened: "killed" (it was running — its decode or
+    mux was killed and the worker parks it as `review`), "dequeued" (it was only waiting, so it
+    is taken off the queue before the worker can claim it), or "not running".
+
+    Aborting a QUEUED item has to be a real transition, not a no-op: the worker polls every ten
+    seconds, so "it isn't running yet" is a race, not a state."""
+    key = f"{'m' if kind == 'movie' else 'e'}{ident}"
+    if core.cancel_job(key):
+        return "killed"
+    claim = core.claim_movie if kind == "movie" else core.claim_episode
+    if claim(ident, "ready", "review", progress="",
+             error="taken off the merge queue by the operator",
+             ai_status="needs_human", ai_verdict="merge cancelled by the operator"):
+        core.log(f"abort: {key} taken off the merge queue")
+        return "dequeued"
+    return "not running"
+
+
+# Everything a record accumulates while the pipeline works on it. Reset puts a title back to the
+# state it had before vo-merge ever saw it — EXCEPT that it never touches the library file
+# itself (see reset_records) or `priority`, which is a standing instruction from the operator,
+# not pipeline residue.
+RESET_FIELDS = dict(DONOR_RESET, **AI_RESET, tried="[]", attempts=0, search_rounds=0,
+                    error=None, progress="", candidate_title=None, candidate_score=None,
+                    candidate_seeders=None, merge_kind=None, added_langs="", added_subs="",
+                    merged_file=None, sync_delta=None)
+
+
+def reset_records(movies=(), episodes=(), cfg=None, drop_downloads=True):
+    """Start a title over: stop what is running, throw away the DOWNLOADS, and clear every trace
+    the pipeline left on the records — blocklist, attempt counters, candidates, sync
+    measurements, AI verdicts, merge outcomes — so the next scan+search runs as if the title had
+    just been discovered.
+
+    **The library files are never touched.** Those are the operator's media, and the only
+    endpoint in this app that may delete media is the audio-less repair, which has its own
+    guards. What a reset CANNOT undo is a graft that already happened: tracks muxed into a
+    library file are part of that file now. That is not a gap in the reset — it is why the reset
+    is followed by a re-read, which records what each file ACTUALLY contains today and makes
+    that the honest starting point.
+
+    Donors are deleted with their files (they are throwaway downloads by construction), unless
+    `drop_downloads=False`."""
+    cfg = cfg or core.load_config()
+    movies, episodes = list(movies), list(episodes)
+    hashes, aborted = set(), 0
+    for m in movies:
+        if abort_merge("movie", m["tmdb_id"]) != "not running":
+            aborted += 1
+        if m.get("dl_hash"):
+            hashes.add(str(m["dl_hash"]).lower())
+    for e in episodes:
+        if abort_merge("episode", e["id"]) != "not running":
+            aborted += 1
+        if e.get("dl_hash"):
+            hashes.add(str(e["dl_hash"]).lower())
+    dropped = 0
+    if drop_downloads and hashes:
+        try:
+            qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
+            qb.delete(sorted(hashes), delete_files=True)
+            dropped = len(hashes)
+        except Exception as e:
+            core.log(f"reset: qB delete failed ({e}) — records still reset")
+    for m in movies:
+        core.set_status(m["tmdb_id"], "pending", **RESET_FIELDS)
+    for e in episodes:
+        core.set_ep_status(e["id"], "pending", **RESET_FIELDS)
+    core.log(f"reset: {len(movies)} movie(s) / {len(episodes)} episode(s) back to pending, "
+             f"{dropped} donor torrent(s) deleted, {aborted} in-flight merge(s) stopped")
+    return {"movies": len(movies), "episodes": len(episodes), "donors_deleted": dropped,
+            "merges_stopped": aborted}
+
+
+def prune_library(cfg=None):
+    """Drop probes and records whose file has VANISHED — the delete half of keeping the
+    inventory honest. A scan only ever adds and updates, so a title removed from the library
+    kept being counted (and kept dragging the coverage percentage down) until an operator
+    pressed a re-read; on an unattended install that is forever. Shared by every /rescan and
+    the daily housekeeping job, so deletions are swept on a schedule like everything else.
+
+    Guarded on the mount actually looking alive: with /media unmounted every path reads as
+    missing and a blind prune would wipe the DB. Mid-flight records are separately protected by
+    core._PRUNE_SKIP — a merge swaps a new file in, so its library path can be briefly absent.
+
+    Returns (probes, movie_records, episode_records) pruned, or None when the mount looked dead
+    and nothing was touched."""
+    cfg = cfg or core.load_config()
+    mount = (cfg.get("media_mount") or "/media").rstrip("/")
+    try:
+        alive = os.path.isdir(mount) and bool(os.listdir(mount))
+    except OSError:
+        alive = False
+    if not alive:
+        core.log(f"prune: {mount} is missing or empty (unmounted?) — skipping, nothing dropped")
+        return None
+    probes = core.prune_missing_probes()
+    mv, ep = core.prune_missing_records()
+    if probes or mv or ep:
+        core.log(f"prune: dropped {probes} probe(s) and {mv} movie / {ep} episode record(s) "
+                 f"whose file is gone")
+    return probes, mv, ep
+
+
+def revisit_ignored(cfg=None):
+    """Re-examine long-`ignored` records: one cheap candidates query each, capped per day.
+
+    `ignored` is a deliberate give-up and rightly survives every rescan — but its usual reason,
+    "no release exists", decays as truth: indexers gain releases constantly. Without a revisit
+    the verdict is permanent by accident. A record whose search NOW finds a usable candidate
+    re-opens (fresh budgets, verdict cleared — the give-up is over); one that still finds
+    nothing is re-stamped and sleeps another `ignored_revisit_days`. The daily cap keeps a large
+    ignored backlog from turning the housekeeping hour into an indexer hammering."""
+    cfg = cfg or core.load_config()
+    days = float(cfg.get("ignored_revisit_days", 90))
+    if days <= 0 or not cfg.get("enabled"):
+        return 0
+    cap = max(1, int(cfg.get("ignored_revisit_per_day", 10)))
+    cut = time.time() - days * 86400
+    with core.db() as c:
+        movies = [dict(r) for r in c.execute(
+            "SELECT * FROM movies WHERE status='ignored' AND COALESCE(revisit_at, updated, 0) < ? "
+            "ORDER BY COALESCE(revisit_at, updated) LIMIT ?", (cut, cap))]
+        eps = [dict(r) for r in c.execute(
+            "SELECT * FROM episodes WHERE status='ignored' AND COALESCE(revisit_at, updated, 0) < ? "
+            "ORDER BY COALESCE(revisit_at, updated) LIMIT ?", (cut, max(0, cap - len(movies))))]
+    reopened = 0
+    for mv in movies:
+        try:
+            cand = candidates(mv["tmdb_id"], cfg)
+        except SearchUnavailable:
+            core.log("revisit: indexer unavailable -> abandoning this pass")
+            return reopened
+        if cand and cand[0]["score"] >= cfg["score_threshold"] \
+                and cand[0]["seeders"] >= cfg["min_seeders"]:
+            core.set_status(mv["tmdb_id"], "pending", expect="ignored", attempts=0, error=None,
+                            progress="", revisit_at=time.time(), **DONOR_RESET, **AI_RESET)
+            reopened += 1
+            core.log(f"revisit: {mv.get('title')} — a usable release now exists -> re-opened")
+        else:
+            core.set_status(mv["tmdb_id"], "ignored", revisit_at=time.time())
+    from . import tv as _tv
+    for e in eps:
+        try:
+            cand = _tv.episode_candidates(e["id"], cfg)
+        except SearchUnavailable:
+            core.log("revisit: indexer unavailable -> abandoning this pass")
+            return reopened
+        if any(x["seeders"] >= cfg["min_seeders"] and not x["tried"] for x in cand):
+            core.set_ep_status(e["id"], "pending", expect="ignored", attempts=0, error=None,
+                               progress="", revisit_at=time.time(), **DONOR_RESET, **AI_RESET)
+            reopened += 1
+            core.log(f"revisit: {e.get('series_title')} "
+                     f"S{e['season']:02d}E{e['episode']:02d} -> re-opened")
+        else:
+            core.set_ep_status(e["id"], "ignored", revisit_at=time.time())
+    if movies or eps:
+        core.log(f"revisit: checked {len(movies) + len(eps)} ignored record(s), "
+                 f"{reopened} re-opened")
+    return reopened
+
+
 # ---------------------------------------------------------------- MUX (mkvmerge)
 def _unlink(path):
     try:
@@ -1236,10 +2011,16 @@ def run_mux(cmd, out, cfg=None):
     cfg = cfg or core.load_config()
     timeout = max(60, int(cfg.get("mux_timeout_min", 240)) * 60)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = core.run_proc(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         _unlink(out)
         return False, f"mkvmerge exceeded {timeout // 60}min and was killed"
+    except core.Aborted:
+        # An abort must not leave a half-written file in the library folder any more than a
+        # failure does — and Aborted is a BaseException precisely so the handler below can't
+        # quietly turn a cancellation into "mkvmerge failed to start".
+        _unlink(out)
+        raise
     except Exception as e:
         _unlink(out)
         return False, f"mkvmerge failed to start: {e}"
@@ -1345,6 +2126,169 @@ def resolve_donor_path(cfg, dl_hash, cached, tag=""):
 
 
 # ---------------------------------------------------------------- MERGE + FINISH
+def graft_gains(bi, fi, added_a, added_s, kind, cfg, orig_name, orig_codes):
+    """What this merge would give the LIBRARY FILE that it still lacks — the set that must be
+    non-empty for the merge to be worth running at all. Returns (gains, library_missing).
+
+    `wanted_audio`/`wanted_subs` ask what the BASE lacks, and the base is whichever file won the
+    video-quality comparison. When the RELEASE wins, its shortfalls — usually English, which the
+    library already has — read as things to graft, and nothing anywhere asked whether the output
+    helps the record's actual gap. That is how a VOSTFR donor (original audio + French subs, for
+    a file missing only the French DUB) got a full sync scan and a mux: the library's own eng
+    track was "wanted" by the release, the output still lacked `fre`, and the library file's
+    video had been replaced by the rip along the way.
+
+    So judge the OUTPUT (base languages plus everything grafted) against the LIBRARY file's own
+    remaining gap — whichever direction the quality comparison chose. The deliberate VO fallback
+    stays a gain in its own right: adding the original-language track a library file LACKS is
+    worth a merge even though it can't close the profile gap (Kraken's Norwegian when no English
+    exists)."""
+    lib_a, lib_s = media.langs(fi)
+    miss_a, miss_s = media.gap_langs(lib_a, lib_s, kind, cfg, orig_name)
+    out_a = set(media.langs(bi)[0]) | set(added_a)
+    out_s = set(media.langs(bi)[1]) | set(added_s)
+    gains = ((out_a & set(miss_a)) | (out_s & set(miss_s))
+             | ((out_a & set(orig_codes)) - lib_a))
+    return gains, miss_a + miss_s
+
+
+def qc_grafted_audio(out, n_base_auds, dur, cfg, tag=""):
+    """Verify the mux we just wrote, before it replaces the library file: cross-correlate the
+    FIRST grafted audio track against the base's own track inside the single output file.
+
+    A confident-but-wrong sync is the one failure nothing downstream can ever detect. The gap
+    decision sees the language as present, the record closes as merged, the donor is deleted,
+    the original was replaced in place — and a re-merge can't fix it, because a new donor
+    "contributes nothing" for a language that reads as covered. The only detector left was a
+    human watching the film. This check is the machine version of that viewing: mkvmerge orders
+    output tracks by input, so the base's audio occupies indexes 0..n_base_auds-1 and the first
+    grafted track sits at n_base_auds; if the applied offset was right, the residual between
+    them is ~0 (different languages correlate through music and effects — the same signal
+    `resync_movie` has always used to repair these by hand).
+
+    Asymmetric on purpose: rejection requires CONFIDENT evidence of misalignment (points at
+    conf ≥ qc_min_conf, agreeing with each other or falling on a line). An inconclusive
+    measurement — dialogue-free windows, wildly different mixes, scattered noise — accepts the
+    merge, because burning the retry budget on absent evidence would reject good merges of
+    quiet films.
+
+    Two failure signatures, told apart from the same points (`sync.audio_windows`):
+    - a wrong CONSTANT offset: the residuals agree on one value beyond `qc_max_offset_ms`;
+    - a wrong STRETCH ratio: the residual GROWS across the runtime. The old consensus-based
+      check collapsed the windows into one verdict, so this exact signature — windows that
+      disagree *linearly* — read as "inconclusive" and a wrong drift sailed through. A line
+      through the confident points whose span across the runtime exceeds the limit is a
+      drifting graft (R² ≥ 0.85 with 3+ points; two points must disagree by 2× the limit,
+      since any two points fit a line perfectly).
+
+    Returns (ok, residual_ms|None, conf)."""
+    if not cfg.get("postmerge_qc", True) or n_base_auds < 1:
+        return True, None, 0.0
+    import statistics
+    try:
+        pts = sync.audio_windows(out, 0, n_base_auds, dur, cfg, tag=f"{tag} qc")
+    except Exception as e:
+        core.log(f"qc{tag}: measurement failed ({e}) — inconclusive, accepting")
+        return True, None, 0.0
+    min_conf = float(cfg.get("qc_min_conf", 0.35))
+    lim = int(cfg.get("qc_max_offset_ms", 1500))
+    good = [(t, m, c) for t, m, c in pts if c >= min_conf]
+    if not good:
+        best = max((c for _, _, c in pts), default=0.0)
+        core.log(f"qc{tag}: inconclusive (best conf {best:.2f}) — accepting")
+        return True, None, best
+    conf = max(c for _, _, c in good)
+    if len(good) >= 2:
+        b, _a, r2 = sync._linfit([t for t, _, _ in good], [m for _, m, _ in good])
+        span = abs(b) * (dur or 0)
+        if span > lim and (r2 >= 0.85 if len(good) >= 3 else span > 2 * lim):
+            core.log(f"qc{tag}: grafted audio DRIFTS ~{int(span)}ms across the runtime "
+                     f"(R²={r2:.2f}, conf {conf:.2f}) — rejecting before it reaches the library")
+            return False, int(round(span)), conf
+        med = statistics.median(m for _, m, _ in good)
+        agree = [m for _, m, _ in good if abs(m - med) <= 300]
+        if len(agree) >= 2 and abs(med) > lim:
+            core.log(f"qc{tag}: grafted audio is OFF by {int(med):+d}ms (conf {conf:.2f}) — "
+                     f"rejecting before it reaches the library")
+            return False, int(round(med)), conf
+        if len(agree) >= 2:
+            core.log(f"qc{tag}: grafted audio aligned ({int(med):+d}ms residual, conf {conf:.2f})")
+            return True, int(round(med)), conf
+        core.log(f"qc{tag}: confident points scatter with no pattern — inconclusive, accepting")
+        return True, int(round(med)), conf
+    m = good[0][1]
+    if abs(m) > lim:
+        core.log(f"qc{tag}: grafted audio is OFF by {int(m):+d}ms (single window, conf "
+                 f"{conf:.2f}) — rejecting before it reaches the library")
+        return False, int(round(m)), conf
+    core.log(f"qc{tag}: grafted audio aligned ({int(m):+d}ms residual, conf {conf:.2f})")
+    return True, int(round(m)), conf
+
+
+RECYCLE_DIRNAME = ".vo-merge-recycle"
+
+
+def recycle(path, cfg=None):
+    """Move a library file whose CONTENT is about to be discarded into the recycle area, keyed
+    by its library-relative path, instead of deleting it.
+
+    Only the replacement outcomes need this (`_place_multi`, the TV direct remux): there the
+    download *becomes* the library file and the original's video is genuinely gone. A graft
+    output carries every track the base had, so recycling those would double the disk cost of
+    every merge for nothing. The dot-name keeps Plex from indexing the area; the mtime is
+    re-stamped so the TTL counts from recycling, not from when the film was ripped years ago.
+
+    Returns the recycled path, or None when recycling is off/impossible — callers then fall
+    back to the old destructive behaviour rather than blocking the pipeline."""
+    cfg = cfg or core.load_config()
+    if float(cfg.get("recycle_keep_days", 7)) <= 0:
+        return None
+    mount = cfg.get("media_mount", "/media")
+    try:
+        rel = os.path.relpath(path, mount)
+        if rel.startswith(".."):
+            rel = os.path.basename(path)
+        dest = os.path.join(mount, RECYCLE_DIRNAME, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.exists(dest):
+            dest += f".{int(time.time())}"
+        shutil.move(path, dest)
+        os.utime(dest, None)
+        core.log(f"recycle: kept {rel} for {int(float(cfg.get('recycle_keep_days', 7)))}d")
+        return dest
+    except Exception as e:
+        core.log(f"recycle: {path} failed ({e}) — falling back to the old delete")
+        return None
+
+
+def purge_recycle(cfg=None):
+    """Drop recycled originals older than `recycle_keep_days` and prune emptied folders.
+    Runs from the daily housekeeping job. Returns how many files were purged."""
+    cfg = cfg or core.load_config()
+    root = os.path.join(cfg.get("media_mount", "/media"), RECYCLE_DIRNAME)
+    if not os.path.isdir(root):
+        return 0
+    keep_s = max(0.0, float(cfg.get("recycle_keep_days", 7))) * 86400
+    now, n = time.time(), 0
+    for r, _dirs, files in os.walk(root, topdown=False):
+        for f in files:
+            p = os.path.join(r, f)
+            try:
+                if now - os.path.getmtime(p) > keep_s:
+                    os.remove(p)
+                    n += 1
+            except OSError:
+                pass
+        if r != root:
+            try:
+                os.rmdir(r)
+            except OSError:
+                pass
+    if n:
+        core.log(f"recycle: purged {n} expired original(s)")
+    return n
+
+
 def _video_quality(path, dur):
     """(height, video_bitrate) — to pick the better-looking source. mkv often omits
     per-stream bitrate, so fall back to filesize/duration."""
@@ -1371,7 +2315,10 @@ def _place_multi(en, mv, cfg, tmdb_id):
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
     ok, err = run_mux(["mkvmerge", "-o", out, en], out, cfg)
     if not ok:
-        core.set_status(tmdb_id, "error", error=f"multi remux: {err}"); return
+        # A release mkvmerge can't remux is a defective download — fetch another (see the
+        # graft-path mux failure for the reasoning).
+        reject_and_retry(tmdb_id, f"multi remux failed: {err}", cfg, final="error")
+        return
     core.set_status(tmdb_id, "merged", merged_file=out, added_langs="", error=None,
                     merge_kind="replaced")
     core.log(f"merge {tmdb_id}: MULTI release used directly (both langs, native sync) -> {out}")
@@ -1436,15 +2383,30 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     if en and en != mv.get("en_file"):
         core.set_status(tmdb_id, mv["status"], en_file=en)
     fr = mv["french_path"]
-    if not en:
-        core.set_status(tmdb_id, "error", progress="",
-                        error="merge: donor file missing (not on disk, and qB no longer has it)")
+    if not en or not os.path.exists(en):
+        # The donor is genuinely gone (qB confirmed). Nothing will bring THIS file back, but the
+        # record still has its gap and the autonomous answer is simply another release — the
+        # exact thing reject_and_retry does. Parking it as `error` made an agent perform the
+        # /retry a state transition could have performed.
+        reject_and_retry(tmdb_id, "donor file vanished before the merge "
+                                  "(not on disk, and qB no longer has it)", cfg)
         return
-    if not (os.path.exists(en) and os.path.exists(fr)):
-        core.set_status(tmdb_id, "error", error="merge: file(s) not found on disk"); return
+    if not os.path.exists(fr):
+        core.set_status(tmdb_id, "error", error="merge: library file missing on disk"); return
     ei, fi = probe(en), probe(fr)
-    if not ei or not fi:
-        core.set_status(tmdb_id, "error", error="merge: probe failed"); return
+    if not ei:
+        # An unreadable DONOR is a defective release: blocklist it and fetch another.
+        reject_and_retry(tmdb_id, "donor unreadable (probe failed)", cfg)
+        return
+    if not fi:
+        # An unreadable BASE is more likely a mount hiccup than corruption — the same file was
+        # probed fine at scan time. Re-queue and retry; a run of failures becomes a real error.
+        transient("movie", tmdb_id, "merge: library file probe failed", cfg, back_to="ready")
+        return
+    okd, dfree, dneed = disk_headroom_ok([en, fr], os.path.dirname(fr), cfg)
+    if not okd:
+        hold_for_disk("movie", tmdb_id, dfree, dneed, cfg)
+        return
     # The "wanted" foreign track is English; if this title's original language isn't English
     # and no English exists, the original-language VO is the fallback (e.g. Norwegian Kraken).
     orig_codes = _orig_codes(mv.get("original_lang"))
@@ -1524,6 +2486,16 @@ def _merge_movie_impl(tmdb_id, cfg=None):
         plex_refresh(cfg, [os.path.dirname(fr).replace(cfg["media_mount"], cfg["plex_media_prefix"], 1),
                            en_dir], mv.get("title"), year=mv.get("year"))
         return
+    # The merge must give the LIBRARY FILE something it still lacks — see graft_gains for the
+    # VOSTFR shape this closes. Decided BEFORE sync detection, which is the expensive part.
+    gains, lib_needs = graft_gains(bi, fi, {langs[i] for i in ids},
+                                   {s["lang"] for s in subs}, kind, cfg,
+                                   mv.get("original_lang"), orig_codes)
+    if not gains:
+        reject_and_retry(tmdb_id, "release adds nothing this file needs "
+                                  f"(file still needs {'+'.join(lib_needs) or 'nothing'})",
+                         cfg, delta)
+        return
     # Multi-point detection: constant offset, linear drift (framerate), or inconsistent (reject).
     # A manually-set offset skips detection. Honour a stored stretch ratio too, so a
     # known rate correction (e.g. a PAL 1.0427 ratio) can be applied by hand via
@@ -1543,17 +2515,31 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             # m is None  -> inconsistent/low-confidence sync.
             # fps_diff & no drift -> framerates differ but only a constant offset was found
             #   (e.g. audio fallback); a constant can't correct frame drift, so don't risk it.
-            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
-            # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit here
-            # on the very first failure, so `max_sync_retries` — the budget that exists to try
-            # four DIFFERENT releases — was never spent, and every sync failure became a manual
-            # "pick another release" that nothing in the pipeline would ever do for you. A
-            # different release is by far the likeliest fix (one at the library's own framerate
-            # simply works), it is fully automatic, and it costs a download slot. Review is what
-            # happens when that budget is GONE, not instead of it.
-            reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
-                             final="review" if cfg.get("sync_review", True) else "sync_fail")
-            return
+            # On the attempt that would SPEND the retry budget, the pipeline makes its own last
+            # call — the wide probe — before parking the record for an actor (see
+            # wide_probe_rescue). Earlier failures are cheaper to answer with a different
+            # release, which needs no detection at all.
+            rescue = None
+            if (mv.get("attempts") or 0) + 1 >= cfg.get("max_sync_retries", 4):
+                rescue = wide_probe_rescue(base, donor, 0, (daidx[ids[0]] if ids else 0),
+                                           min(ei["dur"] or 0, fi["dur"] or 0), fps_diff, cfg,
+                                           tag=f" {tmdb_id}",
+                                           on_progress=lambda msg: _beat("movie", tmdb_id, msg),
+                                           base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+                                           base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+            if rescue is None:
+                why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+                # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit
+                # here on the very first failure, so `max_sync_retries` — the budget that exists
+                # to try four DIFFERENT releases — was never spent, and every sync failure became
+                # a manual "pick another release" that nothing in the pipeline would ever do for
+                # you. A different release is by far the likeliest fix (one at the library's own
+                # framerate simply works), it is fully automatic, and it costs a download slot.
+                # Review is what happens when that budget is GONE, not instead of it.
+                reject_and_retry(tmdb_id, f"couldn't sync ({why})", cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+                return
+            m, conf, method, drift = rescue
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"merge {tmdb_id}: sync {offset:+d}ms"
@@ -1572,8 +2558,26 @@ def _merge_movie_impl(tmdb_id, cfg=None):
           _donor_opts(ids, langs, subs, offset, drift) + [donor]
     ok, err = run_mux(cmd, out, cfg)
     if not ok:
-        core.set_status(tmdb_id, "error", progress="", error=err)
+        # A failed mux is almost always the DONOR — a container mkvmerge can't parse, a
+        # truncated download — and another release is the automatic fix. This used to park as
+        # `error` and hand the AI a /retry it could have been a state transition.
+        # final="error" keeps the escalation honest once the budget is spent.
+        reject_and_retry(tmdb_id, f"mux failed: {err}", cfg, delta, final="error")
         return
+    # Verify before the swap. Only audio grafts are checkable (a subtitle has no waveform);
+    # a rejected output is unlinked and the donor blocklisted like any other failed sync.
+    if ids:
+        _beat("movie", tmdb_id, "verifying sync of the merged file…")
+        ok_qc, qres, qconf = qc_grafted_audio(out, len(bi["auds"]),
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg,
+                                              tag=f" {tmdb_id}")
+        if not ok_qc:
+            _unlink(out)
+            reject_and_retry(tmdb_id,
+                             f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
+                             f"(conf {qconf:.2f})", cfg, delta,
+                             final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
     # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single
     # /set_sync keep skipping detection for every future donor this record ever gets — the same
     # replay bug the flag exists to prevent, just gated behind one manual fix. The offset itself
@@ -1707,6 +2711,13 @@ def finish_movie(tmdb_id, cfg=None):
     dest = os.path.join(libdir, os.path.basename(merged))
     mergedir = os.path.dirname(merged)
     try:
+        # A REPLACED file's content is genuinely discarded — the download became the library
+        # file, the original's video is gone. Recycle it so a bad replacement is reversible by
+        # machine for recycle_keep_days. A grafted output carries every track the base had, so
+        # the graft path keeps the old (cheap) delete/overwrite below. When the paths are EQUAL
+        # this must happen before the move, which would otherwise silently overwrite.
+        if mv.get("merge_kind") == "replaced" and os.path.exists(donor):
+            recycle(donor, cfg)          # None (off/failed) -> the old destructive path below
         shutil.move(merged, dest)
         # remove the old FR-only library file (its seed copy, if any, is a separate path)
         if os.path.exists(donor) and os.path.abspath(donor) != os.path.abspath(dest):
@@ -1844,23 +2855,40 @@ def merge_next(cfg=None):
     """Claim and merge ONE queued item. Returns True if something was merged."""
     from . import tv as _tv
     cfg = cfg or core.load_config()
+    # The disk gate: below the floor, or cooling off after a pair that didn't fit, nothing is
+    # claimed at all — the queue keeps its order and the worker idles on its normal wait.
+    if DISK_STATE.get("low") or time.time() < DISK_STATE.get("hold_until", 0):
+        return False
     for kind, rid, _ts in merge_queue(cfg):
         key = f"{'m' if kind == 'movie' else 'e'}{rid}"
         claim = core.claim_movie if kind == "movie" else core.claim_episode
+        setter = core.set_status if kind == "movie" else core.set_ep_status
         # atomic ready -> merging: if we lose the race, another claimer has it
         if not claim(rid, "ready", "merging", progress="starting…"):
             continue
         with _MERGING_NOW_LOCK:
             _MERGING_NOW.add(key)
         try:
-            if kind == "movie":
-                merge_movie(rid, cfg)
-            else:
-                _tv.merge_ready_episode(rid, cfg)
+            # core.job: registers this thread's subprocesses under `key`, so an operator abort
+            # can kill the decode or the mux that is running RIGHT NOW rather than waiting out
+            # mux_timeout_min (4h) or restarting the container.
+            with core.job(key):
+                if kind == "movie":
+                    merge_movie(rid, cfg)
+                else:
+                    _tv.merge_ready_episode(rid, cfg)
+        except core.Aborted as a:
+            # Someone chose this, so it is not a failure to diagnose: park it as `review` (a
+            # human decision by definition), stamp needs_human so the AI is not paged about it,
+            # and leave the donor alone — an abort is usually the first half of "let me fix
+            # something and try again", not "this release is bad".
+            setter(rid, "review", progress="", error=f"merge aborted by the operator ({a})",
+                   ai_status="needs_human", ai_verdict="merge aborted by the operator",
+                   ai_at=time.time())
+            core.log(f"merge {key}: ABORTED by the operator")
         except Exception as e:
             # never let one bad item kill the worker (the old inline merge aborted the
             # whole finish cycle, stranding every record behind it)
-            setter = core.set_status if kind == "movie" else core.set_ep_status
             setter(rid, "error", error=f"merge: {e}", progress="")
             core.log(f"merge {key} FAILED: {e}")
         finally:
@@ -1932,7 +2960,15 @@ def _promote_completed(cfg=None):
         if not t:
             t = next((x for x in torrents
                       if _owns(x.get("save_path", "") + x.get("content_path", ""), tmdb)), None)
-        if not t or (t.get("progress", 0) or 0) < 1.0:
+        if not t:
+            # Not in this category at all (renamed, removed outside vo-merge, added to the
+            # wrong one). stage_finish reconciles it every 10 min; promote runs every minute and
+            # used to skip it in silence, leaving a row reading "100% · done" with no reason.
+            core.set_status(mv["tmdb_id"], mv["status"],
+                            progress=f"complete, but its torrent is not in the "
+                                     f"{cfg['qb_category']} category in qB — reconciling")
+            continue
+        if (t.get("progress", 0) or 0) < 1.0:
             continue
         vid, local = _resolve_donor_video(mv, t, cfg)
         if vid:

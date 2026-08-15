@@ -550,17 +550,20 @@ rather than a missing file.
 ### A scan adds what's new; the prune drops what's gone
 
 Nothing used to remove a probe or a record, so a title deleted from the library kept being counted
-— and kept dragging the coverage percentage down — forever. Every rescan now starts with
-`core.prune_missing_probes()` + `core.prune_missing_records()`. Two guards keep that from eating
-the DB:
+— and kept dragging the coverage percentage down — forever. `pipeline.prune_library` is the one
+shared implementation, run by **every rescan and by the daily housekeeping job** — the prune only
+lived inside the operator's re-read before, so on an unattended install a deletion was never
+swept at all. Two guards keep it from eating the DB:
 
 - **The mount must look alive.** If `/media` is missing or empty (an unmounted share) every path
   reads as gone, so the prune is skipped and logged rather than run.
 - **Mid-flight records are never pruned** (`core._PRUNE_SKIP`: downloading / ready / merging /
   grabbed / searching) — a merge swaps a new file in, so the library path can be briefly absent.
 
-`SCAN_STATE` carries `pruned` / `pruned_records` and the button reports "N deleted entries
-removed" alongside the gap count.
+The webhooks cover the *arr-driven case instantly (a delete event calls `core.forget_probe`);
+the daily prune is what catches files removed behind the *arrs' backs. `SCAN_STATE` carries
+`pruned` / `pruned_records` and the button reports "N deleted entries removed" alongside the gap
+count.
 
 ## `updated` and `merged_at` mean specific things (`core._set_row`)
 
@@ -628,13 +631,26 @@ Spanish got no signal at all, and a Spanish-dub release wasn't recognised as a d
 markers are a **per-language table**, so the same rule works for any profile:
 
 - `media.release_langs(title)` → *(languages advertised, multi, original)*.
-- `media.useless_release(title, need)` — reject when a release advertises dubs and **none** is a
-  language this file still needs. A release advertising nothing (`Movie.2019.1080p.BluRay`, the
-  common shape) says nothing about its audio and is never rejected; nor is MULTI, nor VOST/VOSTFR
-  (which state the audio is *original*, i.e. not a dub).
+- `media.useless_release(title, need, orig=, need_subs=)` — reject when a release advertises
+  audio and **none** of it is a language this file still needs. A release advertising nothing
+  (`Movie.2019.1080p.BluRay`, the common shape) says nothing about its audio and is never
+  rejected; nor is MULTI. **VOST/VOSTFR is no longer a free pass**: those tags are a concrete,
+  checkable claim — the audio is the ORIGINAL language, the subs French (VOSTFR) or English
+  (VOSTA) — so with the title's original language known, a VOSTFR that fills no remaining gap is
+  rejected. That is the Colony bug: a Korean film missing only the French DUB grabbed a VOSTFR
+  (Korean audio + French subs, definitionally unable to help) and sank an hour of sync into it.
+  Unknown original (`orig=None`/`"?"`) keeps the old conservative pass.
 - `media.lang_hits(title, need)` — +60 (films) / +120 (TV candidates) per missing language the
   name advertises, so a dub of a language we need beats an unmarked release, and MULTI still
   beats both.
+- **The merge itself re-asks the question of the FILES** (`pipeline.graft_gains`, before sync
+  detection — the expensive part): the OUTPUT (base languages + everything grafted) must give
+  the LIBRARY file something it still lacks, whichever file won the video comparison. This is
+  the second half of the Colony bug: the release won the quality comparison, became the base,
+  and `wanted_audio` — which asks what the *base* lacks — happily grafted the library's own
+  English track while the output still lacked `fre` and the library's video got replaced by the
+  rip. The deliberate VO fallback stays a gain (Kraken's Norwegian); anything else that adds
+  nothing needed is rejected and blocklisted before a single decode runs.
 
 **Only the tag zone is inspected** — everything after the first year / SxxExx / resolution /
 source token. That's where a scene release states its audio, and scanning only there is what
@@ -642,6 +658,17 @@ stops a film called *The German Doctor* from reading as a German dub. Verified b
 title alone advertises nothing, while `The German Doctor 2013 GERMAN 1080p` advertises `ger`.
 Two-letter codes (NL, DE, IT…) are deliberately absent from the table — they collide with
 source/resolution tokens, and a false positive here **rejects** a good release.
+
+**`VOF` is a French-audio marker, and it matched nothing for a long time.** "Version Originale
+Française" = a French-ORIGINAL title, so the release carries French and nothing else — but the
+bare `VF` alternative refuses a letter *before* it (the `O` blocks it) and the VOST-family `VO`
+refuses one *after* (the `F` blocks it), so VOF fell between both guards, advertised no language
+at all, and was scored on seeders alone. A French film missing ENGLISH would happily grab one.
+It now sits in the `fre` markers (and in `_NAME_HINTS`, so a VOF filename also resolves an
+untagged `und` audio track to French). Note the deliberate cost: a French BluRay of a French
+film often *does* embed English subtitles its name never mentions, so a subtitle-only gap loses
+that occasional donor — the same trade `FRENCH` already made, and Bazarr is the cheaper tool for
+subtitles anyway.
 
 `_place_multi` (films) and the direct-remux branch (TV) ask the same generalised question of the
 *probed* release: `media.gap_langs(...)` reporting no audio gap means the download alone
@@ -915,37 +942,50 @@ and its outcome is written back so failures surface for a human:
    `ai_stale_min` (default 60) while still in a problem state, `ai_health_check` flips it to
    `needs_human` — catching a silently crashed AI.
 
-### The dispatcher runs on the host, and its failure is silent (`agent.py`)
+### The dispatcher is a supervised component, not a silent host cron (`agent.py`, `deploy/dispatcher/`)
 
-vo-merge writes a ticket into `/config/ai-tickets/`; an **Unraid user script on a cron runs the
-Claude Code CLI** against it. That agent lives outside this app, so the only evidence in here that
-it exists at all is second-hand — and **when the script stops running, nothing reports an error.**
-Tickets pile up, every record ages past `ai_stale_min`, and the whole backlog flips to "AI did not
-respond within 60m", which reads exactly like an agent that examined each one and gave up. That is
-the state this install was found in: every Review row flagged for a human, `last_callback: null`.
+vo-merge writes **one ticket per record** into `/config/ai-tickets/` (`review-m{id}` /
+`review-e{id}` — the same shape for an auto-page and the operator's Send-to-AI button). The
+consumer is the **resident dispatcher** (`deploy/dispatcher/`), which speaks a take/ack
+protocol — claim a ticket by renaming it into `claimed/`, delete it on the callback, retry a
+crashed run and dead-letter it into `dead/` after `MAX_ATTEMPTS`, and **touch `.heartbeat`
+every cycle**. Two editions, same protocol:
 
-Two things make that visible instead of mysterious:
+- **`dispatcher.sh` on the Unraid host (the deployed one)** — a User Scripts loop ("At First
+  Array Start Only", or hourly with `ONESHOT=1`) running the host's already-logged-in `claude`
+  CLI, i.e. the operator's **Claude subscription, not API-key billing**. This replaces the
+  legacy ticket cron: same tickets directory, but the legacy script never wrote a heartbeat or
+  claimed/dead-lettered, so a dead cron was indistinguishable from a slow one.
+- **`dispatcher.py` in a container** — for non-Unraid hosts; auths by mounting the host's
+  `~/.claude` login (subscription) or an `ANTHROPIC_API_KEY`.
 
-- **`agent.movie_context` / `episode_context` build the brief in ONE place.** It used to be
-  written inline in main.py's escalation endpoints and again, differently, in `ai_health_check`,
-  so an operator-escalated record and an auto-escalated one could be given different instructions.
-- **`agent.status()` reports the ticket directory** — how many tickets are sitting there and how
-  long the oldest has waited. `core.ticket` refuses to overwrite a ticket of the same kind
-  ("already awaiting dispatch"), so the dispatcher is expected to REMOVE each file once it picks
-  it up; a ticket that has sat for hours is the most direct evidence available from inside the
-  container that nothing on the host is reading them. It is evidence, not proof (a dispatcher
-  could run and leave the files), so the On-call AI panel pairs it with `last_callback`, which is.
+Why this shape — the previous one failed silently: the host cron died, tickets piled up, every
+record aged past `ai_stale_min`, and the whole backlog flipped to "AI did not respond", which
+read exactly like an agent that examined each one and gave up. That was the state this install
+was found in. Now:
+
+- **A dead fixer is an EVENT.** `pipeline.check_dispatcher` (3-min sweep) alarms out-of-band
+  when the oldest queued ticket exceeds `ai_dispatcher_alarm_min` AND the heartbeat is
+  absent/stale — both signals, because a live sidecar with a deep queue is slow, not dead, and
+  a healthy hourly cron keeps no heartbeat but drains the queue. The default (120) sits above
+  common cron intervals so a legacy setup doesn't false-alarm.
+- **The queue is capped and honest.** `ai_health_check` files at most `ai_max_tickets` queued
+  tickets; overflow records stay UNSTAMPED (never `ai_status='pending'` without a ticket on
+  disk — the staleness timer must not run on a page that was never sent) and get picked up as
+  the queue drains. A record that recovers on its own has its queued ticket withdrawn — it
+  describes a solved problem, and its presence would block the record's next page — and the
+  never-delivered `pending` stamp cleared with it.
+- **`agent.movie_context` / `episode_context` build the brief in ONE place**, so an
+  operator-escalated record and an auto-escalated one can't be given different instructions.
+- **`agent.status()`** reports queued/claimed/dead counts, the oldest queued age, and
+  `heartbeat_age` — dead-vs-slow is a reported fact, not an inference.
 
 **The `ai_stale_min` timeout measures how long the dispatcher has HELD a ticket**, not how long
-the ticket has existed (`agent.undispatched()`, consulted by the staleness sweep). The host script
-handles a couple of tickets per cron firing, so a backlog bigger than its throughput — one bad
-season pack is 400 episodes — leaves most records untouched for hours. Ageing those out claimed
-"the AI examined this and gave up" about records no agent had opened, and made a *slow* dispatcher
-indistinguishable from a *dead* one. A record whose own `review-m{id}`/`review-e{id}` ticket is
-still on disk — or which is listed in a still-present `errors-review.json` — is left `pending`.
-
-When both say nothing is happening, the panel says so plainly and points at the user script rather
-than leaving "N need you" to be read as a considered give-up.
+the ticket has existed (`agent.undispatched()`, consulted by the staleness sweep) — a backlog
+bigger than the dispatcher's throughput must not age out records no agent has opened. The
+staleness flip covers **movies and episodes alike in `error`/`review`/`sync_fail`/`no_release`**
+(episodes-in-review used to be missed and showed "AI working" forever), and each flip triggers
+the needs-human digest on the notify channel.
 
 **"Needs attention" means NEEDS YOU, not "something failed."** Every failure reaches the AI within
 3 minutes, so a panel listing all of them is mostly a list of things already being worked on. It
@@ -984,8 +1024,109 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 |---|---|
 | `POST /episode/{id}/assign {path}` | **Numbering the automatic aired↔absolute translation can't cover** (Sonarr has no absolute numbers, or the pack numbers its files a third way). Maps ONE donor file to one episode and queues the merge. The agent reads `/context`, works out the mapping, calls this per episode. |
 | `POST /movie\|episode/{id}/set_sync {offset_ms, drift}` | Applies a **known** offset and/or rate stretch with no detection (`drift` = donor_fps/base_fps; 1.0427083 = film→PAL). `_merge_*_impl` honours a stored `sync_drift` when the offset is manual. |
-| `POST /search_releases {query}` | The `no_release` backlog. The built-in search composes its own query from the library title, so a title it never matches can never be found however often it re-searches. This runs an arbitrary Prowlarr query (original/romaji/alternate title, no year) and returns links to `/grab`. |
-| `POST /movie\|episode/{id}/unfixable {reason}` | Terminal give-up **with a recorded reason** (sets `ignored` + `ai_status=needs_human`), so it doesn't read as an unexamined skip. |
+| `POST /search_releases {query}` | The `no_release` backlog. The built-in search now walks a **query ladder** itself (original title → *arr title → alternate titles, once `search_rounds` ≥ 1), so this is the step BEYOND the ladder: an arbitrary Prowlarr query for whatever the AI can think of that Radarr/Sonarr didn't know. Records that exhaust `no_release_escalate_rounds` fruitless rounds are paged once with exactly this instruction. |
+| `POST /movie\|episode/{id}/unfixable {reason}` | Terminal give-up **with a recorded reason** (sets `ignored` + `ai_status=needs_human`), so it doesn't read as an unexamined skip. `ignored` is re-examined every `ignored_revisit_days` with one cheap search (capped/day) — "no release exists" decays as truth, so the verdict must not be permanent by accident. |
+
+## Autonomy & failure management
+
+The design goal after the July 2026 autonomy review (`docs/AUTONOMY.md`): **a human never does
+routine repair, and is told out-of-band when the machine has proven something impossible or the
+machine itself is broken.** The escalation ladder, in order — each rung strictly cheaper than
+the next:
+
+1. **Self-retry** (`pipeline.transient`): failures a retry fixes — a grab fetch timeout, a qB
+   blip, an unreadable-base probe — go back for another automatic attempt instead of minting an
+   `error` (which pages the AI within 3 minutes, i.e. burns an agent run on a network hiccup).
+   Bounded by `transient_max` CONSECUTIVE failures (`transient_fails` column, reset by
+   `DONOR_RESET`); an unbroken run means the condition isn't transient and becomes a real error
+   carrying the count.
+2. **A different release**: failures whose automatic fix is *another donor* — donor vanished
+   before the merge, donor unreadable, mux failure (mkvmerge can't parse the download),
+   post-merge QC rejection, TV's "carries none of the missing languages" — all route through
+   `reject_and_retry`/`_reject_and_retry_ep` (blocklist + re-search + the `max_sync_retries`
+   budget) instead of parking as `error` and handing the AI a `/retry` that could have been a
+   state transition.
+3. **The pipeline's own last call** (`pipeline.wide_probe_rescue`): on the attempt that would
+   SPEND the sync budget, detection re-runs once at ±`sync_probe_lag_s` (300s) — the
+   deterministic first line of the AI runbook ("call /sync_probe FIRST"), executed by the
+   pipeline. A parked record now really means "windows disagree even at ±300s".
+4. **The agent** (per-record tickets, above): judgement calls — numbering mismatches the
+   automatic translation can't cover, alternate names beyond the ladder, known rate stretches.
+5. **`unfixable`/`needs_human` + the notify digest**: the terminal rung, delivered to a human
+   out-of-band, with the machine's reasoning recorded.
+
+**Crash recovery is complete.** `stage_finish` always re-queued stale `merging` and reconciled
+`downloading`; `pipeline.sweep_stuck` (3-min sweep) now recovers `searching`/`grabbed` too —
+they had NO reader at all, and a `grabbed` record has no `dl_hash` yet, so even the orphan
+sweep couldn't see one. Recovery never blocklists (the release may never have been grabbed);
+approval-mode `grabbed` is exempt (a human deciding is not a crash). Dead merge-worker threads
+are respawned by the same sweep (`ensure_merge_workers` used to run only on settings changes).
+
+**The output is verified before it becomes the library** (`pipeline.qc_grafted_audio`). A
+confident-but-wrong sync was the one failure nothing could ever detect: the language reads as
+present, the record closes, the donor is deleted — only a human watching the film would notice,
+which is the definition of non-autonomous. After every audio graft (movie + TV), the grafted
+track is cross-correlated against the base's own track *inside the mux output* (mkvmerge orders
+tracks by input, so base audio = 0..n-1, first grafted = n; different languages correlate
+through music/effects — the signal `resync_movie` always used). Rejection needs CONFIDENT
+evidence (`qc_min_conf` + `qc_max_offset_ms`); inconclusive accepts, so quiet films don't burn
+their budget on absent evidence. A wrong drift lands in the inconclusive bucket — narrower
+coverage, stated honestly.
+
+**What a replacement discards is reversible** (`pipeline.recycle`). `_place_multi` and the TV
+direct remux are the only outcomes that throw the library file's content away; the original now
+moves to `<media>/.vo-merge-recycle/<relpath>` (mtime restamped so the TTL counts from
+recycling) and the daily housekeeping job purges past `recycle_keep_days`. Grafts keep the
+cheap delete — their output carries every track the base had.
+
+**Nothing loops forever.** The blocklist ages (`tried` entries are `[rid, ts]`,
+`pipeline.tried_active` filters by `tried_ttl_days`; legacy strings stay blocked until a
+rewrite stamps them, so an upgrade doesn't un-blocklist years of known-bad releases at once).
+`search_rounds` counts fruitless rounds per record: round ≥ 1 widens the query ladder to the
+*arrs' alternate titles, and round ≥ `no_release_escalate_rounds` pages the AI once (the
+`ai_status IS NULL` gate makes it one-shot — the verdict is durable across cooldown cycles).
+
+**Nothing fills the disk.** `check_disk` (watchdog) holds ALL merging below `disk_floor_gb`;
+`disk_headroom_ok` refuses a specific pair whose output can't fit (inputs' sum + floor),
+re-queues it un-penalised and cools the worker off 15 min (`DISK_STATE["hold_until"]`) — rc≥2
+half-writes no longer compound the disk-full that causes them. Donors kept for parked failure
+states (`review`/`sync_fail`/`error` — kept for `/assign`//`set_sync`) are freed after
+`donor_keep_days`; a later merge finds them gone and self-heals through the donor-vanished
+reject path.
+
+**State survives corruption.** `core.verify_or_restore_db` (startup) runs `PRAGMA quick_check`;
+a corrupt DB is quarantined (never deleted) and last night's `VACUUM INTO` snapshot restored
+automatically — the backups finally have a reader. `config.json` gets the same nightly copy
+(`core.backup_config`, skipped while the live file is unparseable so the good snapshot
+survives), and an unparseable config — which stops the whole pipeline via the `enabled: False`
+fallback — files a `config-broken` ticket and alarms, using the last config that PARSED for the
+notify URL the broken file is hiding (`core._LAST_GOOD_CFG`).
+
+### The alarm channel (`notify.py`)
+
+Everything else in the app is pull-based, which is useless for the class of failure where the
+pipeline (or its fixer) has stopped doing anything. `notify_url` (empty = off) takes a
+Discord/Slack webhook (their JSON envelope) or anything ntfy-shaped (plain POST + `Title`
+header). **Rate-limited per KIND, not per message** (`notify_repeat_h`, state persisted across
+restarts), re-armed the moment a condition is observed healthy — a channel that repeats itself
+every 3 minutes gets muted by its human, which is worse than no channel. The five kinds:
+dispatcher dead, config broken, disk floor, `dep-*` (a dependency continuously unreachable past
+`dep_down_alarm_min` — `pipeline.check_deps` remembers DURATION, which the per-cycle
+"qB error, returning" logs never could; surfaced on `/api/status` as `deps_down`), and the
+needs-human digest. Never per-merge chatter.
+
+**Who watches the watcher:** all of the above lives inside vo-merge, so vo-merge's own death is
+the one failure it can never report. The sidecar dispatcher closes that loop — it pings
+`/api/health` each cycle (`VO_URL`) and raises the same out-of-band alarm (`NOTIFY_URL`) when
+vo-merge stays unreachable past `VO_DOWN_ALARM_MIN`, so the two processes watch each other. A
+whole-host outage still needs an external uptime ping; no in-host software can report the
+host's own death.
+
+Post-merge QC is **drift-aware**: `sync.audio_windows` hands `qc_grafted_audio` the raw
+per-window residuals, and a line through them whose span exceeds `qc_max_offset_ms` across the
+runtime rejects the merge — a wrong STRETCH ratio (windows disagreeing *linearly*) used to be
+indistinguishable from noise and sailed through the consensus check. Scattered disagreement is
+still inconclusive-accept; two points must span 2× the limit, since any two points fit a line.
 
 ## Config (`core.py:DEFAULTS`, persisted to `/config/config.json`)
 
@@ -996,11 +1137,23 @@ Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `lang_pr
 `stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
 `promote_interval_min`, `max_inflight_downloads` (download slots) /`max_parallel_merges`
 (concurrent merges, applied live via `MERGE_GATE`), `enabled` (master switch),
-`ai_tickets`/`ai_stale_min` (AI-review escalation, see below), `api_key` (empty = open on the
-LAN), `mux_timeout_min`/`sync_decode_timeout_min` (deadlock guards, not tuning knobs),
-`db_backup_keep` (nightly `VACUUM INTO /config/backup/`), and `api_url`/`docs_path` (what the AI
+`ai_tickets`/`ai_stale_min`/`ai_max_tickets`/`ai_dispatcher_alarm_min` (AI-review escalation,
+see above), `api_key` (empty = open on the LAN), `mux_timeout_min`/`sync_decode_timeout_min`
+(deadlock guards, not tuning knobs), `db_backup_keep` (nightly `VACUUM INTO /config/backup/`,
+now DB + config, with an auto-restore reader at startup), and `api_url`/`docs_path` (what the AI
 ticket tells the dispatcher — these used to be one install's hard-coded LAN address and
 `/mnt/nvme` path).
+
+Autonomy keys (see "Autonomy & failure management"): `notify_url`/`notify_repeat_h` (the alarm
+channel), `dep_down_alarm_min`, `disk_floor_gb`, `transient_max`, `sync_wide_probe`/
+`sync_probe_lag_s`, `postmerge_qc`/`qc_min_conf`/`qc_max_offset_ms`, `recycle_keep_days`,
+`tried_ttl_days`, `no_release_escalate_rounds`, `donor_keep_days`, `ignored_revisit_days`/
+`ignored_revisit_per_day`, `auto_repair`. All are validated like every other key; the newer ones
+are edited via `config.json` / `POST /api/settings` until the Settings page grows fields for
+them. **The autonomous posture** is: `enabled: true`, `grab_mode: "auto"`, `ai_tickets: true`, a
+running dispatcher (`deploy/dispatcher/dispatcher.sh` on the Unraid host — the CLI's
+subscription auth, no API key), and a `notify_url` — `sync_review: true` is then safe, because
+`review` parks records for an actor that actually exists.
 Most of these are editable in the UI under **Settings → Queues & limits**.
 
 **Settings are validated** (`main._validate_settings`): each value is coerced to the type of its

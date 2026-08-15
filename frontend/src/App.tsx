@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, setApiKey, withKey, Movie, Status, Episode, Candidate, DL, Dash, RescanState, Coverage,
   CoverageLib, LibItem, LibPage, RepairPlan, RepairState, AiHealth, AiLog, RecheckState,
-  Forecast } from "./api";
+  Forecast, DashRecent, QueueView } from "./api";
 
 const fmtTime = (s: number) => {
   s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -574,8 +574,8 @@ function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
     );
   const pct = Math.round((c.complete / Math.max(c.probed, 1)) * 100);
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped">
+      <div className="row panel-head">
         <b>Language coverage</b>
         <span className="muted">{c.complete.toLocaleString()} of {c.probed.toLocaleString()} probed
           files meet their target · {pct}%
@@ -583,7 +583,9 @@ function CoveragePanel({ goto }: { goto?: (tab: string) => void }) {
         {goto && <><div className="spacer" />
           <button className="btn sec" onClick={() => goto("library")}>Browse files →</button></>}
       </div>
-      {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+      <div className="panel-body">
+        {c.libraries.map(l => <LibBar key={l.name} l={l} />)}
+      </div>
     </div>
   );
 }
@@ -729,15 +731,15 @@ function Library() {
   const pages = Math.ceil((d?.total ?? 0) / PAGE);
   return (
     <>
-      <div className="panel">
-        <div className="row" style={{ marginBottom: 8 }}>
+      <div className="panel capped full">
+        <div className="row panel-head">
           <b>Library</b>
           <span className="muted">every file the scanner has read, scored against its language target</span>
           <div className="spacer" />
           <RescanButton scope="all" label="files" primary />
           <RescanButton scope="all" label="everything" full />
         </div>
-        <div className="row libfilters">
+        <div className="row libfilters panel-head">
           <div className="segbtns">
             {tabs.map(([k, label, n]) => (
               <button key={k} className={state === k ? "active" : ""} onClick={() => pick(setState)(k)}>
@@ -769,11 +771,11 @@ function Library() {
               : "Nothing here matches those filters."}
           </div>}
         {d && d.total > 0 && <>
-          <div className="libhead">
+          <div className="libhead panel-head">
             <span>title</span><span>on the file</span><span>gap</span>
           </div>
-          <div className="liblist">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
-          <div className="row" style={{ marginTop: 10 }}>
+          <div className="liblist panel-body">{d.items.map(i => <LibRow key={i.path} i={i} />)}</div>
+          <div className="row panel-foot">
             <span className="muted">
               showing {(page * PAGE + 1).toLocaleString()}–{(page * PAGE + shown).toLocaleString()}
               {" "}of {d.total.toLocaleString()}</span>
@@ -820,7 +822,7 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
         {!list && !err && <div className="muted" style={{ marginTop: 12 }}>searching indexers… (this can take a few seconds)</div>}
         {list && list.length === 0 && <div className="muted" style={{ marginTop: 12 }}>No releases found.</div>}
         {list && list.length > 0 &&
-          <div className="rel-list">
+          <div className="rel-list scroll-y tall">
             {list.map(c => (
               <div className={"rel-row" + (c.tried ? " tried" : "")} key={c.rid}>
                 <div className="rel-main">
@@ -829,7 +831,11 @@ function ReleaseModal({ title, load, onGrab, onClose, onGrabbed }:
                       ? <a href={c.info_url} target="_blank" rel="noreferrer" title="Open tracker page"
                            style={{ color: "#9ecbff", textDecoration: "none" }}>{c.title} ↗</a>
                       : c.title}
-                    {c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
+                    {/* COMPLETE outranks PACK: it claims every episode of the show in one grab,
+                        which is a different promise from "one season". */}
+                    {c.complete
+                      ? <span className="multi-badge" style={{ background: "#2a2440", color: "#c9a6ff", borderColor: "#4a3d70" }}>COMPLETE</span>
+                      : c.pack && <span className="multi-badge" style={{ background: "#14432a", color: "#5ee9a0" }}>PACK</span>}
                     {c.multi && <span className="multi-badge">MULTI</span>}
                     {c.tried && <span className="tried-mark">tried</span>}
                   </div>
@@ -862,6 +868,20 @@ function MovieActions({ m, busy, act, onRelease, onTune }:
         B("Search again", () => act(() => api.research(m.tmdb_id)))}
       {["grabbed", "downloading", "no_release", "error", "sync_fail"].includes(m.status) &&
         B("Pick another", () => act(() => api.another(m.tmdb_id)))}
+      {/* A merge is a sync detect plus a multi-GB remux; without this the only ways to stop one
+          going wrong were to wait out mux_timeout_min (4h) or restart the container. */}
+      {["merging", "ready"].includes(m.status) &&
+        B("⛔ Abort merge", () => act(() => api.abortMovie(m.tmdb_id)))}
+      {/* The file on disk changed (replaced by hand, remuxed, subtitles dropped beside it):
+          re-read it and act on whatever it is now missing, without waiting for a sweep. */}
+      {B("↻ Re-read file", () => act(() => api.rescanMovie(m.tmdb_id)))}
+      {B("↺ Start over", () => {
+        if (confirm(`Start "${m.title}" from scratch?\n\nStops any merge, DELETES its download, `
+          + `and clears the blocklist, attempts, candidates and sync data.\n\n`
+          + `Your library file is NOT deleted — but tracks already merged into it stay merged, `
+          + `so it is re-read afterwards to see what it actually contains now.`))
+          act(() => api.resetMovie(m.tmdb_id));
+      })}
       {m.status === "merged" && B("Re-sync", () => act(() => api.sync(m.tmdb_id, 0)))}
       {m.status === "merged" && B("Tune sync", () => onTune(m))}
       {m.status === "sync_fail" && B("Re-try sync", () => act(() => api.sync(m.tmdb_id, 0)))}
@@ -884,20 +904,22 @@ function MovieCard({ m, dl, busy, act, onRelease, onTune }:
     <div className="card">
       <Poster src={m.poster} alt={m.title} />
       <div className="card-body">
-        <div className="card-title">{m.title} <span className="muted">({m.year})</span></div>
-        <div className="sub">→ {m.original_title} · {m.original_lang}{m.quality ? " · " + m.quality : ""}</div>
+        <div className="card-title" title={`${m.title} (${m.year})`}>{m.title} <span className="muted">({m.year})</span></div>
         <div className="card-row"><Pill s={m.status} />
           {m.status === "sync_fail" && m.sync_delta != null && <span className="sub">Δ {m.sync_delta.toFixed(1)}s</span>}
           <div className="spacer" />
           <MovieActions m={m} busy={busy} act={act} onRelease={onRelease} onTune={onTune} />
         </div>
-        {m.status === "downloading" && <DownloadBar dl={dl} />}
-        {m.status === "ready" && <QueuedLine />}
-        {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
-        <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
-        {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
-        <DriftBadge d={m.sync_drift} />
-        {m.error && <div className="sub bad">{m.error}</div>}
+        <div className="card-scroll">
+          <div className="sub">→ {m.original_title} · {m.original_lang}{m.quality ? " · " + m.quality : ""}</div>
+          {m.status === "downloading" && <DownloadBar dl={dl} />}
+          {m.status === "ready" && <QueuedLine />}
+          {m.status === "merging" && m.progress && <div className="sub" style={{ color: "#5ee9a0" }}>{m.progress}</div>}
+          <Tracks a={m.audio_langs} s={m.sub_langs} na={m.need_audio} ns={m.need_subs} />
+          {m.candidate_title && <div className="sub" style={{ marginTop: 4 }} title={m.candidate_title}>🎯 {m.candidate_title}</div>}
+          <DriftBadge d={m.sync_drift} />
+          {m.error && <div className="sub bad">{m.error}</div>}
+        </div>
       </div>
     </div>
   );
@@ -934,6 +956,143 @@ function Tile({ label, value, sub, tone, onClick }:
 // `needs_human` is mostly the no-callback flip. A wall of needs_human with no callback ever means
 // the dispatcher isn't running — which, without saying so, looks exactly like "it looked at
 // everything and gave up".
+/* One merged row — shared by the dashboard panel and the full-history modal, so the two can
+   never drift apart in what they show or how they say it. */
+function MergedRow({ r, now }: { r: DashRecent; now: number }) {
+  return (
+    <div className="dashrow">
+      <Poster src={r.poster} alt={r.title} />
+      <div className="dashrow-main">
+        <div className="dashrow-title">{r.title}</div>
+        <div className="sub addrow">
+          {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
+          {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
+          {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
+          {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
+        </div>
+      </div>
+      <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, now)}</span>
+    </div>
+  );
+}
+
+/* The whole merge history. The dashboard panel is a ten-row window onto this; everything older
+   had no way to be seen at all. Paged rather than fetched whole — this is a few thousand rows on
+   a working install — and searchable, because "did X ever get done?" is the actual question you
+   bring to a list this long. */
+function AllMergedModal({ onClose }: { onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const [rows, setRows] = useState<DashRecent[]>([]);
+  const [meta, setMeta] = useState<{ total: number; now: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const PAGE = 50;
+
+  // Refetch from the top whenever the query changes, debounced so typing doesn't hammer the API.
+  useEffect(() => {
+    let dead = false;
+    setBusy(true);
+    const t = setTimeout(() => {
+      api.mergedLog(PAGE, 0, q)
+        .then(d => { if (!dead) { setRows(d.items); setMeta({ total: d.total, now: d.now }); } })
+        .finally(() => { if (!dead) setBusy(false); });
+    }, q ? 250 : 0);
+    return () => { dead = true; clearTimeout(t); };
+  }, [q]);
+
+  const more = () => {
+    setBusy(true);
+    api.mergedLog(PAGE, rows.length, q)
+      .then(d => { setRows(r => [...r, ...d.items]); setMeta({ total: d.total, now: d.now }); })
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="row panel-head">
+          <b>Everything merged</b>
+          {meta && <span className="muted">{meta.total.toLocaleString()} total</span>}
+          <div className="spacer" />
+          <input className="search" placeholder="Search title…" value={q}
+                 onChange={e => setQ(e.target.value)} autoFocus />
+          <button className="btn sec" onClick={onClose}>✕</button>
+        </div>
+        <div className="scroll-y tall">
+          {rows.length === 0 && !busy &&
+            <div className="muted">{q ? "Nothing merged matches that." : "No merges yet."}</div>}
+          {rows.map((r, i) => <MergedRow key={i} r={r} now={meta?.now || Date.now() / 1000} />)}
+        </div>
+        <div className="row panel-foot">
+          <span className="muted" style={{ fontSize: 12 }}>
+            {busy ? "loading…" : `showing ${rows.length.toLocaleString()} of ${(meta?.total || 0).toLocaleString()}`}
+          </span>
+          <div className="spacer" />
+          {meta && rows.length < meta.total &&
+            <button className="btn sec" onClick={more} disabled={busy}>Load 50 more</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* The merge queue, in the order it will actually be drained — and the controls the operator
+   was missing: move an item to the front, or stop it. Until this existed the queue was a number
+   on a tile, so "why is that episode still waiting behind 300 others" had no answer and no
+   remedy. */
+function QueueModal({ onClose }: { onClose: () => void }) {
+  const [q, setQ] = useState<QueueView | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => api.queue(200).then(setQ).catch(() => {});
+  usePoll(load, 4000);
+  const act = (fn: () => Promise<any>) => {
+    setBusy(true);
+    fn().catch(() => {}).finally(() => { setBusy(false); load(); });
+  };
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="row panel-head">
+          <b>Merge queue</b>
+          {q && <span className="muted">{q.total} waiting · {q.merging_now} merging ·
+            {" "}{q.workers} worker{q.workers === 1 ? "" : "s"}</span>}
+          <div className="spacer" />
+          <button className="btn sec" onClick={onClose}>✕</button>
+        </div>
+        {/* the whole point of the panel: a held queue says so, in words */}
+        {q?.hold && <div className="panel warnbar" style={{ marginBottom: 10 }}>
+          ⏸ Nothing is merging — {q.hold}.
+          {q.disk?.paths && <span className="muted"> (library {q.disk.paths.media?.toFixed(0) ?? "?"} GB
+            free, /config {q.disk.paths.config?.toFixed(0) ?? "?"} GB)</span>}
+        </div>}
+        <div className="scroll-y tall">
+          {q && q.items.length === 0 && <div className="muted">Nothing is queued to merge.</div>}
+          {q?.items.map(it => (
+            <div className="dashrow" key={`${it.kind}${it.key}`}>
+              <span className="muted" style={{ width: 30, textAlign: "right" }}>{it.pos}</span>
+              <Poster src={it.poster} alt={it.title} />
+              <div className="dashrow-main">
+                <div className="dashrow-title">
+                  {it.priority > 0 && <span className="prio" title="prioritised">★</span>}
+                  {it.title}
+                </div>
+                <div className="sub">{it.merging ? "merging now"
+                  : `waiting ${fmtAgo(q.now - it.waiting_s, q.now)}`}{it.sub ? ` · ${it.sub}` : ""}</div>
+              </div>
+              {!it.merging &&
+                <button className="btn sec small" disabled={busy} title="Move to the front of the queue"
+                  onClick={() => act(() => api.queueTop({ kind: it.kind, key: it.key }))}>⤒ Top</button>}
+              <button className="btn sec small" disabled={busy}
+                title={it.merging ? "Kill the decode/mux running now" : "Take it off the queue"}
+                onClick={() => act(() => it.kind === "movie"
+                  ? api.abortMovie(Number(it.key)) : api.abortEpisode(it.key))}>⛔</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AiHealthPanel({ ai, now }: { ai?: AiHealth; now: number }) {
   if (!ai || !ai.enabled) return null;
   const seen = ai.pending + ai.resolved + ai.failed + ai.needs_human;
@@ -991,6 +1150,15 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
   const [dls, setDls] = useState<Record<string, DL>>({});
   const [logLines, setLogLines] = useState<string[]>([]);
   const [err, setErr] = useState("");
+  const [allMerged, setAllMerged] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [actBusy, setActBusy] = useState(false);
+  // one place for the Active-now row actions: run, then refresh the dashboard
+  const actA = (fn: () => Promise<any>) => {
+    setActBusy(true);
+    fn().catch(e => setErr(e.message || "action failed"))
+      .finally(() => { setActBusy(false); api.dashboard().then(setD).catch(() => {}); });
+  };
 
   usePoll(() => api.dashboard().then(x => { setD(x); setErr(""); })
     .catch(e => setErr(e.message || "dashboard unavailable")), 6000);
@@ -1025,9 +1193,15 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
         <Tile label="Downloading" value={<>{d.inflight ?? downloading.length}<span className="t-cap"> / {d.inflight_cap}</span></>}
           sub={totalSpeed > 0 ? "↓ " + fmtSpeed(totalSpeed) : d.inflight == null ? "qB unreachable" : "slots in use"}
           tone={d.inflight == null ? "warn" : undefined} />
+        {/* "0/2 · idle" beside five finished downloads is indistinguishable from a broken app,
+            so the tile carries the REASON the worker isn't running (merge_hold) and opens the
+            queue itself. */}
         <Tile label="Merging" value={<>{merging.length}<span className="t-cap"> / {d.merge_cap}</span></>}
-          sub={merging.length ? merging[0].title
-            : queued.length ? `${queued.length} queued` : "idle"} />
+          tone={d.merge_hold ? "warn" : undefined}
+          onClick={() => setQueueOpen(true)}
+          sub={d.merge_hold ? `held · ${d.merge_hold}`
+            : merging.length ? merging[0].title
+            : queued.length ? `${queued.length} queued — open` : "idle"} />
         <Tile label="Attention" value={attention} tone={attention ? "bad" : undefined}
           onClick={() => goto("review")}
           sub={<>{both("review")} review · {both("sync_fail")} sync · {both("error")} error</>} />
@@ -1042,89 +1216,124 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
       <ForecastPanel />
 
       <div className="dash-cols">
-        <div className="panel">
-          <div className="row" style={{ marginBottom: 8 }}><b>Active now</b>
+        <div className="panel capped tall">
+          <div className="row panel-head"><b>Active now</b>
             <span className="muted">{d.active.length} item{d.active.length === 1 ? "" : "s"}</span>
             <div className="spacer" /><LiveDot /></div>
-          {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
-          {d.active.map(a => (
-            <div className="dashrow" key={a.key}>
-              <Poster src={a.poster} alt={a.title} />
-              <div className="dashrow-main">
-                <div className="dashrow-title">{a.title}
-                  {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
-                {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
-                {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
-                {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
-                {a.status === "merging" && a.progress &&
-                  <div className="sub" style={{ color: "#5ee9a0" }}>{a.progress}</div>}
+          <div className="panel-body">
+            {d.active.length === 0 && <div className="muted">Nothing in flight.</div>}
+            {d.active.map(a => (
+              <div className="dashrow" key={a.key}>
+                <Poster src={a.poster} alt={a.title} />
+                <div className="dashrow-main">
+                  <div className="dashrow-title">{a.title}
+                    {a.count > 1 && <span className="muted"> · {a.count} eps</span>}</div>
+                  {a.sub && <div className="sub" title={a.sub}>{a.sub}</div>}
+                  {a.status === "downloading" && <DownloadBar dl={dlOf(a)} />}
+                  {a.status === "ready" && <QueuedLine pos={a.queue_pos} />}
+                  {/* `progress` is the pipeline's own explanation — the sync ticker while
+                      merging, and WHY a finished download is not moving otherwise. Rendering it
+                      only for `merging` is what kept a stuck row silent for 24h. */}
+                  {a.progress &&
+                    <div className="sub" style={{ color: a.status === "merging" ? "#5ee9a0" : "#ffcf8f" }}>
+                      {a.progress}</div>}
+                </div>
+                <div className="col-end">
+                  <Pill s={a.status} />
+                  {/* This is the list the operator actually watches, so the controls belong
+                      here. Both act on the whole row: a folded pack is one torrent behind 28
+                      episodes, and bumping one of them would leave the other 27 behind. */}
+                  <div className="row" style={{ gap: 4 }}>
+                    {a.status !== "merging" &&
+                      <button className="btn sec small" disabled={actBusy}
+                        title="Move to the front of the queue (the whole pack, if this row is one)"
+                        onClick={() => actA(() => api.queueTop(a.dl_hash
+                          ? { hash: a.dl_hash }
+                          : { kind: a.kind, key: a.key.slice(1) }))}>⤒</button>}
+                    <button className="btn sec small" disabled={actBusy}
+                      title={a.status === "merging"
+                        ? "Kill the decode/mux running now"
+                        : "Drop this download, blocklist the release and search for another"}
+                      onClick={() => {
+                        if (a.status === "merging") {
+                          actA(() => a.kind === "movie"
+                            ? api.abortMovie(Number(a.key.slice(1))) : api.abortEpisode(a.key.slice(1)));
+                        } else if (a.dl_hash && confirm(
+                          `Drop this download and look for a different release?\n\n${a.title}`
+                          + `${a.count > 1 ? ` (${a.count} episodes)` : ""}\n\n`
+                          + `The torrent and its files are deleted, the release is blocklisted, `
+                          + `and the records go back to searching. Your library files are untouched.`)) {
+                          actA(() => api.cancelDownload(a.dl_hash!));
+                        }
+                      }}>⛔</button>
+                  </div>
+                </div>
               </div>
-              <Pill s={a.status} />
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
 
         <div>
-          <div className="panel">
+          <div className="panel capped">
             {/* Only what the on-call AI could not resolve, plus `review` (a human decision by
                 definition). Everything else that failed is still with the AI and is counted,
                 not listed — otherwise this is a list of things already being worked on. */}
-            <div className="row" style={{ marginBottom: 8 }}><b>Needs attention</b>
+            <div className="row panel-head"><b>Needs attention</b>
               {(d.ai_working ?? 0) > 0 &&
                 <span className="muted" title="failed records the AI is still working on — they appear here only if it can't fix them">
                   {d.ai_working} with the AI</span>}
               {attention > 0 && <button className="btn sec" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 12 }}
                 onClick={() => goto("review")}>Open review →</button>}</div>
-            {d.attention.length === 0 && <div className="muted">
-              {(d.ai_working ?? 0) > 0
-                ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
-                : attention > 0
-                  ? `${attention} failure(s), none flagged for you yet.`
-                  : "All clear 🎉"}</div>}
-            {d.attention.map(a => (
-              // Title on ONE truncated line with the pills pinned beside it, then the message
-              // below at full width. The old shape put the pills in a right-hand COLUMN, which
-              // stole ~110px from the text and stacked them vertically as the panel narrowed.
-              <div className="attn" key={a.key}>
-                <div className="attn-head">
-                  <span className="attn-title" title={a.title}>{a.title}</span>
-                  {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
-                  <Pill s={a.status} />
-                  <AiPill s={a.ai_status} />
+            <div className="panel-body">
+              {d.attention.length === 0 && <div className="muted">
+                {(d.ai_working ?? 0) > 0
+                  ? `Nothing for you — ${d.ai_working} failure(s) are with the AI.`
+                  : attention > 0
+                    ? `${attention} failure(s), none flagged for you yet.`
+                    : "All clear 🎉"}</div>}
+              {d.attention.map(a => (
+                // Title on ONE truncated line with the pills pinned beside it, then the message
+                // below at full width. The old shape put the pills in a right-hand COLUMN, which
+                // stole ~110px from the text and stacked them vertically as the panel narrowed.
+                <div className="attn" key={a.key}>
+                  <div className="attn-head">
+                    <span className="attn-title" title={a.title}>{a.title}</span>
+                    {(a.count ?? 1) > 1 && <span className="cnt">{a.count}</span>}
+                    <Pill s={a.status} />
+                    <AiPill s={a.ai_status} />
+                  </div>
+                  {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
+                  {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
+                  {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
                 </div>
-                {a.error && <div className="sub bad clamp2" title={a.error}>{a.error}</div>}
-                {a.sync_delta != null && !a.error && <div className="sub">Δ {a.sync_delta.toFixed(1)}s</div>}
-                {a.ai_verdict && <div className="sub clamp2" title={a.ai_verdict}>🤖 {a.ai_verdict}</div>}
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
 
           <AiHealthPanel ai={d.ai} now={d.now} />
 
-          <div className="panel">
-            <div className="row" style={{ marginBottom: 8 }}><b>Recently merged</b>
+          <div className="panel capped short">
+            <div className="row panel-head"><b>Recently merged</b>
               {d.merged_kinds &&
                 <span className="muted" title="'already correct' files were never touched by vo-merge — a scan found they met their target and closed the record out">
                   {d.merged_kinds.grafted.toLocaleString()} grafted
                   {d.merged_kinds.replaced > 0 && <> · {d.merged_kinds.replaced.toLocaleString()} replaced</>}
                   {d.merged_kinds.already > 0 && <> · {d.merged_kinds.already.toLocaleString()} already correct</>}
                 </span>}</div>
-            {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
-            {d.recent.map((r, i) => (
-              <div className="dashrow" key={i}>
-                <Poster src={r.poster} alt={r.title} />
-                <div className="dashrow-main">
-                  <div className="dashrow-title">{r.title}</div>
-                  <div className="sub addrow">
-                    {r.langs && <span className="lang-badge">+{r.langs} audio</span>}
-                    {r.subs && <span className="lang-badge subs">+{r.subs} subs</span>}
-                    {r.how === "replaced" && <span className="lang-badge repl">used the release</span>}
-                    {!r.langs && !r.subs && r.how !== "replaced" && <span className="muted">merged</span>}
-                  </div>
-                </div>
-                <span className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>{fmtAgo(r.ts, d.now)}</span>
-              </div>
-            ))}
+            <div className="panel-body">
+              {d.recent.length === 0 && <div className="muted">No merges yet.</div>}
+              {d.recent.map((r, i) => <MergedRow key={i} r={r} now={d.now} />)}
+            </div>
+            {/* The panel shows the ten most recent; everything older is only reachable through
+                here, so the foot carries the count it is a window onto. */}
+            {d.recent.length > 0 &&
+              <div className="row panel-foot">
+                <span className="muted" style={{ fontSize: 12 }}>the 10 most recent</span>
+                <div className="spacer" />
+                <button className="btn sec small" onClick={() => setAllMerged(true)}>
+                  See all →
+                </button>
+              </div>}
           </div>
         </div>
       </div>
@@ -1141,6 +1350,9 @@ function Overview({ goto }: { goto: (tab: string) => void }) {
           {d.next_runs.stall != null && <span className="chip">next stall sweep <b>{fmtIn(d.next_runs.stall, d.now)}</b></span>}
         </div>
       </div>
+
+      {allMerged && <AllMergedModal onClose={() => setAllMerged(false)} />}
+      {queueOpen && <QueueModal onClose={() => setQueueOpen(false)} />}
     </>
   );
 }
@@ -1230,7 +1442,7 @@ function Films() {
         </div>
 
         {view === "grid"
-          ? <div className="cardgrid">
+          ? <div className="cardgrid fixed">
               {shown.map(m => <MovieCard key={m.tmdb_id} m={m} dl={dlOf(m)} busy={busy}
                 act={act} onRelease={setRelease} onTune={setTune} />)}
             </div>
@@ -1288,6 +1500,7 @@ function Series({ anime }: { anime: boolean }) {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [relSeason, setRelSeason] = useState<{ seriesId: number; season: number; title: string } | null>(null);
+  const [relSeries, setRelSeries] = useState<{ seriesId: number; title: string } | null>(null);
   const [relEp, setRelEp] = useState<Episode | null>(null);
   const [searchMsg, setSearchMsg] = useState("");
   const toggle = (t: string) => setOpen(o => { const n = new Set(o); n.has(t) ? n.delete(t) : n.add(t); return n; });
@@ -1311,7 +1524,7 @@ function Series({ anime }: { anime: boolean }) {
       for (const e of list) { let a = sm.get(e.season); if (!a) { a = []; sm.set(e.season, a); } a.push(e); }
       const seasons = [...sm.entries()].sort((a, b) => a[0] - b[0]);
       for (const [, seps] of seasons) seps.sort((a, b) => a.episode - b.episode);
-      return { title, poster: list[0]?.poster, eps: list, byStatus, seasons };
+      return { title, poster: list[0]?.poster, sid: list[0]?.series_id, eps: list, byStatus, seasons };
     });
   }, [kindEps]);
   const shownShows = useMemo(() => {
@@ -1370,6 +1583,10 @@ function Series({ anime }: { anime: boolean }) {
             <td><div className="row">
               {!["ignored", "merged"].includes(e.status) &&
                 <button className="btn sec" disabled={busy} onClick={() => setRelEp(e)}>Interactive…</button>}
+              {["merging", "ready"].includes(e.status) &&
+                <button className="btn sec" disabled={busy}
+                  title="Kill the decode/mux running now, or take it off the merge queue"
+                  onClick={() => act(() => api.abortEpisode(e.id))}>⛔ Abort</button>}
               {["pending", "no_release", "error", "sync_fail"].includes(e.status) &&
                 <button className="btn sec" disabled={busy} onClick={() => act(() => api.epRetry(e.id))}>Retry</button>}
               {!["ignored", "merged"].includes(e.status) &&
@@ -1385,6 +1602,60 @@ function Series({ anime }: { anime: boolean }) {
     <span className={`pill ${s}`} key={s}>{n} {s.replace("_", " ")}</span>);
 
   // list row (accordion)
+  /* Re-read one show's files and act on the result. The unit an operator works in: after
+     replacing a whole show's files by hand (a fresh MULTI rip), a library-wide re-read is
+     minutes over tens of thousands of files and the hourly sweep may not reach this show for
+     ages. Runs in the background — progress shows on the scan state like any other scan. */
+  const rescanShow = async (sid: number | undefined, title: string) => {
+    if (!sid) { setSearchMsg("no Sonarr id on these records"); return; }
+    setBusy(true); setSearchMsg("");
+    try {
+      const r = await api.rescanSeries(sid);
+      setSearchMsg(r.started ? `re-reading ${title} and searching what's still missing…`
+                             : (r.note || "a scan is already running"));
+    } catch (e: any) {
+      setSearchMsg(e.message || "re-read failed");
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
+  const rescanBtn = (sh: typeof shows[number]) =>
+    <button className="btn sec small" disabled={busy}
+      title="Re-read every file of this show (bypassing the probe cache) and search for whatever it still lacks"
+      onClick={e => { e.stopPropagation(); rescanShow(sh.sid, sh.title); }}>↻ Re-read</button>;
+  /* Whole-show releases. The per-season search composes "Title Sxx", which an indexer never
+     answers with a complete-series batch — so the one release that can fill a 150-episode gap
+     in a single grab had no way to be found. */
+  const completeBtn = (sh: typeof shows[number]) =>
+    sh.sid ? <button className="btn sec small"
+      title="Find a COMPLETE-series release (a batch covering every season) and claim every episode with it"
+      onClick={e => { e.stopPropagation(); setRelSeries({ seriesId: sh.sid!, title: sh.title }); }}>
+      ⧉ Complete…</button> : null;
+  /* Start the whole show over. Deletes DOWNLOADS, never library files — the confirm says so,
+     because "delete everything" is the one instruction that must not be ambiguous. */
+  const resetShow = async (sh: typeof shows[number]) => {
+    if (!sh.sid) { setSearchMsg("no Sonarr id on these records"); return; }
+    if (!confirm(`Start "${sh.title}" (${sh.eps.length} episodes) from scratch?\n\n`
+      + `• stops any merge in progress\n• DELETES the downloads it grabbed\n`
+      + `• clears the blocklist, attempts, candidates, sync data and AI verdicts\n`
+      + `• re-reads every file afterwards\n\n`
+      + `Your library files are NOT deleted. Tracks already merged into them stay merged — `
+      + `the re-read is what records what each file actually contains now.`)) return;
+    setBusy(true); setSearchMsg("");
+    try {
+      const r = await api.resetSeries(sh.sid);
+      setSearchMsg(`${sh.title}: ${r.episodes} episode(s) reset, ${r.donors_deleted} download(s) `
+        + `deleted, ${r.merges_stopped} merge(s) stopped — re-reading the files…`);
+    } catch (e: any) {
+      setSearchMsg(e.message || "reset failed");
+    } finally { setBusy(false); refresh(); }
+  };
+  const resetBtn = (sh: typeof shows[number]) =>
+    <button className="btn sec small danger" disabled={busy}
+      title="Start this show over: stop merges, delete its downloads, clear all pipeline state, re-read the files"
+      onClick={e => { e.stopPropagation(); resetShow(sh); }}>↺ Start over</button>;
+
   const renderShow = (sh: typeof shows[number]) => {
     const isOpen = open.has(sh.title);
     return (
@@ -1393,6 +1664,7 @@ function Series({ anime }: { anime: boolean }) {
           <span className="caret">{isOpen ? "▾" : "▸"}</span>
           <Poster src={sh.poster} alt={sh.title} />
           <b>{sh.title}</b><span className="muted">{sh.eps.length} ep</span>
+          {rescanBtn(sh)}{completeBtn(sh)}{resetBtn(sh)}
           <div className="spacer" />
           <span className="chips">{statusPills(sh)}</span>
         </div>
@@ -1410,7 +1682,7 @@ function Series({ anime }: { anime: boolean }) {
           <Poster src={sh.poster} alt={sh.title} />
           <div className="showcard-meta">
             <div className="showcard-title">{sh.title}</div>
-            <div className="sub">{sh.eps.length} ep</div>
+            <div className="sub row" style={{ gap: 6 }}>{sh.eps.length} ep {rescanBtn(sh)}{completeBtn(sh)}{resetBtn(sh)}</div>
             <div className="chips">{statusPills(sh)}</div>
           </div>
         </div>
@@ -1442,8 +1714,8 @@ function Series({ anime }: { anime: boolean }) {
         </div>
       </div>
 
-      <div className="panel">
-        <div className="row toolbar" style={{ marginBottom: 10 }}>
+      <div className="panel capped full">
+        <div className="row toolbar panel-head">
           <select value={filter} onChange={e => setFilter(e.target.value)}>
             <option value="">all states</option>
             {TV_STATES.map(s => <option key={s} value={s}>{s}</option>)}
@@ -1462,11 +1734,17 @@ function Series({ anime }: { anime: boolean }) {
             <button className={view === "list" ? "active" : ""} onClick={() => setViewP("list")} title="List view">☰ List</button>
           </div>
         </div>
-        {view === "grid"
-          ? <div className="showcardgrid">{shownShows.map(renderShowCard)}</div>
-          : shownShows.map(renderShow)}
-        {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
+        <div className="panel-body">
+          {view === "grid"
+            ? <div className="showcardgrid fixed">{shownShows.map(renderShowCard)}</div>
+            : shownShows.map(renderShow)}
+          {shownShows.length === 0 && <div className="muted">{anime ? "No anime match." : "No shows match."}</div>}
+        </div>
       </div>
+      {relSeries && <ReleaseModal title={`${relSeries.title} — complete series`}
+        load={() => api.seriesCandidates(relSeries.seriesId)}
+        onGrab={c => api.seriesGrab(relSeries.seriesId, c.link, c.rid, c.title)}
+        onClose={() => setRelSeries(null)} onGrabbed={refresh} />}
       {relSeason && <ReleaseModal title={`${relSeason.title} S${pad2(relSeason.season)}`}
         load={() => api.seasonCandidates(relSeason.seriesId, relSeason.season)}
         onGrab={c => api.seasonGrab(relSeason.seriesId, relSeason.season, c.link, c.rid, c.title)}
@@ -1537,8 +1815,8 @@ function Review() {
 
   return (
     <>
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped tall">
+      <div className="row panel-head">
         <b>Needs review</b>
         <span className="muted">{rows.length} item{rows.length === 1 ? "" : "s"}
           {needHuman > 0 && <> · <span className="bad">{needHuman} the AI couldn’t fix</span></>}</span>
@@ -1549,9 +1827,10 @@ function Review() {
             onClick={() => act(api.retryAllErrors)}>↻ Retry {retryable} failed</button>}
         <LiveDot />
       </div>
-      {rows.length === 0
-        ? <div className="muted">Nothing needs review 🎉</div>
-        : <table>
+      <div className="panel-body">
+        {rows.length === 0
+          ? <div className="muted">Nothing needs review 🎉</div>
+          : <table>
             <thead><tr><th>Title</th><th>Reason</th><th>AI review</th><th>Actions</th></tr></thead>
             <tbody>
               {rows.map(r => {
@@ -1605,7 +1884,8 @@ function Review() {
                 );
               })}
             </tbody>
-          </table>}
+            </table>}
+      </div>
       {tune && <SyncEditor movie={tune} onClose={() => { setTune(null); refresh(); }} />}
       {release && <ReleaseModal title={release.title}
         load={() => api.candidates(release.tmdb_id)}
@@ -1638,8 +1918,8 @@ function AiSolvedPanel() {
     ["resolved", "Solved"], ["failed", "Couldn’t fix"],
     ["needs_human", "Handed back"], ["all", "All"]];
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: open ? 10 : 0 }}>
+    <div className="panel capped">
+      <div className="row panel-head" style={{ marginBottom: open ? 10 : 0 }}>
         <button className="btn sec" style={{ padding: "2px 8px" }}
           onClick={() => setOpen(o => !o)}>{open ? "▾" : "▸"}</button>
         <b>🤖 What the AI did</b>
@@ -1653,9 +1933,10 @@ function AiSolvedPanel() {
             </button>))}
         </div>}
       </div>
-      {open && (d.items.length === 0
-        ? <div className="muted">Nothing in this category yet.</div>
-        : <table>
+      {open && <div className="panel-body">
+        {d.items.length === 0
+          ? <div className="muted">Nothing in this category yet.</div>
+          : <table>
             <thead><tr><th>Title</th><th>What it did</th><th>Now</th><th>When</th></tr></thead>
             <tbody>
               {d.items.map(i => (
@@ -1671,7 +1952,8 @@ function AiSolvedPanel() {
                   <td className="muted" style={{ whiteSpace: "nowrap" }}>{fmtAgo(i.ai_at, d.now)}</td>
                 </tr>))}
             </tbody>
-          </table>)}
+            </table>}
+      </div>}
     </div>
   );
 }
@@ -1743,7 +2025,10 @@ function Settings() {
       <span className={tests[k] === "ok" ? "ok" : "bad"}> {tests[k]}</span>}</button>;
 
   return (
-    <div className="panel">
+    <div className="panel capped full">
+      {/* The form is metres long, so it scrolls inside the panel — but Save must never scroll
+          out of reach, so it sits in the pinned foot below rather than inside this body. */}
+      <div className="panel-body">
       <div className="section-title">Integrations</div>
       <div className="form-grid">
         <label>Prowlarr URL</label>{Text("prowlarr_url")}{TestBtn("prowlarr")}
@@ -1906,7 +2191,8 @@ function Settings() {
         <label>Pipeline enabled</label>{Check("enabled")}<span />
       </div>
 
-      <div className="row" style={{ marginTop: 18 }}>
+      </div>
+      <div className="row panel-foot">
         <button className="btn" onClick={save}>Save</button>
         {saved && <span className="ok">saved ✓</span>}
       </div>
@@ -1922,12 +2208,12 @@ function Logs() {
   useEffect(() => { refresh(); /* always load once on mount */ /* eslint-disable-next-line */ }, []);
   usePoll(() => { if (auto) refresh().catch(() => {}); }, 5000, [auto]);
   return (
-    <div className="panel">
-      <div className="row" style={{ marginBottom: 10 }}>
+    <div className="panel capped full">
+      <div className="row panel-head">
         <button className="btn sec" onClick={refresh}>Refresh</button>
         <label className="muted"><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} /> auto</label>
       </div>
-      <pre className="logs">{lines.join("")}</pre>
+      <pre className="logs panel-body">{lines.join("")}</pre>
     </div>
   );
 }

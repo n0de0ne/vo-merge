@@ -15,7 +15,7 @@ from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_
                        _pick_subs, _donor_opts, hold_reason, reopen_status,
                        CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
                        run_mux, SearchUnavailable, _sync_fail_reason,
-                       resolve_donor_path)
+                       resolve_donor_path, qc_grafted_audio, _unlink, recycle)
 
 SXXEXX = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
 VIDEXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts")
@@ -350,7 +350,7 @@ def _size_bonus(r):
 
 
 def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=None, need=(),
-            need_subs=(), tried=()):
+            need_subs=(), tried=(), orig=None):
     """Return best (score, seeders, title, link, rid) for a usable release, or None.
 
     `tried` is the set of release identities this record has already burned. Without it the
@@ -376,8 +376,8 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
     best = None
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, query):
-            continue                     # advertises only dubs this episode already has
+        if media.useless_release(t, lang_need, query, orig=orig, need_subs=need_subs):
+            continue    # advertises only audio this episode already has (dub OR VOST claim)
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
         if want_pack:
@@ -410,6 +410,32 @@ def _search(query, cfg, want_pack=False, season=None, ep=None, year=None, absn=N
         if best is None or sc > best[0]:
             best = (sc, r.get("seeders") or 0, t, link, rid)
     return best
+
+
+_ALT_CACHE = {}                  # series_id -> (expires_at, [alternate titles])
+
+
+def _alt_titles(series_id, cfg=None):
+    """Sonarr's alternate titles for a series (romaji, English, other transliterations) — the
+    query ladder's next guesses once the library title has proven fruitless. Cached like
+    `_numbering` (1 h); a Sonarr failure returns [] and is not cached."""
+    hit = _ALT_CACHE.get(series_id)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    titles = []
+    try:
+        cfg = cfg or core.load_config()
+        s = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"]).series_one(series_id) or {}
+        main_t = (s.get("title") or "").strip()
+        for a in s.get("alternateTitles") or []:
+            t = (a.get("title") or "").strip()
+            if t and t != main_t and _toks(t) and t not in titles:
+                titles.append(t)
+    except Exception as ex:
+        core.log(f"tv alt titles {series_id}: {ex}")
+        return []
+    _ALT_CACHE[series_id] = (time.time() + 3600, titles)
+    return titles
 
 
 def _usable(best, cfg):
@@ -451,10 +477,10 @@ def season_candidates(series_id, season, cfg=None):
     lang_need = set(need) | need_s if subs_only else need
     rseasons = sorted({_release_se(e, cfg)[0] for e in eps}) or [season]
     query = f"{title} S{rseasons[0]:02d}" if len(rseasons) == 1 else title
-    import json as _json
+    from .pipeline import tried_active
     tried = set()
     for e in eps:
-        tried |= set(_json.loads(e.get("tried") or "[]"))
+        tried |= tried_active(e, cfg)
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
         results = pro.search(query, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
@@ -466,7 +492,8 @@ def season_candidates(series_id, season, cfg=None):
     seas_re = "|".join(rf"s0?{s}\b|season\s*0?{s}\b" for s in rseasons)
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, title):
+        if media.useless_release(t, lang_need, title, orig=eps[0].get("orig_lang"),
+                                 need_subs=need_s):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -490,6 +517,103 @@ def season_candidates(series_id, season, cfg=None):
                     "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
     out.sort(key=lambda x: -x["score"])
     return out
+
+
+# A release that covers the WHOLE show, however the scene spelled it. "Batch" is the anime
+# convention and was missing entirely — `[Judas] … (Complete Series + Movies) … (Batch)` is the
+# exact shape this exists for.
+COMPLETE_RX = re.compile(r'(?<![a-z])(complete|int[eé]grale|integrale|batch|all\s+seasons'
+                         r'|full\s+series|s01\s*[-–~]\s*s?\d{2})(?![a-z])', re.I)
+
+
+def series_candidates(series_id, cfg=None):
+    """Scored candidates for the WHOLE SHOW — the complete-series batches.
+
+    Every other pack search composes `Title Sxx`, which is exactly why a complete-series batch
+    could never be found: an indexer asked for "Hunter x Hunter (2011) S01" does not return
+    "[Judas] Hunter x Hunter (2011) (Complete Series + Movies) … (Batch)". The pipeline could
+    already CLAIM such a release (`_pack_seasons` reads complete/intégrale as "every season" and
+    `_assign_pack` fans it out over the whole show) — there was simply no way to search for one.
+
+    So: query the bare title, and keep releases that cover more than one season — a complete
+    batch, a multi-season range, or a per-season pack (offered too, since one season of a long
+    show is often the only thing seeded). Single episodes are left to the per-episode search.
+    Scoring prefers what actually helps: a complete batch first, then the missing languages."""
+    cfg = cfg or core.load_config()
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id]
+    if not eps:
+        return []
+    gap = [e for e in eps if e["status"] not in ("merged", "ignored")] or eps
+    title = eps[0]["series_title"]
+    need = {x for e in gap for x in (e.get("need_audio") or "").split(",") if x}
+    need_s = {x for e in gap for x in (e.get("need_subs") or "").split(",") if x}
+    subs_only = _subs_only(need, need_s)
+    lang_need = set(need) | need_s if subs_only else need
+    # every season a RELEASE would use for this show, so a multi-season pack can be recognised
+    rseasons = sorted({_release_se(e, cfg)[0] for e in gap})
+    from .pipeline import tried_active
+    tried = set()
+    for e in gap:
+        tried |= tried_active(e, cfg)
+    pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
+    try:
+        results = pro.search(title, cfg["en_indexer_ids"] + cfg.get("multi_indexer_ids", []))
+    except Exception as e:
+        core.log(f"series_candidates: {e}")
+        raise SearchUnavailable(str(e)) from e
+    qt = _toks(title); out = []
+    for r in results:
+        t = r.get("title", ""); tl = t.lower()
+        if media.useless_release(t, lang_need, title, orig=gap[0].get("orig_lang"),
+                                 need_subs=need_s):
+            continue
+        if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
+            continue
+        if SXXEXX.search(t):
+            continue                      # a single episode is not a whole-show answer
+        complete = bool(COMPLETE_RX.search(t))
+        seasons = _pack_seasons(t, -1)    # -1 = "advertised no season of its own"
+        multi_season = seasons is None or (seasons and seasons != {-1} and len(seasons) > 1)
+        covers = seasons is None or bool(seasons and (set(seasons) & set(rseasons)))
+        if not (complete or multi_season or covers):
+            continue
+        sc = min(int(r.get("seeders") or 0), 100)
+        if complete:
+            sc += 150                     # the thing this search exists to surface
+        elif multi_season:
+            sc += 80
+        else:
+            sc += 40                      # a single-season pack: still useful, ranked below
+        if subs_only:      sc += _size_bonus(r)
+        elif RES.search(t): sc += 20
+        if re.search(r"\bMULTI\b", t, re.I): sc += 40 if subs_only else 200
+        sc += 120 * media.lang_hits(t, lang_need, title)
+        link = _pick_link(r); rid = _hash_from_magnet(link) or r.get("guid") or r.get("title")
+        out.append({"score": sc, "seeders": r.get("seeders") or 0, "size": r.get("size") or 0,
+                    "title": t, "indexer": r.get("indexer"), "pack": True, "complete": complete,
+                    "multi": bool(re.search(r"\bMULTI\b", t, re.I)),
+                    "link": link, "rid": rid, "tried": rid in tried, "info_url": r.get("infoUrl")})
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def grab_series(series_id, link, rid=None, title=None, cfg=None):
+    """Grab a whole-show release and claim every gap episode it covers.
+
+    The seasons come from the release NAME, exactly as a pack grab does — but with one extra
+    rule: a title that advertises no season at all was picked by the operator AT SERIES LEVEL,
+    so it means the whole show rather than "season -1". That is the common case here, because a
+    complete batch usually names no season."""
+    cfg = cfg or core.load_config()
+    h = _grab(link, f"{cfg['qb_tv_download_dir']}/{series_id}_ALL", cfg)
+    if not h:
+        raise RuntimeError("torrent never appeared in qB (fetch/add failed)")
+    s = _pack_seasons(title, -1)
+    seasons = None if (s is None or s == {-1}) else s
+    n = _assign_pack(series_id, seasons, h, rid, title, cfg)
+    core.log(f"tv grab SERIES {series_id} (seasons {sorted(seasons) if seasons else 'ALL'}): "
+             f"{n} ep(s) <- {title}")
+    return n
 
 
 def _pack_seasons(title, default_season):
@@ -528,7 +652,8 @@ def _assign_pack(series_id, seasons, h, rid, title, cfg=None):
            and (seasons is None or _release_se(e, cfg)[0] in seasons)]
     for e in eps:
         core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
-                           candidate_title=title, error=None)
+                           candidate_title=title, error=None, transient_fails=0,
+                           search_rounds=0)
     return len(eps)
 
 
@@ -560,8 +685,8 @@ def episode_candidates(ep_id, cfg=None):
     need_s = {x for x in (e.get("need_subs") or "").split(",") if x}
     subs_only = _subs_only(need, need_s)
     lang_need = set(need) | need_s if subs_only else need
-    import json as _json
-    tried = set(_json.loads(e.get("tried") or "[]"))
+    from .pipeline import tried_active
+    tried = tried_active(e, cfg)
     pro = Prowlarr(cfg["prowlarr_url"], cfg["prowlarr_key"])
     try:
         results = pro.search(f"{title} S{season:02d}E{ep:02d}",
@@ -573,7 +698,8 @@ def episode_candidates(ep_id, cfg=None):
     qt = _toks(title); out = []
     for r in results:
         t = r.get("title", ""); tl = t.lower()
-        if media.useless_release(t, lang_need, title):
+        if media.useless_release(t, lang_need, title, orig=e.get("orig_lang"),
+                                 need_subs=need_s):
             continue
         if qt and len(qt & _toks(t)) / max(len(qt), 1) < 0.6:
             continue
@@ -605,15 +731,11 @@ def retry_episode(ep_id, cfg=None):
     """Proper retry for an errored/failed episode: blocklist the release that failed, drop its
     donor from qB (only if no other live episode still needs that hash), clear the grab fields,
     and re-queue for a fresh search."""
-    import json as _json
     cfg = cfg or core.load_config()
     e = core.get_episode(ep_id)
     if not e:
         return False
     h = e.get("dl_hash")
-    tried = _json.loads(e.get("tried") or "[]")
-    if e.get("dl_id") and e["dl_id"] not in tried:
-        tried.append(e["dl_id"])
     if h:
         live = [x for x in core.get_episodes()
                 if (x.get("dl_hash") == h and x["id"] != ep_id
@@ -627,7 +749,7 @@ def retry_episode(ep_id, cfg=None):
                 core.log(f"retry {ep_id}: donor drop failed: {ex}")
     # attempts is reset because an operator asking for a retry means "try again": a sync_fail
     # record has already spent its budget and would otherwise fail straight back to sync_fail.
-    core.set_ep_status(ep_id, "pending", error=None, tried=_json.dumps(tried), attempts=0,
+    core.set_ep_status(ep_id, "pending", error=None, tried=blocklist(e), attempts=0,
                        **DONOR_RESET, **AI_RESET, progress="")
     return True
 
@@ -657,7 +779,12 @@ def grab_episode(ep_id, link, rid=None, title=None, cfg=None):
     return 1 + extra
 
 
-def stage_search(cfg=None):
+def stage_search(cfg=None, only_series=None):
+    """The TV search sweep. `only_series` narrows it to ONE Sonarr series — what the operator's
+    per-show "re-scan and search" does, so a show that was just re-imported (a fresh MULTI rip,
+    say) is searched for its remaining gap immediately instead of waiting for the hourly sweep to
+    reach it behind a few thousand other records. Everything downstream is unchanged: the same
+    grouping, the same pack-vs-episode decision, the same brakes and budget."""
     cfg = cfg or core.load_config()
     if not (cfg["enabled"] and cfg["scope_series"]):
         return
@@ -669,6 +796,8 @@ def stage_search(cfg=None):
         core.log(f"tv search: in-flight cap ({cfg.get('max_inflight_downloads', 5)}) reached -> not grabbing")
         return
     pend = core.get_episodes("pending")
+    if only_series is not None:
+        pend = [e for e in pend if e["series_id"] == only_series]
     cap = min(budget, cfg.get("max_search_per_run", 25)); n = 0   # ramp gradually, don't flood indexers
     # Group by the season a RELEASE would use, not the season the library filed it under. An
     # absolute-as-S01 anime library otherwise lumps every episode into one S01 group, searches
@@ -703,13 +832,14 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
     `no_release_retry_h` expired for a large backlog at once, a single cycle ran one Prowlarr query
     per episode across hundreds of episodes — exactly the hammering `max_search_per_run` exists to
     prevent, and re-run by the finish refill every 10 minutes."""
-    import json as _json
+    from .pipeline import tried_active
     if len(eps) >= cfg["tv_pack_threshold"]:
         q = f"{title} S{season:02d}"
         # A pack has to clear every member's blocklist: one episode having burned this release is
         # reason enough not to grab it again for the whole season.
-        pack_tried = {x for e in eps for x in _json.loads(e.get("tried") or "[]")}
+        pack_tried = {x for e in eps for x in tried_active(e, cfg)}
         best = _search(q, cfg, want_pack=True, season=season, tried=pack_tried,
+                       orig=eps[0].get("orig_lang"),
                        need={x for e in eps for x in (e.get("need_audio") or "").split(",") if x},
                        need_subs={x for e in eps
                                   for x in (e.get("need_subs") or "").split(",") if x})
@@ -718,11 +848,14 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
             sc, seed, rtitle, link, rid = best
             h = _grab(link, f"{cfg['qb_tv_download_dir']}/{sid}_S{season:02d}", cfg)
             if not h:
-                # grab failed -> mark these eps error (NOT a null-hash download, which would
-                # loop grab -> reconcile-to-pending -> re-grab forever)
+                # Grab failed -> retryable, per episode (NOT a null-hash download, which would
+                # loop grab -> reconcile-to-pending -> re-grab forever; and NOT a straight
+                # `error`, which paged the AI for what is usually a fetch timeout or qB blip —
+                # pipeline.transient self-retries and escalates only a consecutive run).
+                from .pipeline import transient
                 for e in eps:
-                    core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) set to error")
+                    transient("episode", e["id"], "grab: torrent never appeared", cfg)
+                core.log(f"tv grab PACK '{q}': grab failed -> {len(eps)} ep(s) queued for retry")
                 return n
             seasons = _pack_seasons(rtitle, season)   # claim every season the pack advertises
             # `rid` (not None): the identity every retry path blocklists. Passing None meant the
@@ -737,24 +870,43 @@ def _search_season(sid, title, season, eps, rel, cfg, n, cap):
         if n >= cap:
             break
         rs, rn = rel[e["id"]]
+        e_need = {x for x in (e.get("need_audio") or "").split(",") if x}
+        e_need_s = {x for x in (e.get("need_subs") or "").split(",") if x}
         q = f"{title} S{rs:02d}E{rn:02d}"
         best = _search(q, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
-                       tried=set(_json.loads(e.get("tried") or "[]")),
-                       need={x for x in (e.get("need_audio") or "").split(",") if x},
-                       need_subs={x for x in (e.get("need_subs") or "").split(",") if x})
+                       tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s,
+                       orig=e.get("orig_lang"))
         n += 1
+        # Query ladder: once a record has burned a whole fruitless ROUND, the library title has
+        # proven unmatchable and Sonarr's alternate titles (romaji etc.) are the automatable
+        # next guess — see pipeline._movie_queries for the movie mirror.
+        if not _usable(best, cfg) and (e.get("search_rounds") or 0) >= 1:
+            for alt in _alt_titles(sid, cfg)[:2]:
+                if n >= cap:
+                    break
+                q2 = f"{alt} S{rs:02d}E{rn:02d}"
+                best = _search(q2, cfg, season=rs, ep=rn, absn=_abs_num(e, cfg),
+                               tried=tried_active(e, cfg), need=e_need, need_subs=e_need_s,
+                               orig=e.get("orig_lang"))
+                n += 1
+                if _usable(best, cfg):
+                    core.log(f"tv search: query ladder matched on '{q2}'")
+                    break
         if not _usable(best, cfg):
             core.set_ep_status(e["id"], "no_release",
+                               search_rounds=(e.get("search_rounds") or 0) + 1,
                                candidate_title=(best[2] if best else None))
             continue
         sc, seed, rtitle, link, rid = best
         h = _grab(link, f"{cfg['qb_tv_download_dir']}/{e['id'].replace(':','_')}", cfg)
         if not h:
-            core.set_ep_status(e["id"], "error", error="grab: torrent never appeared")
-            core.log(f"tv grab EP '{q}': grab failed -> error")
+            from .pipeline import transient
+            transient("episode", e["id"], "grab: torrent never appeared", cfg)
+            core.log(f"tv grab EP '{q}': grab failed -> queued for retry")
             continue
-        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid,
-                           candidate_title=rtitle, candidate_score=sc, candidate_seeders=seed)
+        core.set_ep_status(e["id"], "downloading", dl_hash=h, dl_id=rid, transient_fails=0,
+                           search_rounds=0, candidate_title=rtitle, candidate_score=sc,
+                           candidate_seeders=seed)
         core.log(f"tv grab EP '{q}': [{sc}] {seed}s {rtitle}")
     return n
 
@@ -770,18 +922,15 @@ def _reject_and_retry_ep(ep, reason, cfg, delta=None, final="sync_fail"):
 
     The donor torrent is deliberately NOT deleted: it is usually a season pack that other episodes
     are still merging from. `free_donor_if_done` releases it once nobody needs it."""
-    import json as _json
-    tried = _json.loads(ep.get("tried") or "[]")
-    if ep.get("dl_id") and ep["dl_id"] not in tried:
-        tried.append(ep["dl_id"])
+    tried = blocklist(ep)
     attempts = (ep.get("attempts") or 0) + 1
     if attempts >= cfg.get("max_sync_retries", 4):
-        core.set_ep_status(ep["id"], final, tried=_json.dumps(tried), attempts=attempts,
+        core.set_ep_status(ep["id"], final, tried=tried, attempts=attempts,
                            sync_delta=delta, progress="",
                            error=f"{reason}; no compatible release after {attempts} tries")
         core.log(f"tv merge {ep['id']}: {final} after {attempts} tries ({reason})")
         return
-    core.set_ep_status(ep["id"], "pending", tried=_json.dumps(tried), attempts=attempts,
+    core.set_ep_status(ep["id"], "pending", tried=tried, attempts=attempts,
                        **DONOR_RESET, error=None, progress="")
     core.log(f"tv merge {ep['id']}: {reason} -> blocklisted, re-searching (attempt {attempts})")
 
@@ -813,11 +962,26 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     from . import sync
     from .clients import Sonarr as _S
     fr = ep["french_path"]
-    if not (os.path.exists(en_file) and os.path.exists(fr)):
-        core.set_ep_status(ep["id"], "error", error="merge: file missing"); return
+    if not os.path.exists(en_file):
+        _reject_and_retry_ep(ep, "donor file vanished before the merge", cfg)
+        return
+    if not os.path.exists(fr):
+        core.set_ep_status(ep["id"], "error", error="merge: library file missing on disk"); return
     ei, fi = probe(en_file), probe(fr)
-    if not ei or not fi:
-        core.set_ep_status(ep["id"], "error", error="merge: probe failed"); return
+    if not ei:
+        # unreadable DONOR = defective release -> blocklist it, fetch another (see pipeline)
+        _reject_and_retry_ep(ep, "donor unreadable (probe failed)", cfg)
+        return
+    if not fi:
+        # unreadable BASE is more likely a mount hiccup — self-retry, escalate only a run of them
+        from .pipeline import transient
+        transient("episode", ep["id"], "merge: library file probe failed", cfg, back_to="ready")
+        return
+    from .pipeline import disk_headroom_ok, hold_for_disk
+    okd, dfree, dneed = disk_headroom_ok([en_file, fr], os.path.dirname(fr), cfg)
+    if not okd:
+        hold_for_disk("episode", ep["id"], dfree, dneed, cfg)
+        return
     # The download alone satisfies this episode's audio profile -> remux it directly, but ONLY
     # if its video isn't worse than the library file; otherwise keep the library video and graft
     # what's missing (below). Asked of the probed file against the profile, not of a literal
@@ -837,6 +1001,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         os.makedirs(os.path.dirname(out), exist_ok=True)
         ok_mux, mux_err = run_mux(["mkvmerge", "-o", out, en_file], out, cfg)
         if ok_mux:
+            # the library file's content is being DISCARDED — recycle it (see pipeline.recycle)
+            recycle(fr, cfg)
             shutil.move(out, fr)
             try: os.rmdir(os.path.dirname(out))
             except OSError: pass
@@ -852,7 +1018,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             except Exception: pass
             _plex_ep_refresh(ep, cfg)
         else:
-            core.set_ep_status(ep["id"], "error", error=f"multi remux: {mux_err}")
+            # a release mkvmerge can't remux is a defective download — fetch another
+            _reject_and_retry_ep(ep, f"multi remux failed: {mux_err}", cfg, final="error")
         return
     delta = abs((ei["dur"] or 0) - (fi["dur"] or 0))
     # Only a DELIBERATELY set offset skips detection — see pipeline._merge_movie_impl. A stored
@@ -889,14 +1056,26 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
         # reject a donor carrying exactly the language the record needed.
         still_a, still_s = media.gap_langs(*media.langs(bi), kind, cfg, ep.get("orig_lang"))
         if still_a or still_s:
-            core.set_ep_status(ep["id"], "error", progress="",
-                               error="merge: release carries none of the missing languages "
-                                     f"(still needs {'+'.join(still_a + still_s)})")
+            # Wrong release, not a dead end: blocklist it and go back for another — the movie
+            # path has always done this, TV parked it as `error` for an agent to /retry.
+            _reject_and_retry_ep(ep, "release carries none of the missing languages "
+                                     f"(still needs {'+'.join(still_a + still_s)})", cfg, delta)
             return
         core.set_ep_status(ep["id"], "merged", merged_file=fr, progress="", error=None,
                            added_langs="", merge_kind="already")
         core.log(f"tv merge {ep['id']}: already has English -> done")
         _plex_ep_refresh(ep, cfg)
+        return
+    # The merge must give the LIBRARY FILE something it still lacks — see pipeline.graft_gains
+    # for the VOSTFR shape this closes. Decided BEFORE sync detection, the expensive part.
+    from .pipeline import graft_gains
+    gains, lib_needs = graft_gains(bi, fi, {langs[i] for i in ids},
+                                   {s["lang"] for s in subs}, kind, cfg,
+                                   ep.get("orig_lang"), _orig_codes(ep.get("orig_lang")))
+    if not gains:
+        _reject_and_retry_ep(ep, "release adds nothing this file needs "
+                                 f"(file still needs {'+'.join(lib_needs) or 'nothing'})",
+                             cfg, delta)
         return
     # manual offset skips detection; honour a stored stretch ratio (see pipeline)
     drift = (ep.get("sync_drift") or None) if manual else None
@@ -911,12 +1090,24 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             base_fps=bi.get("fps"), donor_fps=di.get("fps"),
             base_dur=bi.get("dur"), donor_dur=di.get("dur"))
         if m is None or (fps_diff and not drift):
-            # Spend the automatic budget on ANOTHER release before settling — see
-            # pipeline.reject_and_retry. This used to be terminal on the first attempt.
-            why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
-            _reject_and_retry_ep(ep, why, cfg, delta,
-                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
-            return
+            # On the budget-spending attempt, run the pipeline's own wide probe before parking
+            # — see pipeline.wide_probe_rescue. Otherwise spend the automatic budget on ANOTHER
+            # release first (this used to be terminal on the first attempt).
+            from .pipeline import wide_probe_rescue
+            rescue = None
+            if (ep.get("attempts") or 0) + 1 >= cfg.get("max_sync_retries", 4):
+                rescue = wide_probe_rescue(base, donor, 0, (daidx[ids[0]] if ids else 0),
+                                           min(ei["dur"] or 0, fi["dur"] or 0), fps_diff, cfg,
+                                           tag=f" {ep['id']}",
+                                           on_progress=lambda msg: _beat("episode", ep["id"], msg),
+                                           base_fps=bi.get("fps"), donor_fps=di.get("fps"),
+                                           base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+            if rescue is None:
+                why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
+                _reject_and_retry_ep(ep, why, cfg, delta,
+                                     final="review" if cfg.get("sync_review", True) else "sync_fail")
+                return
+            m, conf, method, drift = rescue
         if abs(m) >= 40 or drift:
             offset = int(round(m))
         core.log(f"tv sync {ep['id']}: {offset:+d}ms{' drift' if drift else ''} ({method} conf {conf:.2f})")
@@ -929,7 +1120,21 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
     ok_mux, mux_err = run_mux(cmd, out, cfg)
     if not ok_mux:
-        core.set_ep_status(ep["id"], "error", progress="", error=mux_err); return
+        # almost always the donor's container — blocklist it and fetch another (see pipeline)
+        _reject_and_retry_ep(ep, f"mux failed: {mux_err}", cfg, delta, final="error")
+        return
+    # verify BEFORE the in-place swap — see pipeline.qc_grafted_audio (audio grafts only)
+    if ids:
+        _beat("episode", ep["id"], "verifying sync of the merged file…")
+        ok_qc, qres, qconf = qc_grafted_audio(out, len(bi["auds"]),
+                                              min(ei["dur"] or 0, fi["dur"] or 0), cfg,
+                                              tag=f" {ep['id']}")
+        if not ok_qc:
+            _unlink(out)
+            _reject_and_retry_ep(ep, f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
+                                     f"(conf {qconf:.2f})", cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
     shutil.move(out, fr)            # replace FR file in place (same name)
     try:
         os.rmdir(outdir)
@@ -957,7 +1162,6 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
 def _drop_stalled_eps(eps, t, cfg):
     """A stalled season-pack/episode torrent: delete it, blocklist that release for all its
     episodes, set them back to pending so stage_search grabs another (better-seeded) release."""
-    import json as _json
     try:
         qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
         if eps and eps[0].get("dl_hash"):
@@ -966,12 +1170,9 @@ def _drop_stalled_eps(eps, t, cfg):
         pass
     seeds = t.get("num_complete", t.get("num_seeds", 0)) or 0
     for e in eps:
-        tried = _json.loads(e.get("tried") or "[]")
-        if e.get("dl_id") and e["dl_id"] not in tried:
-            tried.append(e["dl_id"])
         attempts = (e.get("attempts") or 0) + 1
         st = "no_release" if attempts >= cfg.get("max_sync_retries", 4) else "pending"
-        core.set_ep_status(e["id"], st, tried=_json.dumps(tried), attempts=attempts,
+        core.set_ep_status(e["id"], st, tried=blocklist(e), attempts=attempts,
                            **DONOR_RESET, progress="",
                            error=("all releases stalled" if st == "no_release" else None))
     core.log(f"tv stall: '{t.get('name','')[:50]}' stalled ({seeds} seeds) -> blocklisted "
@@ -1041,8 +1242,10 @@ def merge_ready_episode(ep_id, cfg=None):
     if en and en != ep.get("en_file"):
         core.set_ep_status(ep_id, ep["status"], en_file=en)
     if not en or not os.path.exists(en):
-        core.set_ep_status(ep_id, "error", progress="",
-                           error="merge: donor file missing (not on disk, and qB no longer has it)")
+        # Genuinely gone (qB confirmed). The autonomous answer is another release — same
+        # reasoning as the movie path; parking it as `error` handed the AI a /retry.
+        _reject_and_retry_ep(ep, "donor file vanished before the merge "
+                                 "(not on disk, and qB no longer has it)", cfg)
         return
     res = _merge_episode(ep, en, cfg, hint=_PACK_HINT.get(h))
     if res and res[0] is not None and h:
@@ -1058,6 +1261,63 @@ def promote_completed(cfg=None):
         return _promote_completed(cfg)
     finally:
         TV_PROMOTE_LOCK.release()
+
+
+def _claimable(tgt, rid, h, cfg):
+    """May this completed download claim `tgt` for merging? The mapping loop used to ask only
+    "is it already queued/merging" — which made promote a BACK DOOR around the blocklist, and
+    the engine of the worst observed loop: a completed pack that can't help an episode (a
+    Dual-Audio eng+jpn donor for a fre-audio gap) sat in qB kept alive by its siblings, and
+    every minute the promote sweep re-assigned it to the episode that had just rejected it —
+    29 merge attempts on one episode, and when the on-call agent force-grabbed the RIGHT
+    release, promote hijacked the record back to the bad pack before the new donor finished
+    downloading. Two refusals close it:
+
+    - a release identity this record has already BURNED (its `tried` list holds the release id
+      or the torrent hash) is never re-assigned by promote — same rule every search obeys;
+    - an episode already `downloading` under a DIFFERENT hash belongs to that download (often
+      the agent's deliberate re-grab); its own promote will claim it when it lands."""
+    if tgt["status"] in ("ready", "merging"):
+        return False                     # already queued or being merged — don't disturb
+    from .pipeline import tried_active
+    blocked = tried_active(tgt, cfg)
+    if (rid and rid in blocked) or (h and h in blocked):
+        return False
+    if tgt["status"] == "downloading" and tgt.get("dl_hash") and tgt["dl_hash"] != h:
+        return False
+    return True
+
+
+# Consecutive promote passes a completed download has failed to move, per donor. The sweep runs
+# every minute, so this is also a clock: past STUCK_MAX the records stop being annotated and
+# become a real error, which is what puts them in Review and in front of the on-call AI.
+_STUCK_PASSES = {}
+STUCK_MAX = 30                       # ~30 min at the 1-min promote cadence
+
+
+def _stuck(eps, why, h=None):
+    """Explain, on the records themselves, why a COMPLETED download is not moving — and escalate
+    if it stays that way.
+
+    Every skip in this sweep used to be silent: the row read "100% · done" and sat there, which
+    is indistinguishable from a broken app. Worse, it sat there indefinitely — a pack observed
+    stuck for 24 hours was never going to move and nothing said so. `progress` is the pipeline's
+    own explanation field and writing it does not touch `updated` (see core._set_row), so
+    annotating a stall cannot reshuffle the attention panel; but after STUCK_MAX passes the
+    annotation has plainly not helped, and a record nobody can see is worse than an error
+    everybody can."""
+    n = 0
+    if h:
+        n = _STUCK_PASSES[h] = _STUCK_PASSES.get(h, 0) + 1
+    if n >= STUCK_MAX:
+        _STUCK_PASSES.pop(h, None)
+        for e in eps:
+            core.set_ep_status(e["id"], "error", progress="",
+                               error=f"download {why} — stuck for {STUCK_MAX} min")
+        core.log(f"tv promote: {str(h)[:12]} stuck {STUCK_MAX} passes ({why}) -> error")
+        return
+    for e in eps:
+        core.set_ep_status(e["id"], e["status"], progress=why)
 
 
 def _promote_completed(cfg=None):
@@ -1077,7 +1337,16 @@ def _promote_completed(cfg=None):
     queued = 0
     for h, eps in by_hash.items():
         t = torrents.get(h)
-        if not t or (t.get("progress", 0) or 0) < 1.0:
+        if not t:
+            # The record points at a torrent that is not in this category — renamed category,
+            # removed outside vo-merge, or added to the wrong one. `stage_finish` reconciles
+            # this every 10 minutes, but promote runs every MINUTE and used to skip it in
+            # silence, so a download stuck here showed "100% · done" and no reason for as long
+            # as it took someone to notice. Say it on the record, where the UI already looks.
+            _stuck(eps, f"complete, but its torrent is not in the {cfg['qb_tv_category']} "
+                        f"category in qB (hash {str(h)[:12]}) — reconciling", h)
+            continue
+        if (t.get("progress", 0) or 0) < 1.0:
             continue
         local = _qb_to_local(t.get("content_path") or t.get("save_path") or "", cfg)
         root = local if os.path.isdir(local) else os.path.dirname(local)
@@ -1124,8 +1393,8 @@ def _promote_completed(cfg=None):
             if not tgt:
                 continue
             mapped += 1
-            if tgt["id"] in taken or tgt["status"] in ("ready", "merging"):
-                continue                       # already queued or being merged — don't disturb
+            if tgt["id"] in taken or not _claimable(tgt, eps[0].get("dl_id"), h, cfg):
+                continue           # queued/merging, a burned release, or another donor's record
             # conditional on the status we just read: if the worker claimed it in between,
             # this fails and we leave the live merge alone (never re-queue a merging episode)
             if core.claim_episode(tgt["id"], tgt["status"], "ready", en_file=vid,
@@ -1135,14 +1404,24 @@ def _promote_completed(cfg=None):
                 claimed += 1
         if claimed:
             queued += claimed
+            _STUCK_PASSES.pop(h, None)          # it moved: the stall clock starts over
             core.log(f"tv queued: {t['name'][:50]} -> {claimed} episode(s) on the merge queue")
         elif mapped:
             # The pack DOES contain these episodes — they were simply already queued, already
-            # merging, or claimed by a concurrent pass a moment ago. Claiming nothing here is a
-            # no-op, NOT a failure: erroring on it (which this used to do, because `claimed == 0`
-            # was treated as "nothing matched") overwrote perfectly good `ready` records and
-            # produced the nonsense "parsed X, wanted X" with both sides identical.
-            core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already queued/merging")
+            # merging, claimed by a concurrent pass a moment ago, or refused by _claimable
+            # (this release is on their blocklist, or another donor is already on its way).
+            # Claiming nothing here is a no-op, NOT a failure: erroring on it (which this used
+            # to do, because `claimed == 0` was treated as "nothing matched") overwrote
+            # perfectly good `ready` records and produced the nonsense "parsed X, wanted X".
+            core.log(f"tv promote: {t['name'][:50]} -> {mapped} file(s) already "
+                     f"queued/merging/blocklisted")
+            # If NOTHING here is claimable and none of these episodes is queued or merging
+            # elsewhere, this download can never move them — say so on the records instead of
+            # logging it once a minute forever.
+            if not claimed and not any(e["status"] in ("ready", "merging")
+                                       for e in core.get_episodes() if e["dl_hash"] == h):
+                _stuck(eps, "complete, but every episode it covers has already blocklisted this "
+                            "release or is being served by another download", h)
         elif not files:
             # complete, dir present, but ZERO parseable video -> dead release
             core.log(f"tv promote: {t['name'][:50]} complete but no video files -> re-searching")

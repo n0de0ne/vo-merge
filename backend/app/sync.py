@@ -117,6 +117,27 @@ def _windows(dur, n=3, length=480):
     return uniq
 
 
+def audio_windows(path, ref_ai, shift_ai, dur, cfg, tag="", n=3, length=None):
+    """Per-window offsets between two audio tracks IN THE SAME FILE: [(center_s, offset_ms,
+    conf), ...] with failed windows omitted. This is `audio_consensus` WITHOUT the verdict —
+    the post-merge QC needs the raw points, because a wrong constant offset and a wrong STRETCH
+    have opposite signatures (agreement vs a residual that grows with time) and the consensus
+    collapse erases exactly that difference. Windows default shorter than the sync ones (300s):
+    a drifting track smears its own correlation peak in proportion to window length, so shorter
+    windows are what keep a realistic wrong-ratio residual measurable at all."""
+    length = length or min(int(cfg.get("sync_window_dur", 480)), 300)
+    out = []
+    for (s, d) in _windows(dur, n=n, length=length):
+        try:
+            m, c = detect_offset_ms(path, ref_ai, path, shift_ai, start=int(s), dur=int(d),
+                                    timeout=_decode_timeout(cfg))
+        except Exception:
+            continue
+        if m is not None:
+            out.append((s + d / 2.0, m, c))
+    return out
+
+
 def audio_consensus(path, ref_ai, shift_ai, dur, cfg, tag=""):
     """Offset between two audio tracks IN THE SAME FILE (for re-syncing a finished merge,
     where there's only one video). Multi-window consensus. Returns (offset_ms|None, conf)."""

@@ -1,5 +1,5 @@
 """Config persistence + SQLite state + the per-movie pipeline state machine."""
-import json, os, re, sqlite3, threading, time
+import json, os, re, shutil, sqlite3, subprocess, threading, time
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get("VO_CONFIG", "/config")
@@ -56,6 +56,34 @@ DEFAULTS = {
     "ai_tickets": True,                            # page the host AI dispatcher on wedges/errors
     "ai_stale_min": 60,                            # if the AI doesn't report back within this many
                                                    # minutes, flag the item for manual review
+    "ai_max_tickets": 50,                          # cap on QUEUED (undispatched) per-record
+                                                   # tickets. One bad season pack is 400 episodes;
+                                                   # filing all 400 at once buries the queue for
+                                                   # hours. Records beyond the cap stay unpaged
+                                                   # (and unstamped — the staleness timer must not
+                                                   # run on a page that was never sent) and are
+                                                   # picked up as the queue drains.
+    "ai_dispatcher_alarm_min": 120,                # alarm when the OLDEST queued ticket has waited
+                                                   # this long and the dispatcher heartbeat is
+                                                   # absent/stale. Generous by default so a legacy
+                                                   # hourly host cron (which keeps no heartbeat)
+                                                   # doesn't false-alarm.
+    # ---- the out-of-band alarm channel (notify.py) -----------------------------------------
+    # Empty = off. A Discord/Slack webhook URL gets their JSON envelope; anything else gets an
+    # ntfy-style plain POST with a Title header. This is for the automation's OWN failures —
+    # dead dispatcher, broken config, full disk, prolonged dependency outage, records needing a
+    # human — not per-merge chatter.
+    "notify_url": "",
+    "notify_repeat_h": 24,                         # one alarm per kind per this many hours; a
+                                                   # condition observed healthy again re-arms
+                                                   # immediately
+    "dep_down_alarm_min": 60,                      # a dependency (Prowlarr/qB/*arr) continuously
+                                                   # unreachable this long raises an alarm. Every
+                                                   # sweep already logs-and-returns per cycle;
+                                                   # this is the part that remembers DURATION.
+    "disk_floor_gb": 10,                           # alarm (and, see merge gate, hold merges) when
+                                                   # free space under media_mount or /config
+                                                   # drops below this
     "score_threshold": 60,
     "min_seeders": 5,
     "grab_mode": "auto",                   # auto | approval
@@ -123,9 +151,39 @@ DEFAULTS = {
     "sync_ratio_test": True,               # test known transfer rate ratios (PAL 25fps vs 23.976
                                            # etc). Fixes the "framerates differ but no reliable
                                            # drift could be measured" dead-end.
+    "sync_wide_probe": True,               # before PARKING a sync failure (review/sync_fail),
+                                           # re-run detection once at ±sync_probe_lag_s. This is
+                                           # the first line of the AI runbook ("call /sync_probe
+                                           # FIRST") executed by the pipeline itself: a large
+                                           # constant offset (sponsor card, 'previously on')
+                                           # reads as "different cut" inside ±sync_max_lag_s and
+                                           # is trivially fixable further out.
+    "sync_probe_lag_s": 300,               # how far the parking-rescue probe searches
+    "transient_max": 5,                    # consecutive infrastructure failures (grab hiccup,
+                                           # unreadable base, qB blip) a record retries by
+                                           # itself before it becomes a real `error` and pages
+                                           # the AI. Retrying is cheaper than an agent run for
+                                           # everything a retry can fix.
     "sync_ratio_span": 2400,               # seconds of runtime scanned for the ratio test
     "sync_ratio_min_conf": 0.35,           # min correlation for a ratio to be accepted
     "sync_ratio_margin": 1.3,              # ...and it must beat the no-stretch hypothesis by this
+    "postmerge_qc": True,                  # after a graft, cross-correlate the grafted audio
+                                           # against the base's own track IN THE OUTPUT before
+                                           # the library swap. A confident-but-wrong sync is the
+                                           # one failure nothing downstream can ever detect: the
+                                           # language reads as present, the record closes, the
+                                           # donor is deleted. Costs seconds per merge.
+    "qc_min_conf": 0.35,                   # below this the QC verdict is 'inconclusive' and the
+                                           # merge is ACCEPTED — absence of evidence is not
+                                           # evidence of misalignment
+    "qc_max_offset_ms": 1500,              # a confident residual offset beyond this rejects the
+                                           # merge (blocklist donor, try another release)
+    "recycle_keep_days": 7,                # originals DISCARDED by a replacement (_place_multi /
+                                           # TV direct remux) go to <media>/.vo-merge-recycle for
+                                           # this many days instead of being destroyed, so a bad
+                                           # replacement is reversible by machine. 0 = old
+                                           # destructive behaviour. Grafts don't recycle: their
+                                           # output carries every track the original had.
     "mux_timeout_min": 240,                # kill an mkvmerge that runs longer than this. It is a
                                            # deadlock guard, not a tuning knob — a wedged mux (a
                                            # stalled /mnt/user read, a hung iGPU decode) held the
@@ -137,6 +195,33 @@ DEFAULTS = {
     "sync_ffmpeg_threads": 4,              # cap decode threads (politeness)
     "sync_hwaccel": "vaapi",               # vaapi | qsv | none — offload decode to the iGPU
     "sync_hwaccel_device": "/dev/dri/renderD128",
+    "tried_ttl_days": 30,                  # a blocklisted release becomes eligible again after
+                                           # this many days. The blocklist only ever grew, so a
+                                           # release that stalled ONCE (0 seeds on a bad day) was
+                                           # burned forever — for some titles that is the only
+                                           # release that exists. 0/negative = never expire.
+    "no_release_escalate_rounds": 3,       # a no_release record whose built-in query has come
+                                           # back empty this many separate rounds is paged to
+                                           # the AI once with a compose-a-better-query brief —
+                                           # /search_releases exists for exactly these, but
+                                           # no_release was never escalated. 0 = off.
+    "ignored_revisit_days": 90,            # a record `ignored` this long is re-examined with ONE
+                                           # cheap search: "no release exists" decays as truth,
+                                           # and without a revisit the verdict is permanent by
+                                           # accident. Finds something usable -> re-opened;
+                                           # still nothing -> sleeps another cycle. 0 = never.
+    "ignored_revisit_per_day": 10,         # cap on revisits per housekeeping day, so a large
+                                           # ignored backlog doesn't hammer the indexers
+    "auto_repair": False,                  # run the audio-less repair pass (delete via the *arr
+                                           # + re-search) on the daily housekeeping schedule.
+                                           # Off by default: it deletes media. Its guards are the
+                                           # strong ones either way — cache-bypassed re-probe,
+                                           # BROKEN_ERR only, *arr-known files only.
+    "donor_keep_days": 14,                 # donors kept for parked failure states (review/
+                                           # sync_fail/error — kept so /assign and /set_sync can
+                                           # still use them) are freed after this long. With a
+                                           # dead or ignoring actor they otherwise pin gigabytes
+                                           # forever. 0 = keep forever (old behaviour).
     "no_release_retry_h": 24,              # a record that found nothing is re-searched after this
                                            # many hours. Indexers gain releases constantly, so
                                            # "nothing existed when we looked" must not be
@@ -194,8 +279,14 @@ _lock = threading.Lock()
 # (mtime, size), i.e. once per edit.
 _CONFIG_BROKEN = {"at": 0.0, "reported": None}
 
+# The last config that parsed, kept so the broken-config alarm can still reach the notify URL
+# that is trapped inside the file it cannot read. In-memory only: after a restart into a broken
+# config the alarm degrades to ticket + log, which is still infinitely better than silence.
+_LAST_GOOD_CFG = None
+
 
 def load_config():
+    global _LAST_GOOD_CFG
     cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_FILE) as f:
@@ -211,6 +302,10 @@ def load_config():
         try:
             cfg.update(json.loads(raw))
             _CONFIG_BROKEN.update(at=0.0, reported=None)
+            # Remember the last config that PARSED. When the file breaks, the broken copy holds
+            # the notify URL we would use to say so — the one credential the failure itself
+            # hides — so the alarm below reads it from here instead.
+            _LAST_GOOD_CFG = dict(cfg)
         except Exception as e:
             # Silently falling back to DEFAULTS is how a truncated config.json erased an install:
             # every URL and key reads as empty, `enabled` flips to False, and the next save_config
@@ -225,6 +320,31 @@ def load_config():
                 _CONFIG_BROKEN["reported"] = fingerprint
                 log(f"config: {CONFIG_FILE} could not be parsed ({e}) — running on DEFAULTS and "
                     f"REFUSING to overwrite it. Fix or remove the file.")
+                # A broken config doesn't just degrade — with `enabled` defaulting False it
+                # STOPS the whole pipeline, and until now the only trace was the log line
+                # above. Page the dispatcher (it has host access and can usually repair a
+                # truncated JSON file itself) and raise the out-of-band alarm. Both are
+                # per-fingerprint, i.e. once per distinct broken state; both must never be the
+                # thing that breaks config loading.
+                try:
+                    ticket("config-broken",
+                           f"config.json could not be parsed ({e}) — the pipeline is STOPPED "
+                           f"(running on defaults, enabled=False)",
+                           {"file": CONFIG_FILE, "error": str(e),
+                            "hint": "fix the JSON in place (nightly copies are in "
+                                    "/config/backup/config-*.json) or remove the file; "
+                                    "vo-merge refuses to save over it while it is broken"},
+                           key=str(fingerprint))
+                except Exception:
+                    pass
+                try:
+                    from . import notify as _notify
+                    _notify.send("config", "config.json unparseable — pipeline stopped",
+                                 f"{CONFIG_FILE}: {e}. Running on defaults with enabled=False "
+                                 f"until the file is fixed or removed.",
+                                 cfg=_LAST_GOOD_CFG or cfg)
+                except Exception:
+                    pass
             _CONFIG_BROKEN["at"] = _CONFIG_BROKEN["at"] or time.time()
     # Build the new set first and REBIND, rather than clear()+update() in place. Every thread and
     # every job calls this constantly, and a redact() running inside the clear-to-update window
@@ -419,6 +539,103 @@ def tail_log(n=300):
     return [ln + "\n" for ln in text.splitlines()[-want:]]
 
 
+# ---------------------------------------------------------------- killable work
+# A merge is a sync detect (several minute-long ffmpeg decodes) plus a remux of a multi-GB file,
+# and once it started NOTHING could stop it: the operator watching it go wrong could only wait
+# out `mux_timeout_min` (4 hours by default) or restart the container, which loses every other
+# in-flight download too. These few functions make a merge interruptible.
+#
+# `Aborted` deliberately inherits BaseException, not Exception. The merge path is full of
+# `except Exception` handlers that turn a failed decode into "this window didn't resolve, try the
+# next one" — correct for a failure, exactly wrong for a cancellation, which would be swallowed
+# and the merge would grind on through the remaining windows. Only code that explicitly wants to
+# know about a cancellation sees one; the same reason KeyboardInterrupt sits where it does.
+class Aborted(BaseException):
+    """The operator aborted the job running on this thread."""
+
+
+_JOBS = {}                        # job key -> {"procs": set(Popen), "cancel": bool}
+_JOBS_LOCK = threading.Lock()
+_CUR = threading.local()          # the job key owned by THIS thread
+
+
+@contextmanager
+def job(key):
+    """Mark the calling thread as running job `key`, so its subprocesses can be killed by name.
+    The merge worker wraps each claimed record in this."""
+    with _JOBS_LOCK:
+        _JOBS[key] = {"procs": set(), "cancel": False}
+    prev = getattr(_CUR, "key", None)
+    _CUR.key = key
+    try:
+        yield
+    finally:
+        _CUR.key = prev
+        with _JOBS_LOCK:
+            _JOBS.pop(key, None)
+
+
+def _here():
+    with _JOBS_LOCK:
+        return _JOBS.get(getattr(_CUR, "key", None))
+
+
+def cancel_job(key):
+    """Signal a running job to stop and kill whatever it is currently executing. Returns False
+    when no such job is running — the caller then knows the record was not mid-flight."""
+    with _JOBS_LOCK:
+        j = _JOBS.get(key)
+        procs = list(j["procs"]) if j else []
+        if j:
+            j["cancel"] = True
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    if j:
+        log(f"abort: {key} signalled, killed {len(procs)} running process(es)")
+    return bool(j)
+
+
+def cancelled():
+    j = _here()
+    return bool(j and j["cancel"])
+
+
+def run_proc(cmd, timeout=None, capture_output=False, text=False, **kw):
+    """`subprocess.run`, but killable and cancellation-aware.
+
+    Identical contract (a CompletedProcess, TimeoutExpired on timeout, the timeout still enforced
+    — see the AST test that requires one on every call), with two additions: the process is
+    registered against this thread's job so an abort can kill it, and an abort raises `Aborted`
+    rather than returning a mysterious rc=-9 that the caller would read as a corrupt file and
+    blocklist a perfectly good release for."""
+    if cancelled():
+        raise Aborted(f"aborted before starting {cmd[0] if cmd else '?'}")
+    if capture_output:
+        kw.setdefault("stdout", subprocess.PIPE)
+        kw.setdefault("stderr", subprocess.PIPE)
+    p = subprocess.Popen(cmd, text=text, **kw)
+    j = _here()
+    if j is not None:
+        with _JOBS_LOCK:
+            j["procs"].add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise
+    finally:
+        if j is not None:
+            with _JOBS_LOCK:
+                j["procs"].discard(p)
+    if cancelled():
+        raise Aborted(f"{cmd[0] if cmd else 'process'} killed by an operator abort")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 @contextmanager
 def db():
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -493,7 +710,16 @@ def init_db():
                                    # WHY this record is 'merged': grafted (we added tracks) |
                                    # replaced (we used the download as the file) | already (it
                                    # met its profile on its own — we did nothing). NULL = legacy.
-                                   "merge_kind": "TEXT"})
+                                   "merge_kind": "TEXT",
+                                   # consecutive infrastructure failures (see pipeline.transient)
+                                   # — routes retryable failures through self-retry instead of
+                                   # minting an `error` that pages the AI for a network blip
+                                   "transient_fails": "INTEGER DEFAULT 0",
+                                   # how many separate search rounds ended in no_release —
+                                   # drives the query ladder and the one-shot AI escalation
+                                   "search_rounds": "INTEGER DEFAULT 0",
+                                   # when an `ignored` record was last re-examined (revisit_ignored)
+                                   "revisit_at": "REAL"})
 
 
 def _ensure_indexes(c):
@@ -553,7 +779,10 @@ def init_tv():
                                      # series' original language — the merge needs the same
                                      # inputs the scan used, or the two pick different profiles
                                      "orig_lang": "TEXT",
-                                     "merge_kind": "TEXT"})   # see movies table
+                                     "merge_kind": "TEXT",                    # see movies table
+                                     "transient_fails": "INTEGER DEFAULT 0",  # see movies table
+                                     "search_rounds": "INTEGER DEFAULT 0",    # see movies table
+                                     "revisit_at": "REAL"})                   # see movies table
 
 
 def init_indexes():
@@ -696,6 +925,93 @@ def backup_db(keep=7):
         except OSError:
             pass
     log(f"backup: {dest} ({os.path.getsize(dest) // 1024} KB), keeping {keep}")
+    return dest
+
+
+def verify_or_restore_db():
+    """Startup integrity gate: quick_check the DB, and on corruption restore the newest nightly
+    snapshot AUTOMATICALLY instead of limping on a broken file.
+
+    The nightly `VACUUM INTO` backups existed but nothing ever read one — so the recovery path
+    was a human noticing weird behaviour, diagnosing SQLite corruption, and hand-copying a file
+    into place. The DB is the app's entire memory (probe inventory + every record's state);
+    losing up to a day of it to the snapshot is strictly better than every query silently
+    misbehaving. The corrupt file is quarantined beside the live one (with its -wal/-shm), never
+    deleted, so a human can still attempt a finer-grained recovery later.
+
+    Returns one of: "ok" | "absent" | "restored" | "fresh" | "corrupt-unrecovered"."""
+    if not os.path.exists(DB_FILE):
+        return "absent"
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+        if row and str(row[0]).lower() == "ok":
+            return "ok"
+        problem = str(row[0]) if row else "quick_check returned nothing"
+    except Exception as e:
+        problem = str(e)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    quarantine = f"{DB_FILE}.corrupt-{stamp}"
+    try:
+        os.replace(DB_FILE, quarantine)
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(DB_FILE + ext):
+                os.replace(DB_FILE + ext, quarantine + ext)
+    except OSError as e:
+        log(f"db: CORRUPT ({problem}) and could not be quarantined ({e}) — continuing on it")
+        return "corrupt-unrecovered"
+    backups = sorted(f for f in (os.listdir(BACKUP_DIR) if os.path.isdir(BACKUP_DIR) else [])
+                     if f.startswith("vo-merge-") and f.endswith(".db"))
+    if backups:
+        src = os.path.join(BACKUP_DIR, backups[-1])
+        shutil.copyfile(src, DB_FILE)
+        log(f"db: CORRUPT ({problem}) — quarantined to {os.path.basename(quarantine)} and "
+            f"restored {backups[-1]}")
+        outcome, detail = "restored", f"restored last night's snapshot {backups[-1]}"
+    else:
+        log(f"db: CORRUPT ({problem}) — quarantined to {os.path.basename(quarantine)}; no "
+            f"backup exists, starting fresh (a library re-read rebuilds the inventory)")
+        outcome, detail = "fresh", "no backup existed — started fresh"
+    try:
+        ticket("db-restored", f"database was corrupt ({problem[:120]}) — {detail}",
+               {"quarantined": quarantine, "outcome": outcome,
+                "note": "records changed since the snapshot re-derive from the next scan; "
+                        "the quarantined file is kept for manual recovery"}, key=stamp)
+    except Exception:
+        pass
+    try:
+        from . import notify as _notify
+        _notify.send("db", f"database {outcome} after corruption",
+                     f"{problem[:200]} — {detail}. Quarantined: {quarantine}")
+    except Exception:
+        pass
+    return outcome
+
+
+def backup_config(keep=7):
+    """Nightly copy of config.json beside the DB snapshots. The config's atomic write protects
+    against crashes mid-save, not against a bad-but-parseable save — and the broken-config
+    ticket points the fixer at these copies. Skipped while the live file is unparseable: copying
+    it then would overwrite the day's good snapshot with the very bytes that broke."""
+    if _CONFIG_BROKEN["at"] or not os.path.exists(CONFIG_FILE):
+        return None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"config-{time.strftime('%Y%m%d')}.json")
+    try:
+        shutil.copyfile(CONFIG_FILE, dest)
+    except OSError as e:
+        log(f"config backup failed: {e}")
+        return None
+    old = sorted(f for f in os.listdir(BACKUP_DIR)
+                 if f.startswith("config-") and f.endswith(".json"))
+    for f in old[:-keep] if keep > 0 else []:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, f))
+        except OSError:
+            pass
     return dest
 
 

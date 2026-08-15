@@ -7,6 +7,13 @@ _sched = BackgroundScheduler(daemon=True)
 _merge_threads = {}          # pool slot index -> worker thread
 
 
+def merge_workers_alive():
+    """How many merge worker threads are actually running. A thread that died hard (OOM, an
+    interpreter-level error) leaves the queue draining at zero with nothing else to show for it,
+    so the dashboard reports this rather than making the operator infer it."""
+    return sum(1 for t in _merge_threads.values() if t.is_alive())
+
+
 def ensure_merge_workers():
     """Size the merge worker pool to `max_parallel_merges`. Raising it spawns the missing
     workers immediately; lowering it lets the surplus workers retire themselves."""
@@ -111,7 +118,12 @@ def _stall_job():
         cfg = core.load_config()
         pipeline.no_seed_public(cfg)
         pipeline.sweep_orphan_donors(cfg)
+        pipeline.sweep_stuck(cfg)        # recover records stranded mid-transition by a crash
         pipeline.ai_health_check(cfg)
+        pipeline.watchdogs(cfg)          # is the automation ITSELF healthy? (alarms out-of-band)
+        # A worker thread that died hard (OOM, interpreter error) used to stay dead until a
+        # settings change — with max_parallel_merges=1 that is ALL merging, silently.
+        ensure_merge_workers()
         if cfg.get("scope_films", True):
             pipeline.sweep_stalled(cfg)
         if cfg.get("scope_series"):
@@ -123,9 +135,38 @@ def _stall_job():
 def _backup_job():
     try:
         cfg = core.load_config()
-        core.backup_db(keep=int(cfg.get("db_backup_keep", 7)))
+        keep = int(cfg.get("db_backup_keep", 7))
+        core.backup_db(keep=keep)
+        core.backup_config(keep=keep)   # the config deserves the same nightly copy as the DB
     except Exception as e:
         core.log(f"backup_job error: {e}")
+
+
+def _housekeeping_job():
+    """Daily slow-cadence upkeep, always registered (unlike the backup job, which the operator
+    can turn off): purge expired recycled originals, re-examine long-ignored records, and — when
+    the operator has opted in — run the audio-less repair pass."""
+    try:
+        cfg = core.load_config()
+        # Deletions must not wait for an operator's re-read: sweep vanished files daily, with
+        # the same mount-alive guard the rescan prune uses. Behind SCAN_LOCK non-blocking — a
+        # rescan already running prunes on its own, so there is nothing to wait for.
+        if pipeline.SCAN_LOCK.acquire(blocking=False):
+            try:
+                pipeline.prune_library(cfg)
+            finally:
+                pipeline.SCAN_LOCK.release()
+        pipeline.purge_recycle(cfg)
+        pipeline.revisit_ignored(cfg)
+        if cfg.get("auto_repair"):
+            with core.db() as c:
+                paths = [r["path"] for r in c.execute(
+                    "SELECT path FROM probes WHERE err=? ORDER BY path LIMIT 500",
+                    (pipeline.BROKEN_ERR,))]
+            if paths and pipeline.start_repair(paths, cfg):
+                core.log(f"auto_repair: verifying {len(paths)} audio-less candidate(s)")
+    except Exception as e:
+        core.log(f"housekeeping error: {e}")
 
 
 def start():
@@ -143,6 +184,8 @@ def start():
     if int(cfg.get("db_backup_keep", 7)) > 0:
         _sched.add_job(_backup_job, "cron", hour=4, minute=0,
                        id="backup", replace_existing=True)
+    _sched.add_job(_housekeeping_job, "cron", hour=4, minute=30,
+                   id="housekeeping", replace_existing=True)
     _sched.start()
     ensure_merge_workers()          # background merger(s) draining the 'ready' queue
     core.log("scheduler started")

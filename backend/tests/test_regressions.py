@@ -88,10 +88,12 @@ def test_a_deliberate_offset_survives_and_is_marked_manual(app_env):
 
 
 def test_donor_reset_covers_every_donor_field(app_env):
-    """Kept as one constant because the sync fields were exactly the ones each retry path forgot."""
+    """Kept as one constant because the sync fields were exactly the ones each retry path forgot.
+    `transient_fails` rides along: a fresh run gets a fresh infrastructure-failure budget."""
     from app import pipeline
     assert set(pipeline.DONOR_RESET) == {"dl_hash", "dl_id", "en_file",
-                                         "sync_offset_ms", "sync_drift", "sync_manual"}
+                                         "sync_offset_ms", "sync_drift", "sync_manual",
+                                         "transient_fails"}
 
 
 # ------------------------------------------------------------------ finding 03 / 13
@@ -154,7 +156,8 @@ def test_run_mux_kills_and_cleans_up_on_timeout(app_env, tmp_path, monkeypatch):
 
     def fake_run(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    # the mux runs through core.run_proc now (subprocess.run, but killable by an operator abort)
+    monkeypatch.setattr(pipeline.core, "run_proc", fake_run)
     ok, err = pipeline.run_mux(["mkvmerge"], out, {"mux_timeout_min": 240})
     assert ok is False and "exceeded 240min" in err
     assert not os.path.exists(out)
@@ -170,9 +173,15 @@ def test_every_subprocess_call_has_a_timeout():
         for node in ast.walk(ast.parse(f.read_text())):
             if isinstance(node, ast.Call) and \
                ast.unparse(node.func) in ("subprocess.run", "subprocess.check_output",
-                                          "subprocess.call"):
+                                          "subprocess.call", "core.run_proc"):
                 if not any(k.arg == "timeout" for k in node.keywords):
                     missing.append(f"{f.name}:{node.lineno}")
+            # Popen has no timeout of its own — the wait does — so raw Popen anywhere but inside
+            # core.run_proc (which registers it, waits with a timeout, and kills it on an abort)
+            # would be both unbounded and unkillable.
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.Popen" \
+               and f.name != "core.py":
+                missing.append(f"{f.name}:{node.lineno} (raw Popen — use core.run_proc)")
     assert not missing, f"subprocess calls with no timeout: {missing}"
 
 
@@ -434,7 +443,9 @@ def test_a_broken_config_logs_once_not_once_per_request(app_env):
     before = len(app_env.tail_log(9999))
     for _ in range(20):
         app_env.load_config()
-    assert len(app_env.tail_log(9999)) - before == 1
+    # Once per DISTINCT broken state, never per request: the complaint plus its dispatcher page
+    # (a broken config stops the whole pipeline, so it files a config-broken ticket too).
+    assert len(app_env.tail_log(9999)) - before == 2
 
 
 def test_removing_a_broken_config_lets_saves_work_again(app_env):
@@ -563,7 +574,8 @@ def test_a_sync_failure_tries_other_releases_before_asking_a_human(app_env):
     assert seen[3] == "review", "only the exhausted budget reaches a human"
     mv = app_env.get_movie(40)
     assert mv["attempts"] == 4
-    assert json.loads(mv["tried"]) == [f"rel-{i}" for i in range(1, 5)]
+    # entries are [rid, ts] since the blocklist learned to age — the identities are what matter
+    assert [e[0] for e in json.loads(mv["tried"])] == [f"rel-{i}" for i in range(1, 5)]
     assert mv["dl_hash"] == "h4", "review keeps the donor — /set_sync needs the file"
 
 
@@ -832,3 +844,1021 @@ def test_forecast_needs_a_probed_library(app_env):
     from app import main
     f = main.forecast(90.0)
     assert f["eta_days"] is None and "probed" in f["reason"]
+
+
+# ------------------------------------------------------------------ autonomy phase 1
+# The fixer must not be able to die silently, and its queue must have real per-record units.
+
+def _seed_error_movie(core, tmdb, title="Broken"):
+    core.upsert_movie({"tmdb_id": tmdb, "imdb_id": f"tt{tmdb}", "radarr_id": tmdb,
+                       "title": title, "original_title": title, "year": 2020,
+                       "original_lang": "french", "french_path": f"/media/Films/{title}/f.mkv",
+                       "quality": "1080p"})
+    core.set_status(tmdb, "error", error="merge: something broke")
+
+
+def test_ai_health_check_files_one_ticket_per_record(app_env, monkeypatch):
+    """The errors-review batch had queue semantics that fought the dispatcher: while one batch
+    sat unconsumed, every later failure was refused a ticket. Per-record files are the take/ack
+    units the dispatcher actually works in."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    _seed_error_movie(app_env, 2, "Broken2")
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m2.json"))
+    assert app_env.get_movie(1)["ai_status"] == "pending"
+    # a second sweep re-pages nothing: the seen-set marks them, the tickets still sit queued
+    before = app_env.get_movie(1)["ai_at"]
+    pipeline.ai_health_check(cfg)
+    assert app_env.get_movie(1)["ai_at"] == before
+
+
+def test_ticket_queue_cap_leaves_overflow_unstamped(app_env, monkeypatch):
+    """One bad season pack is 400 failures at once. Beyond ai_max_tickets, records must stay
+    UNSTAMPED — stamping ai_status='pending' with no ticket on disk is exactly the bug that made
+    the staleness sweep report 'the AI did not respond' about pages that were never sent."""
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS, ai_max_tickets=1)
+    _seed_error_movie(app_env, 1)
+    _seed_error_movie(app_env, 2, "Broken2")
+    pipeline.ai_health_check(cfg)
+    stamped = [app_env.get_movie(i)["ai_status"] for i in (1, 2)]
+    assert stamped.count("pending") == 1 and stamped.count(None) == 1
+    # the queue drains (dispatcher consumed the ticket) -> the overflow record is paged next
+    from app import agent
+    for n in os.listdir(agent.TICKET_DIR):
+        if n.endswith(".json"):
+            os.remove(os.path.join(agent.TICKET_DIR, n))
+    pipeline.ai_health_check(cfg)
+    assert [app_env.get_movie(i)["ai_status"] for i in (1, 2)].count("pending") == 2
+
+
+def test_obsolete_ticket_is_withdrawn_when_the_record_recovers(app_env, monkeypatch):
+    """A record that leaves its problem state on its own strands its queued ticket: the
+    dispatcher wastes a run on a solved problem, and — since core.ticket refuses a same-kind
+    overwrite — the stale file blocks that record's NEXT page indefinitely."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    pipeline.ai_health_check(cfg)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m1.json")
+    assert os.path.exists(tpath)
+    app_env.set_status(1, "merged", ai_status=None)      # something fixed it
+    pipeline.ai_health_check(cfg)
+    assert not os.path.exists(tpath), "queued ticket for a recovered record must be withdrawn"
+    # ...and a LATER failure of the same record pages again
+    app_env.set_status(1, "error", error="fails differently")
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(tpath)
+
+
+def test_notify_rate_limits_per_kind_and_rearms_on_clear(app_env, monkeypatch):
+    """A standing condition re-fires every 3-minute sweep; a channel that repeats itself all day
+    gets muted by its human, which is worse than no channel. One alarm per kind per window —
+    re-armed the moment the condition is observed healthy."""
+    from app import notify
+    sent = []
+    class _R:
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(notify.requests, "post", lambda *a, **k: sent.append(a) or _R())
+    cfg = dict(app_env.DEFAULTS, notify_url="https://ntfy.example/vo")
+    assert notify.send("disk", "low", "10GB", cfg=cfg) is True
+    assert notify.send("disk", "low", "9GB", cfg=cfg) is False, "same kind inside the window"
+    assert notify.send("dispatcher", "dead", "x", cfg=cfg) is True, "kinds are independent"
+    notify.clear("disk")
+    assert notify.send("disk", "low again", "8GB", cfg=cfg) is True
+    assert len(sent) == 3
+    assert notify.send("anything", "x", "y", cfg=dict(app_env.DEFAULTS)) is False, \
+        "empty notify_url means the channel is off"
+
+
+def test_dispatcher_alarm_requires_stale_queue_AND_no_live_heartbeat(app_env, monkeypatch):
+    """A live sidecar with a deep queue is slow, not dead; a legacy hourly cron keeps no
+    heartbeat but drains the queue. The alarm must need both signals bad."""
+    import time as _t
+    from app import pipeline, agent, notify
+    calls = []
+    monkeypatch.setattr(notify, "send", lambda k, t, b, cfg=None, force=False: calls.append(k))
+    monkeypatch.setattr(notify, "clear", lambda k: None)
+    cfg = dict(app_env.DEFAULTS, ai_dispatcher_alarm_min=1)
+    os.makedirs(agent.TICKET_DIR, exist_ok=True)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m9.json")
+    with open(tpath, "w") as f:
+        f.write("{}")
+    old = _t.time() - 3600
+    os.utime(tpath, (old, old))
+    pipeline.check_dispatcher(cfg)                      # stale queue, no heartbeat -> alarm
+    assert calls == ["dispatcher"]
+    with open(agent.HEARTBEAT, "w"):
+        pass                                            # fresh heartbeat -> alive, just slow
+    pipeline.check_dispatcher(cfg)
+    assert calls == ["dispatcher"], "a live heartbeat must suppress the alarm"
+    st = agent.status(cfg)
+    assert st["heartbeat_age"] is not None and st["waiting"] == 1
+
+
+def test_broken_config_pages_the_dispatcher(app_env):
+    """An unparseable config.json doesn't just degrade — with `enabled` defaulting False it
+    STOPS the pipeline, and the only trace used to be one log line."""
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"enabled": true, TRUNCATED')
+    cfg = app_env.load_config()
+    assert cfg["enabled"] is False
+    from app import agent
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "config-broken.json"))
+
+
+# ------------------------------------------------------------------ autonomy phase 2
+# Failures a retry can fix must not page the AI; failures a crash caused must not strand a
+# record; the pipeline runs the AI runbook's deterministic first line itself.
+
+def test_transient_failures_self_retry_then_become_a_real_error(app_env):
+    """A momentary qB outage minted an `error` record, which paged the AI for something the next
+    sweep fixes for free. transient() self-retries, bounded — an unbroken run of failures IS an
+    error (the mount is gone, qB is misconfigured) and escalates with the count attached."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "grabbed")
+    cfg = dict(app_env.DEFAULTS, transient_max=3)
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is True
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "pending" and mv["transient_fails"] == 1
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is True
+    assert pipeline.transient("movie", 1, "grab: connection refused", cfg) is False
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "error" and "3 consecutive" in mv["error"]
+
+
+def test_donor_reset_refreshes_the_transient_budget(app_env):
+    """A record sent back for a fresh run gets a fresh infrastructure-failure budget, same as
+    attempts=0 — otherwise three grab hiccups in March count against a different donor in June."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "pending", transient_fails=4)
+    app_env.set_status(1, "pending", **pipeline.DONOR_RESET)
+    assert app_env.get_movie(1)["transient_fails"] == 0
+
+
+def _age_record(core, tmdb, seconds):
+    import time as _t
+    with core.db() as c:
+        c.execute("UPDATE movies SET updated=? WHERE tmdb_id=?", (_t.time() - seconds, tmdb))
+
+
+def test_stuck_searching_and_grabbed_are_recovered(app_env):
+    """Nothing ever read `searching` or `grabbed` back out: stage_search walks only `pending`,
+    stage_finish reconciles only `downloading`/`merging`, and a `grabbed` record has no dl_hash
+    yet so even the orphan sweep can't see it. A crash mid-transition stranded them forever."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, grab_mode="auto")
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "searching")
+    _age_record(app_env, 1, 3600)
+    _seed_error_movie(app_env, 2, "B2")
+    app_env.set_status(2, "grabbed")
+    _age_record(app_env, 2, 3600)
+    _seed_error_movie(app_env, 3, "B3")
+    app_env.set_status(3, "searching")                  # fresh — a live search, leave it alone
+    pipeline.sweep_stuck(cfg)
+    assert app_env.get_movie(1)["status"] == "pending"
+    assert app_env.get_movie(2)["status"] == "pending"
+    assert app_env.get_movie(3)["status"] == "searching"
+    # the release was never blocklisted — it may never have been grabbed at all
+    assert not json.loads(app_env.get_movie(2).get("tried") or "[]")
+
+
+def test_approval_mode_grabbed_is_a_waiting_room_not_a_stuck_state(app_env):
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "grabbed")
+    _age_record(app_env, 1, 86400)
+    pipeline.sweep_stuck(dict(app_env.DEFAULTS, grab_mode="approval"))
+    assert app_env.get_movie(1)["status"] == "grabbed", \
+        "in approval mode a human is deciding — that is not a crash"
+
+
+def test_episode_in_review_flips_needs_human_when_the_ai_is_silent(app_env, monkeypatch):
+    """The staleness sweep covered movies in ('error','review','sync_fail') but episodes only in
+    ('error','sync_fail') — an episode in `review` whose ticket was consumed and never answered
+    showed 'AI working' forever."""
+    import time as _t
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    monkeypatch.setattr(agent, "undispatched", lambda: set())
+    cfg = dict(app_env.DEFAULTS, ai_stale_min=1)
+    app_env.upsert_episode({"id": "9:1:5", "series_id": 9, "series_title": "Show",
+                            "tvdb_id": 9, "season": 1, "episode": 5,
+                            "french_path": "/media/Series/Show/S01E05.mkv", "quality": "1080p"})
+    app_env.set_ep_status("9:1:5", "review", ai_status="pending", ai_at=_t.time() - 3600)
+    with open(os.path.join(str(app_env.CONFIG_DIR), "ai_seen_records.json"), "w") as f:
+        json.dump(["episode:9:1:5:review"], f)          # paged by an earlier sweep
+    pipeline.ai_health_check(cfg)
+    assert app_env.get_episode("9:1:5")["ai_status"] == "needs_human"
+
+
+def test_wide_probe_rescue_gates(app_env, monkeypatch):
+    """The rescue merges only on a result the merge path itself would accept: a real offset, and
+    never a constant offset across differing framerates. Off means off."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: (-40000, 0.89, "video x4", None))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False, cfg) == \
+        (-40000, 0.89, "video x4", None)
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, True, cfg) is None, \
+        "a constant offset cannot correct frame drift, however far out it was found"
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: (None, 0.1, None, None))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False, cfg) is None
+    called = []
+    monkeypatch.setattr(sync, "detect", lambda *a, **k: called.append(1))
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False,
+                                      dict(cfg, sync_wide_probe=False)) is None
+    assert pipeline.wide_probe_rescue("/b", "/d", 0, 0, 5000, False,
+                                      dict(cfg, sync_probe_lag_s=60)) is None, \
+        "no point re-searching NARROWER than the pass that already failed"
+    assert not called
+
+
+# ------------------------------------------------------------------ autonomy phase 3
+# At full autonomy nobody watches the output, so the pipeline verifies its own work — and what
+# a replacement discards stays reversible by machine.
+
+def test_qc_rejects_only_on_confident_misalignment(app_env, monkeypatch):
+    """A confident-but-wrong sync was the one failure nothing downstream could detect: the
+    language reads as present, the record closes, the donor is deleted. QC must catch exactly
+    that — and must NOT reject good merges of quiet films on absent evidence."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    # constant misalignment: confident windows agreeing on a value beyond the limit
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 3800, 0.8), (2500, 3750, 0.7), (4500, 3820, 0.8)])
+    ok, res, conf = pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)
+    assert ok is False and abs(res - 3800) < 100, "confident agreed residual must reject"
+    # aligned: small residuals agree
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 100, 0.9), (2500, 140, 0.8), (4500, 90, 0.9)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    # low confidence everywhere = inconclusive = accept (absence of evidence)
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 3800, 0.1), (2500, -2000, 0.2)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    monkeypatch.setattr(sync, "audio_windows", lambda *a, **k: [])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    # scattered confident noise: no agreement, no line -> inconclusive, accept
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 2400, 0.5), (2500, -2100, 0.5), (4500, 600, 0.5)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True
+    called = []
+    monkeypatch.setattr(sync, "audio_windows", lambda *a, **k: called.append(1) or [])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000,
+                                     dict(cfg, postmerge_qc=False))[0] is True
+    assert not called, "postmerge_qc off must not decode anything"
+
+
+def test_qc_catches_a_wrong_drift_by_its_growing_residual(app_env, monkeypatch):
+    """A wrong STRETCH used to hide in the inconclusive bucket: the consensus collapse only
+    reported that windows disagreed, which is also what noise looks like. The signature that
+    tells them apart is the trend — a residual that grows linearly across the runtime IS a
+    drifting graft, and the one failure class the phase-3 QC still let through."""
+    from app import pipeline, sync
+    cfg = dict(app_env.DEFAULTS)
+    # 1 ms/s residual (the realistic wrong-ratio case, e.g. 25/24 applied for 25/23.976):
+    # +500ms at 500s, +2500ms at 2500s, +4500ms at 4500s over a 5000s film -> span ~5000ms
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 500, 0.7), (2500, 2500, 0.6), (4500, 4500, 0.7)])
+    ok, res, conf = pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)
+    assert ok is False and res > 1500, "a linear residual across the runtime must reject"
+    # two points only: any two points fit a line perfectly, so the bar doubles
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 200, 0.7), (4500, 1800, 0.7)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is True, \
+        "two points spanning less than 2x the limit are not confident drift evidence"
+    monkeypatch.setattr(sync, "audio_windows",
+                        lambda *a, **k: [(500, 200, 0.7), (4500, 4200, 0.7)])
+    assert pipeline.qc_grafted_audio("/out.mkv", 1, 5000, cfg)[0] is False
+
+
+def test_recycle_keeps_replaced_originals_and_purges_on_ttl(app_env, tmp_path):
+    """_place_multi and the TV direct remux DISCARD the library file outright — the only merge
+    outcomes that destroy content. The recycle bin makes a bad replacement reversible by machine
+    for recycle_keep_days; the mtime is re-stamped so a years-old rip doesn't expire at once."""
+    import time as _t
+    from app import pipeline
+    media_root = tmp_path / "media"
+    lib = media_root / "Films" / "Movie (2003)"
+    lib.mkdir(parents=True)
+    f = lib / "Movie (2003).mkv"
+    f.write_text("original video")
+    old = _t.time() - 10 * 86400
+    os.utime(f, (old, old))                             # ripped long ago
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media_root), recycle_keep_days=7)
+    dest = pipeline.recycle(str(f), cfg)
+    assert dest and os.path.exists(dest) and not f.exists()
+    assert pipeline.RECYCLE_DIRNAME in dest and dest.endswith("Movie (2003).mkv")
+    assert pipeline.purge_recycle(cfg) == 0, "freshly recycled must survive the purge (mtime restamped)"
+    os.utime(dest, (old, old))                          # now it HAS sat there past the TTL
+    assert pipeline.purge_recycle(cfg) == 1
+    assert not os.path.exists(dest)
+    assert not os.path.exists(os.path.dirname(dest)), "emptied recycle folders are pruned"
+
+
+def test_recycle_disabled_falls_back_to_the_old_destructive_path(app_env, tmp_path):
+    from app import pipeline
+    f = tmp_path / "media" / "Films" / "x.mkv"
+    f.parent.mkdir(parents=True)
+    f.write_text("v")
+    cfg = dict(app_env.DEFAULTS, media_mount=str(tmp_path / "media"), recycle_keep_days=0)
+    assert pipeline.recycle(str(f), cfg) is None
+    assert f.exists(), "recycle off must not touch the file — the caller overwrites/deletes it"
+
+
+# ------------------------------------------------------------------ autonomy phase 4
+# Nothing loops forever, nothing fills the disk, state survives corruption.
+
+def test_blocklist_entries_age_out_but_legacy_strings_hold_until_rewritten(app_env):
+    """The blocklist only ever grew: a release that stalled ONCE (0 seeds on a bad day) was
+    burned forever — for some titles that is the only release that exists. Timestamped entries
+    age out after tried_ttl_days; legacy plain strings stay blocked (safe) until a rewrite
+    stamps them, so an upgrade doesn't un-blocklist years of known-bad releases at once."""
+    import time as _t
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    old = _t.time() - 40 * 86400
+    app_env.set_status(1, "pending", dl_id="rid-new",
+                       tried=json.dumps([["rid-aged", old], ["rid-fresh", _t.time()], "rid-legacy"]))
+    mv = app_env.get_movie(1)
+    cfg = dict(app_env.DEFAULTS, tried_ttl_days=30)
+    active = pipeline.tried_active(mv, cfg)
+    assert active == {"rid-fresh", "rid-legacy"}, "aged entry eligible again; legacy still held"
+    assert pipeline.tried_active(mv, dict(cfg, tried_ttl_days=0)) == \
+        {"rid-aged", "rid-fresh", "rid-legacy"}, "TTL<=0 preserves never-expire"
+    # a rewrite stamps the legacy entry (ages from the upgrade) and appends the current release
+    stamped = json.loads(pipeline.blocklist(mv))
+    assert all(isinstance(e, list) and len(e) == 2 for e in stamped)
+    assert {e[0] for e in stamped} == {"rid-aged", "rid-fresh", "rid-legacy", "rid-new"}
+    legacy_ts = next(ts for rid, ts in stamped if rid == "rid-legacy")
+    assert _t.time() - legacy_ts < 60
+
+
+def test_exhausted_no_release_is_paged_once(app_env, monkeypatch):
+    """no_release was NEVER escalated — records whose query can't match their title re-searched
+    the same wrong query every cooldown forever, while /search_releases (built for exactly this)
+    waited for someone to think of it. One page per exhaustion, not one per cooldown cycle."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS, no_release_escalate_rounds=3)
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "no_release", search_rounds=2, error=None)
+    pipeline.ai_health_check(cfg)
+    tpath = os.path.join(agent.TICKET_DIR, "review-m1.json")
+    assert not os.path.exists(tpath), "below the rounds gate -> not paged"
+    app_env.set_status(1, "no_release", search_rounds=3)
+    pipeline.ai_health_check(cfg)
+    assert os.path.exists(tpath) and app_env.get_movie(1)["ai_status"] == "pending"
+    with open(tpath) as f:
+        assert "search_releases" in f.read()
+    # the dispatcher consumed it and resolved -> later cooldown cycles must NOT re-page
+    os.remove(tpath)
+    app_env.set_status(1, "no_release", ai_status="resolved")
+    pipeline.ai_health_check(cfg)
+    assert not os.path.exists(tpath), "one-shot: a delivered verdict is durable"
+
+
+def test_withdrawn_page_clears_the_pending_stamp(app_env, monkeypatch):
+    """A record that recovers while its ticket still QUEUES gets the ticket withdrawn — and the
+    stamp must go with it, or the next problem state flips to needs_human claiming 'the AI did
+    not respond' about a page nobody was ever given."""
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    pipeline.ai_health_check(cfg)                       # pages, stamps pending
+    assert app_env.get_movie(1)["ai_status"] == "pending"
+    app_env.set_status(1, "pending")                    # recovered before dispatch
+    pipeline.ai_health_check(cfg)                       # withdraws the queued ticket
+    assert app_env.get_movie(1)["ai_status"] is None
+
+
+def test_disk_gate_holds_the_worker_and_requeues_the_pair(app_env, monkeypatch, tmp_path):
+    """rc>=2 half-writes compound the very disk-full that causes them, once per retry. A pair
+    that can't fit re-queues un-penalised and the worker cools off instead of re-probing the
+    same pair every ten seconds."""
+    import time as _t
+    from app import pipeline, notify
+    monkeypatch.setattr(notify, "send", lambda *a, **k: True)
+    a = tmp_path / "a.bin"; a.write_bytes(b"x" * 1000)
+    ok, free, need = pipeline.disk_headroom_ok([str(a)], str(tmp_path),
+                                               dict(app_env.DEFAULTS, disk_floor_gb=0))
+    assert ok is True and free > 0
+    ok, free, need = pipeline.disk_headroom_ok([str(a)], str(tmp_path),
+                                               dict(app_env.DEFAULTS, disk_floor_gb=10 ** 6))
+    assert ok is False, "an absurd floor cannot be satisfied"
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "merging")
+    pipeline.DISK_STATE["hold_until"] = 0
+    pipeline.hold_for_disk("movie", 1, free, need, dict(app_env.DEFAULTS))
+    assert app_env.get_movie(1)["status"] == "ready"
+    assert pipeline.DISK_STATE["hold_until"] > _t.time()
+    assert pipeline.merge_next(dict(app_env.DEFAULTS)) is False, "worker holds while cooling off"
+    pipeline.DISK_STATE["hold_until"] = 0
+
+
+def test_corrupt_db_restores_from_the_nightly_snapshot(app_env):
+    """The nightly VACUUM INTO backups existed but nothing ever read one — recovery was a human
+    hand-copying a file. Corruption now quarantines the bad DB and restores the snapshot."""
+    from app import core as c2
+    _seed_error_movie(app_env, 1)
+    assert c2.backup_db(keep=3)
+    with open(app_env.DB_FILE, "r+b") as f:             # clobber the header -> unreadable DB
+        f.write(b"CORRUPT!" * 16)
+    for ext in ("-wal", "-shm"):
+        p = app_env.DB_FILE + ext
+        if os.path.exists(p):
+            os.remove(p)
+    assert c2.verify_or_restore_db() == "restored"
+    assert app_env.get_movie(1)["title"] == "Broken", "state came back from the snapshot"
+    assert any(f.startswith("vo-merge.db.corrupt-") for f in os.listdir(str(app_env.CONFIG_DIR))), \
+        "the corrupt file is quarantined, never deleted"
+    assert c2.verify_or_restore_db() == "ok"
+
+
+def test_config_backup_skips_while_the_live_file_is_broken(app_env):
+    """Copying an unparseable config.json would overwrite the day's good snapshot with the very
+    bytes that broke it."""
+    app_env.save_config({"min_seeders": 7})
+    assert app_env.backup_config(keep=3)
+    with open(app_env.CONFIG_FILE, "w") as f:
+        f.write('{"broken": TRUNCA')
+    app_env.load_config()
+    assert app_env.backup_config(keep=3) is None
+
+
+# ------------------------------------------------------------------ autonomy phase 5
+# Terminal verdicts stay honest: a give-up is re-examined as indexers change.
+
+def test_long_ignored_records_get_one_cheap_revisit(app_env, monkeypatch):
+    """`ignored` rightly survives every rescan — but its usual reason, 'no release exists',
+    decays as truth. A slow revisit re-opens the record the day a usable release appears and
+    re-stamps the sleepers, instead of making the give-up permanent by accident."""
+    import time as _t
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS, enabled=True, ignored_revisit_days=90, min_seeders=5)
+    _seed_error_movie(app_env, 1, "NowFindable")
+    app_env.set_status(1, "ignored", ai_verdict="nothing exists (2025)")
+    _seed_error_movie(app_env, 2, "StillNothing")
+    app_env.set_status(2, "ignored")
+    with app_env.db() as c:                          # both ignored long ago
+        c.execute("UPDATE movies SET updated=?", (_t.time() - 120 * 86400,))
+    good = [{"score": 200, "seeders": 30, "title": "NowFindable 2020 MULTI", "tried": False}]
+    monkeypatch.setattr(pipeline, "candidates",
+                        lambda tid, cfg=None, include_tried=False: good if tid == 1 else [])
+    assert pipeline.revisit_ignored(cfg) == 1
+    mv = app_env.get_movie(1)
+    assert mv["status"] == "pending" and mv["attempts"] == 0
+    assert mv["ai_verdict"] is None, "the give-up is over — its verdict goes with it"
+    mv2 = app_env.get_movie(2)
+    assert mv2["status"] == "ignored" and mv2["revisit_at"], \
+        "still nothing -> stays ignored, re-stamped to sleep another cycle"
+    assert pipeline.revisit_ignored(cfg) == 0, "freshly re-stamped records are not due again"
+
+
+def test_revisit_is_capped_and_gated(app_env, monkeypatch):
+    import time as _t
+    from app import pipeline
+    for i in range(1, 6):
+        _seed_error_movie(app_env, i, f"T{i}")
+        app_env.set_status(i, "ignored")
+    with app_env.db() as c:
+        c.execute("UPDATE movies SET updated=?", (_t.time() - 120 * 86400,))
+    calls = []
+    monkeypatch.setattr(pipeline, "candidates",
+                        lambda tid, cfg=None, include_tried=False: calls.append(tid) or [])
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=True, ignored_revisit_per_day=2))
+    assert len(calls) == 2, "per-day cap keeps a big ignored backlog off the indexers"
+    calls.clear()
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=True, ignored_revisit_days=0))
+    assert not calls, "0 = the old never-revisit behaviour"
+    pipeline.revisit_ignored(dict(app_env.DEFAULTS, enabled=False))
+    assert not calls, "a disabled pipeline must not search"
+
+
+def test_repair_pass_is_shared_and_lock_guarded(app_env):
+    """The endpoint and auto_repair run the SAME pass (pipeline.run_repair) so they can never
+    apply different guards; start_repair refuses while a scan holds the lock."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS)
+    assert pipeline.SCAN_LOCK.acquire(blocking=False)
+    try:
+        assert pipeline.start_repair([], cfg) is False
+    finally:
+        pipeline.SCAN_LOCK.release()
+    pipeline.run_repair([], cfg)                     # empty pass: verifies nothing, deletes nothing
+    assert pipeline.REPAIR_STATE["phase"] == "done"
+    assert pipeline.REPAIR_STATE["deleted"] == 0
+
+
+# ------------------------------------------------------------------ the Colony VOSTFR bug
+# A Korean film missing only the French DUB grabbed a VOSTFR release (original audio + French
+# subs — definitionally unable to fill the gap), then ran an hour of sync detection because the
+# release won the video comparison and "wanted" the library's own English track. Two holes, two
+# gates: scoring must reject a checkable VOST claim that fills no gap, and a merge must give the
+# LIBRARY file something it lacks before the expensive part starts.
+
+def test_vost_release_is_rejected_when_it_cannot_fill_the_gap():
+    """VOSTFR is a concrete claim — original audio, French subs — not a free pass."""
+    from app import media
+    t = "Colony.2026.VOSTFR.1080p.WEBRip.10bits.AAC.2.0.x265-FaS"
+    # the Colony case: Korean original, gap = French DUB -> the claim fills nothing
+    assert media.useless_release(t, {"fre"}, "Colony", orig="Korean") is True
+    # the same release IS the answer when the gap is the original-language VO...
+    assert media.useless_release(t, {"kor"}, "Colony", orig="Korean") is False
+    # ...or when the French SUBS it promises are what's missing
+    assert media.useless_release(t, {"fre"}, "Colony", orig="Korean",
+                                 need_subs={"fre"}) is False
+    # a VOSTFR of an ENGLISH-original film still carries eng audio
+    assert media.useless_release("Movie.2019.VOSTFR.1080p", {"eng"}, "Movie",
+                                 orig="English") is False
+    # unknown original language -> the claim is uncheckable -> old conservative pass
+    assert media.useless_release(t, {"fre"}, "Colony") is False
+    assert media.useless_release(t, {"fre"}, "Colony", orig="?") is False
+    # a VOSTFR+VF combo advertises the French dub too -> kept
+    assert media.useless_release("Movie.2019.VF.VOSTFR.1080p", {"fre"}, "Movie",
+                                 orig="Korean") is False
+    # MULTI always passes; plain dub-reject behaviour unchanged
+    assert media.useless_release("Movie.2019.MULTI.VOSTFR.1080p", {"fre"}, "Movie",
+                                 orig="Korean") is False
+    assert media.useless_release("Movie.2019.FRENCH.1080p", {"eng"}, "Movie",
+                                 orig="Korean") is True
+
+
+def test_merge_must_give_the_library_file_something_it_lacks(app_env):
+    """graft_gains judges the OUTPUT against the LIBRARY file's own gap, whichever file won the
+    video comparison — the base-relative question wanted_audio answers is not the record's."""
+    from app import pipeline
+    cfg = dict(app_env.DEFAULTS)
+    lib = {"auds": [{"lang": "eng"}, {"lang": "kor"}],
+           "subs": [{"lang": "eng"}, {"lang": "fre"}]}          # Colony: needs only fre AUDIO
+    vostfr = {"auds": [{"lang": "kor"}], "subs": [{"lang": "fre"}]}
+    # the bug: release won the video comparison (base=vostfr), library donates its eng track
+    gains, needs = pipeline.graft_gains(vostfr, lib, {"eng"}, {"eng"},
+                                        "movie", cfg, "Korean", {"kor"})
+    assert not gains and needs == ["fre"], "output still lacks the French dub -> pointless merge"
+    # a legit swap: the release actually carries the needed dub
+    multi = {"auds": [{"lang": "kor"}, {"lang": "fre"}], "subs": []}
+    gains, _ = pipeline.graft_gains(multi, lib, {"eng"}, set(), "movie", cfg, "Korean", {"kor"})
+    assert "fre" in gains
+    # normal direction: grafting the missing dub onto the library base
+    gains, _ = pipeline.graft_gains(lib, lib, {"fre"}, set(), "movie", cfg, "Korean", {"kor"})
+    assert gains == {"fre"}
+    # the deliberate VO fallback stays a gain: Kraken's Norwegian when no English exists
+    kraken = {"auds": [{"lang": "fre"}], "subs": []}
+    gains, _ = pipeline.graft_gains(kraken, kraken, {"nor"}, set(),
+                                    "movie", cfg, "Norwegian", {"nor"})
+    assert "nor" in gains
+
+
+def test_deleted_titles_are_pruned_on_a_schedule_with_the_mount_guard(app_env, tmp_path):
+    """The prune only ran inside an operator's /rescan, so on an unattended install a deleted
+    title dragged coverage down forever. pipeline.prune_library is the one shared
+    implementation (rescan + daily housekeeping): mount-dead refuses to touch anything, and
+    mid-flight records survive even with their file briefly absent."""
+    from app import pipeline
+    media_root = tmp_path / "media"
+    kept = media_root / "Films" / "Kept (2020)" / "kept.mkv"
+    gone = media_root / "Films" / "Gone (2019)" / "gone.mkv"
+    app_env.put_probe(str(kept))
+    app_env.put_probe(str(gone))
+    _seed_error_movie(app_env, 1)                        # error + missing file -> prunable
+    _seed_error_movie(app_env, 2, "MidFlight")
+    app_env.set_status(2, "downloading")                 # merge-window absence -> protected
+    cfg = dict(app_env.DEFAULTS, media_mount=str(media_root))
+    assert pipeline.prune_library(cfg) is None, "an unmounted share must never authorise a prune"
+    assert app_env.get_movie(1) is not None
+    kept.parent.mkdir(parents=True)
+    kept.write_text("v")                                 # the mount is alive now
+    probes, mv, ep = pipeline.prune_library(cfg)
+    assert (probes, mv, ep) == (1, 1, 0)
+    assert app_env.get_movie(1) is None, "settled record with a vanished file is dropped"
+    assert app_env.get_movie(2) is not None, "mid-flight records are never pruned"
+    with app_env.db() as c:
+        left = [r["path"] for r in c.execute("SELECT path FROM probes")]
+    assert left == [str(kept)]
+
+
+def test_ai_paging_holds_while_a_scan_churns_statuses(app_env, monkeypatch):
+    """Observed live: a running recheck re-opened records en masse, and every 3-minute sweep
+    paged ~26 tickets that the NEXT sweep withdrew as 'recovered' and then re-filed — an
+    endless create/withdraw cycle burning dispatcher runs on tickets about to be void. Paging
+    holds while a scan runs, like searches always have."""
+    from app import pipeline, agent
+    monkeypatch.setattr(pipeline, "inflight_downloads", lambda cfg: 0)
+    cfg = dict(app_env.DEFAULTS)
+    _seed_error_movie(app_env, 1)
+    assert pipeline.SCAN_LOCK.acquire(blocking=False)
+    try:
+        pipeline.ai_health_check(cfg)
+        assert not os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+        assert app_env.get_movie(1)["ai_status"] is None, "no stamp for a page never sent"
+    finally:
+        pipeline.SCAN_LOCK.release()
+    pipeline.ai_health_check(cfg)                       # scan over -> paged promptly
+    assert os.path.exists(os.path.join(agent.TICKET_DIR, "review-m1.json"))
+
+
+def test_promote_cannot_reassign_a_burned_release_or_steal_another_donors_record(app_env):
+    """The engine of the worst observed loop (Bleach S17E25, 29 attempts): promote mapped a
+    completed pack onto any non-merged episode WITHOUT consulting its blocklist, so a donor the
+    merge had just rejected was re-assigned every minute — and when the on-call agent
+    force-grabbed the right release, promote hijacked the record back to the bad pack before
+    the new donor finished downloading. The blocklist must bind promote like it binds search,
+    and a record downloading under a different hash belongs to that download."""
+    import time as _t
+    from app import tv, pipeline
+    cfg = dict(app_env.DEFAULTS)
+    app_env.upsert_episode({"id": "18:17:25", "series_id": 18, "series_title": "Bleach",
+                            "tvdb_id": 74796, "season": 17, "episode": 25,
+                            "french_path": "/media/Anime/Bleach/S17E25.mkv", "quality": "1080p"})
+    ep = lambda: app_env.get_episode("18:17:25")
+    # burned release (rejected by the merge): promote must refuse to re-assign it
+    app_env.set_ep_status("18:17:25", "pending",
+                          tried=json.dumps([["breeze-pack-rid", _t.time()], ["HASHY", _t.time()]]))
+    assert tv._claimable(ep(), "breeze-pack-rid", "otherhash", cfg) is False, "burned dl_id"
+    assert tv._claimable(ep(), "other-rid", "HASHY", cfg) is False, "burned torrent hash"
+    assert tv._claimable(ep(), "fresh-rid", "freshhash", cfg) is True, "an unburned release may claim"
+    # the agent's deliberate re-grab: downloading under a different hash is not promote's to take
+    app_env.set_ep_status("18:17:25", "downloading", dl_hash="kaf-single-hash", tried="[]")
+    assert tv._claimable(ep(), "breeze-pack-rid", "breeze-hash", cfg) is False, \
+        "another donor is on its way — do not hijack the record"
+    assert tv._claimable(ep(), "kaf-rid", "kaf-single-hash", cfg) is True, \
+        "the record's OWN download still promotes it"
+    # queued/merging stay undisturbed, as before
+    app_env.set_ep_status("18:17:25", "ready")
+    assert tv._claimable(ep(), "x", "y", cfg) is False
+
+
+def test_merged_log_pages_both_tables_as_one_stream(app_env):
+    """The dashboard panel shows the ten most recent merges; everything older had no way to be
+    seen. /api/merged is the full history behind it — and it must page movies and episodes as ONE
+    ordered stream: with a LIMIT per table, page 2 re-shows rows page 1 already displayed as soon
+    as one table runs ahead. It also has to count the SAME thing the panel counts, so `already`
+    (a scan closing out a file that was correct on its own — work nobody did) stays out."""
+    import time as _t
+    from app import main
+    base = _t.time()
+    for i in range(6):                                   # interleave the two tables in time
+        app_env.upsert_movie({"tmdb_id": 100 + i, "imdb_id": f"tt{i}", "radarr_id": i,
+                              "title": f"Film {i}", "original_title": f"Film {i}", "year": 2020,
+                              "original_lang": "french", "french_path": f"/m{i}.mkv",
+                              "quality": "1080p"})
+        app_env.set_status(100 + i, "merged", added_langs="eng", merge_kind="grafted",
+                           merged_at=base - i * 200)
+        app_env.upsert_episode({"id": f"7:1:{i}", "series_id": 7, "series_title": "Show",
+                                "tvdb_id": 7, "season": 1, "episode": i,
+                                "french_path": f"/e{i}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(f"7:1:{i}", "merged", added_subs="fre", merge_kind="grafted",
+                              merged_at=base - i * 200 - 100)
+    # work nobody did: must not appear anywhere in the history or its total
+    app_env.upsert_movie({"tmdb_id": 999, "imdb_id": "tt9", "radarr_id": 9, "title": "Untouched",
+                          "original_title": "Untouched", "year": 2020, "original_lang": "french",
+                          "french_path": "/u.mkv", "quality": "1080p"})
+    app_env.set_status(999, "merged", added_langs="", added_subs="", merge_kind="already",
+                       merged_at=base)
+
+    first = main.merged_log(limit=5, offset=0)
+    assert first["total"] == 12, "12 real merges, the 'already' row excluded"
+    assert [r["ts"] for r in first["items"]] == sorted((r["ts"] for r in first["items"]),
+                                                      reverse=True), "newest first"
+    assert first["items"][0]["title"] == "Film 0"
+    assert any(r["title"] == "Show S01E00" for r in first["items"]), "both tables in one stream"
+
+    second = main.merged_log(limit=5, offset=5)
+    ids = [(r["kind"], r["title"], r["ts"]) for r in first["items"] + second["items"]]
+    assert len(set(ids)) == 10, "paging must not re-show or skip rows across the two tables"
+    assert not any(r["title"] == "Untouched" for r in main.merged_log(limit=50)["items"])
+
+    hits = main.merged_log(limit=50, q="Show")
+    assert hits["total"] == 6 and all(r["kind"] == "episode" for r in hits["items"]), \
+        "search filters the film title AND the series title, and the total follows the filter"
+    assert main.merged_log(limit=50, q="nothingmatches")["total"] == 0
+
+
+def test_single_series_search_touches_only_that_series(app_env, monkeypatch):
+    """Re-reading ONE show is the unit an operator works in (you replaced Hunter x Hunter's
+    files; a library-wide re-read is minutes over tens of thousands of files, and the hourly
+    sweep may not reach that show for ages). The search half must stay scoped to it — searching
+    the whole backlog off one show's button would burn the grab budget on unrelated titles."""
+    from app import tv
+    seen = []
+    monkeypatch.setattr(tv, "grab_budget", lambda cfg: 50)
+    monkeypatch.setattr(tv, "hold_reason", lambda cfg=None: None)
+    # no Sonarr in a test: _release_se asks it for the aired<->absolute table per episode
+    monkeypatch.setattr(tv, "_numbering", lambda sid, cfg=None: ({}, {}))
+    monkeypatch.setattr(tv, "_search_season",
+                        lambda sid, title, season, eps, rel, cfg, n, cap: seen.append(sid) or n + 1)
+    for sid, title in ((11, "Hunter x Hunter"), (22, "Other Show")):
+        for ep in (1, 2):
+            eid = f"{sid}:1:{ep}"
+            app_env.upsert_episode({"id": eid, "series_id": sid, "series_title": title,
+                                    "tvdb_id": sid, "season": 1, "episode": ep,
+                                    "french_path": f"/{eid}.mkv", "quality": "1080p"})
+            app_env.set_ep_status(eid, "pending", need_audio="eng", need_subs="eng")
+    cfg = dict(app_env.DEFAULTS, enabled=True, scope_series=True)
+
+    tv.stage_search(cfg, only_series=11)
+    assert seen == [11], "a per-show search must not sweep the whole backlog"
+    seen.clear()
+    tv.stage_search(cfg)                      # the sweep itself is unchanged
+    assert sorted(seen) == [11, 22]
+
+
+JUDAS = ("[Judas] Hunter x Hunter (2011) (Complete Series + Movies) "
+         "[BD 1080p][HEVC x265 10bit][Dual-Audio][Eng-Subs] (Batch)")
+
+
+def test_a_complete_series_batch_is_found_and_claims_every_episode(app_env, monkeypatch):
+    """The one release that can fill a 150-episode gap in a single grab was unreachable: every
+    pack search composes 'Title Sxx', and an indexer asked for 'Hunter x Hunter (2011) S01' does
+    not return '(Complete Series + Movies) … (Batch)'. The pipeline could already CLAIM such a
+    release — it just had no way to search for one."""
+    from app import tv, media
+    # the scene spells 'whole show' several ways; all of them have to read as complete
+    for t in (JUDAS, "Show INTEGRALE FRENCH 1080p", "Show Complete Series 1080p",
+              "Show S01-S06 1080p BluRay"):
+        assert tv.COMPLETE_RX.search(t), t
+    assert not tv.COMPLETE_RX.search("Show S01 1080p WEB-DL"), "one season is not the whole show"
+    # a complete title advertises no season of its own -> claims EVERY season (None), and the
+    # grab path must read that as the whole show rather than as season -1
+    assert tv._pack_seasons(JUDAS, -1) is None
+    assert tv._pack_seasons("Show S01+S02 1080p", -1) == {1, 2}
+
+    for sid, season, ep in ((5, 1, 1), (5, 1, 2), (5, 2, 1)):
+        eid = f"{sid}:{season}:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": sid, "series_title": "Hunter x Hunter",
+                                "tvdb_id": sid, "season": season, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "pending", need_audio="eng", need_subs="eng")
+    monkeypatch.setattr(tv, "_grab", lambda link, savepath, cfg: "HASH123")
+    monkeypatch.setattr(tv, "_numbering", lambda s, cfg=None: ({}, {}))
+    n = tv.grab_series(5, "magnet:?xt=urn:btih:x", rid="judas-rid", title=JUDAS,
+                       cfg=dict(app_env.DEFAULTS))
+    assert n == 3, "a complete batch claims every gap episode, across every season"
+    for eid in ("5:1:1", "5:1:2", "5:2:1"):
+        e = app_env.get_episode(eid)
+        assert e["status"] == "downloading" and e["dl_hash"] == "HASH123"
+        assert e["dl_id"] == "judas-rid", "the release identity every retry path blocklists"
+
+
+def test_series_candidates_prefers_complete_and_drops_single_episodes(app_env, monkeypatch):
+    """Ranking has to put the batch first — and a single episode is never a whole-show answer."""
+    from app import tv
+    app_env.upsert_episode({"id": "6:1:1", "series_id": 6, "series_title": "Hunter x Hunter",
+                            "tvdb_id": 6, "season": 1, "episode": 1,
+                            "french_path": "/a.mkv", "quality": "1080p"})
+    app_env.set_ep_status("6:1:1", "pending", need_audio="eng", need_subs="eng", orig_lang="Japanese")
+    results = [
+        {"title": JUDAS, "seeders": 20, "size": 10 ** 11, "guid": "g1", "indexer": "nyaa"},
+        {"title": "Hunter x Hunter (2011) S01 1080p WEB-DL", "seeders": 90, "size": 10 ** 10,
+         "guid": "g2", "indexer": "nyaa"},
+        {"title": "Hunter x Hunter (2011) S01E05 1080p WEB-DL", "seeders": 99, "size": 10 ** 9,
+         "guid": "g3", "indexer": "nyaa"},
+    ]
+    monkeypatch.setattr(tv, "_numbering", lambda s, cfg=None: ({}, {}))
+    monkeypatch.setattr(tv.Prowlarr, "search", lambda self, q, ids: results)
+    out = tv.series_candidates(6, dict(app_env.DEFAULTS))
+    titles = [c["title"] for c in out]
+    assert titles[0] == JUDAS, "the complete batch ranks first even on far fewer seeders"
+    assert out[0]["complete"] is True
+    assert all("S01E05" not in t for t in titles), "single episodes are not whole-show answers"
+
+
+# ------------------------------------------------------------------ abort & start-over
+def test_a_running_merge_can_actually_be_killed(app_env):
+    """A merge is a sync detect plus a multi-GB remux. Once it started, NOTHING could stop it:
+    the operator watching it go wrong could only wait out mux_timeout_min (4h) or restart the
+    container, losing every other in-flight download. The abort has to kill the process that is
+    running right now, not politely ask the next stage."""
+    import threading
+    import time as _t
+    from app import core
+    started, out = threading.Event(), {}
+
+    def worker():
+        with core.job("m42"):
+            started.set()
+            try:
+                core.run_proc(["sleep", "30"], timeout=60)
+                out["r"] = "completed"
+            except core.Aborted:
+                out["r"] = "aborted"
+
+    t = threading.Thread(target=worker, daemon=True)
+    t0 = _t.time()
+    t.start()
+    assert started.wait(5)
+    _t.sleep(0.3)                                  # let Popen actually spawn
+    assert core.cancel_job("m42") is True
+    t.join(10)
+    assert out["r"] == "aborted"
+    assert _t.time() - t0 < 10, "the kill is immediate, not a wait for the timeout"
+    assert core.cancel_job("m42") is False, "a finished job is no longer cancellable"
+
+
+def test_a_cancellation_is_not_swallowed_as_an_ordinary_failure(app_env):
+    """The merge path is full of `except Exception` handlers that turn a failed decode into
+    'try the next window'. That is right for a failure and exactly wrong for a cancellation —
+    which is why Aborted inherits BaseException."""
+    from app import core
+    assert issubclass(core.Aborted, BaseException) and not issubclass(core.Aborted, Exception)
+    with core.job("m7"):
+        core.cancel_job("m7")
+        try:
+            core.run_proc(["true"], timeout=5)
+        except core.Aborted:
+            pass
+        except Exception:                          # pragma: no cover — the bug this pins
+            raise AssertionError("a cancellation must not be catchable as a plain failure")
+
+
+def test_aborting_a_queued_merge_takes_it_off_the_queue(app_env):
+    """'It hasn't started yet' is a race, not a state: the worker polls every ten seconds. So an
+    abort on a queued record has to be a real transition, or it silently merges anyway."""
+    from app import pipeline
+    _seed_error_movie(app_env, 1)
+    app_env.set_status(1, "ready")
+    assert pipeline.abort_merge("movie", 1) == "dequeued"
+    assert app_env.get_movie(1)["status"] == "review"
+    assert app_env.get_movie(1)["ai_status"] == "needs_human", \
+        "an operator decision must not page the AI"
+    assert pipeline.abort_merge("movie", 1) == "not running"
+
+
+def test_reset_clears_the_pipeline_but_never_the_library_file(app_env, monkeypatch, tmp_path):
+    """'Delete everything and start over' means the DOWNLOADS and the records — never the
+    operator's media. The one endpoint allowed to delete media is the audio-less repair."""
+    from app import pipeline
+    lib = tmp_path / "ep.mkv"
+    lib.write_text("the operator's media")
+    app_env.upsert_episode({"id": "9:1:1", "series_id": 9, "series_title": "Hunter x Hunter",
+                            "tvdb_id": 9, "season": 1, "episode": 1,
+                            "french_path": str(lib), "quality": "1080p"})
+    app_env.set_ep_status("9:1:1", "merged", tried=json.dumps([["burned", 1.0]]), attempts=4,
+                          dl_hash="HASH1", dl_id="rid1", en_file="/downloads/x.mkv",
+                          sync_offset_ms=38000, sync_manual=1, search_rounds=3,
+                          candidate_title="some release", merge_kind="grafted",
+                          added_langs="eng", error="boom", ai_status="needs_human",
+                          ai_verdict="gave up")
+    killed = []
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def delete(self, hashes, delete_files=False): killed.append((sorted(hashes), delete_files))
+    monkeypatch.setattr(pipeline, "QBittorrent", FakeQB)
+
+    out = pipeline.reset_records(episodes=[app_env.get_episode("9:1:1")],
+                                 cfg=dict(app_env.DEFAULTS))
+    assert out["episodes"] == 1 and out["donors_deleted"] == 1
+    assert killed == [(["hash1"], True)], "the DONOR is deleted with its files"
+    assert lib.exists() and lib.read_text() == "the operator's media", "media is never touched"
+    e = app_env.get_episode("9:1:1")
+    assert e["status"] == "pending" and e["french_path"] == str(lib)
+    for col in ("dl_hash", "dl_id", "en_file", "error", "ai_status", "ai_verdict",
+                "merge_kind", "candidate_title", "merged_file"):
+        assert not e[col], f"{col} survived the reset"
+    assert e["tried"] == "[]" and e["attempts"] == 0 and e["search_rounds"] == 0
+    assert e["sync_offset_ms"] == 0 and not e["sync_manual"]
+
+
+def test_only_the_library_mount_gates_merging(app_env, monkeypatch, tmp_path):
+    """The disk gate took the WORST of the library mount and /config, so a tight appdata share
+    silently held EVERY merge in the app while the dashboard showed terabytes free on the disk
+    that actually mattered. The mux writes its output next to the library file; /config holds a
+    database and some logs."""
+    from app import pipeline, notify
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda k, t, b, cfg=None, force=False: sent.append(k))
+    monkeypatch.setattr(notify, "clear", lambda k: None)
+    cfg = dict(app_env.DEFAULTS, media_mount="/media", disk_floor_gb=10)
+    free = {"/media": 8738.0, str(app_env.CONFIG_DIR): 0.4}     # the live shape: TBs vs a full cache
+    monkeypatch.setattr(pipeline, "_free_gb", lambda p: free.get(p, 100.0))
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+    pipeline.check_disk(cfg)
+    assert pipeline.DISK_STATE["low"] is False, "a full /config must not stop merging"
+    assert "disk-config" in sent, "...but it IS worth an alarm — SQLite fails when it fills"
+    assert pipeline.merge_hold_reason(dict(cfg, enabled=True)) != "low disk"
+    # the library mount running out is what genuinely holds a mux
+    free["/media"] = 3.0
+    pipeline.check_disk(cfg)
+    assert pipeline.DISK_STATE["low"] is True
+    hold = pipeline.merge_hold_reason(dict(cfg, enabled=True))
+    assert hold and "low disk" in hold and "3 GB" in hold, hold
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+
+
+def test_merge_hold_reason_names_every_brake(app_env, monkeypatch):
+    """'MERGING 0/2 · idle' beside five finished downloads is indistinguishable from a broken
+    app. Every brake that can stop the worker has to answer in words."""
+    import time as _t
+    from app import pipeline
+    monkeypatch.setattr(pipeline, "_free_gb", lambda p: 500.0)
+    pipeline.DISK_STATE.update(low=False, hold_until=0)
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=False)) \
+        == "the pipeline is disabled"
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True, paused=True)) == "paused"
+    pipeline.DISK_STATE["hold_until"] = _t.time() + 300
+    hold = pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True))
+    assert hold and "waiting for disk space" in hold
+    pipeline.DISK_STATE["hold_until"] = 0
+    # no workers running is the silent one: the queue drains at zero with nothing to show for it
+    assert pipeline.merge_hold_reason(dict(app_env.DEFAULTS, enabled=True)) \
+        == "no merge worker is running"
+
+
+def test_a_completed_download_that_cannot_move_says_why(app_env, monkeypatch):
+    """Observed live: five downloads at 100%, the merger idle, and no reason anywhere. Every
+    skip in the promote sweep was silent, so 'complete but going nowhere' looked exactly like a
+    broken app — and promote runs every minute, so it stayed silent forever."""
+    from app import tv
+    for ep in (1, 2):
+        eid = f"12:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 12, "series_title": "Stuck Show",
+                                "tvdb_id": 12, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="GONEHASH", dl_id="rid")
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def torrents(self, cat): return []          # the torrent is not in this category
+    monkeypatch.setattr(tv, "QBittorrent", FakeQB)
+    before = app_env.get_episode("12:1:1")["updated"]
+    tv._promote_completed(dict(app_env.DEFAULTS, enabled=True, scope_series=True))
+    e = app_env.get_episode("12:1:1")
+    assert e["status"] == "downloading", "promote must not invent a state it can't verify"
+    assert "not in the" in (e["progress"] or "") and "category" in e["progress"], e["progress"]
+    # `updated` means "when the pipeline state last changed"; explaining a stall is not a state
+    # change, and bumping it would reshuffle Needs-attention every minute this sweep runs
+    assert e["updated"] == before
+
+
+def test_bumping_a_folded_pack_row_bumps_the_whole_pack(app_env):
+    """The dashboard folds a season pack into ONE row — 28 episodes behind a single torrent. A
+    bump that moved only the row's representative episode would leave the other 27 exactly where
+    they were, which is indistinguishable from the button doing nothing."""
+    from app import main
+    for ep in range(1, 4):
+        eid = f"31:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 31, "series_title": "Pack Show",
+                                "tvdb_id": 31, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="PACKHASH")
+    # a finished episode on the same donor must NOT be dragged back into the ordering
+    app_env.upsert_episode({"id": "31:1:9", "series_id": 31, "series_title": "Pack Show",
+                            "tvdb_id": 31, "season": 1, "episode": 9,
+                            "french_path": "/done.mkv", "quality": "1080p"})
+    app_env.set_ep_status("31:1:9", "merged", dl_hash="PACKHASH")
+    _seed_error_movie(app_env, 77)
+    app_env.set_status(77, "pending", priority=5)          # something already prioritised
+
+    out = main.queue_top(main.QueueTopIn(hash="packhash"))  # case-insensitive, as qB reports it
+    assert out["records"] == 3 and out["priority"] == 6, "one above the current ceiling"
+    assert all(app_env.get_episode(f"31:1:{e}")["priority"] == 6 for e in (1, 2, 3))
+    assert app_env.get_episode("31:1:9")["priority"] in (0, None), "a finished episode is not queued"
+    # priority is orthogonal to state: bumping must not touch status or reshuffle `updated`
+    assert app_env.get_episode("31:1:1")["status"] == "downloading"
+
+
+def test_a_download_that_cannot_promote_escalates_instead_of_sitting_forever(app_env, monkeypatch):
+    """Observed live: packs at 100% sat in `downloading` for 24 HOURS. Annotating the reason was
+    an improvement but not an answer — an annotation nobody is watching is still a silent stall.
+    After STUCK_MAX passes the records become a real error, which is what puts them in Review and
+    in front of the on-call AI."""
+    from app import tv
+    for ep in (1, 2):
+        eid = f"41:1:{ep}"
+        app_env.upsert_episode({"id": eid, "series_id": 41, "series_title": "Wedged",
+                                "tvdb_id": 41, "season": 1, "episode": ep,
+                                "french_path": f"/{eid}.mkv", "quality": "1080p"})
+        app_env.set_ep_status(eid, "downloading", dl_hash="WEDGED")
+
+    class FakeQB:
+        def __init__(self, *a): pass
+        def login(self): pass
+        def torrents(self, cat): return []
+    monkeypatch.setattr(tv, "QBittorrent", FakeQB)
+    monkeypatch.setattr(tv, "STUCK_MAX", 3)
+    tv._STUCK_PASSES.clear()
+    cfg = dict(app_env.DEFAULTS, enabled=True, scope_series=True)
+    for _ in range(2):
+        tv._promote_completed(cfg)
+        assert app_env.get_episode("41:1:1")["status"] == "downloading", "annotate first"
+    tv._promote_completed(cfg)                       # the pass that gives up
+    e = app_env.get_episode("41:1:1")
+    assert e["status"] == "error" and "stuck for 3 min" in e["error"], e["error"]
+    assert not e["progress"], "the annotation is replaced by the error, not left beside it"
+    tv._STUCK_PASSES.clear()

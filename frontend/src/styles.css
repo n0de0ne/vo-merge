@@ -426,3 +426,198 @@ button.btn.small { padding: 3px 9px; font-size: 11.5px; }
 .fc-hero.ok { color: #5ee9a0; }
 .fc-hero.none { color: #ffb3b3; font-size: 17px; }
 button.btn.sec.active { background: #2b6cb0; border-color: #3182ce; color: #fff; }
+
+/* ======================================================================
+   Bounded cards, scrolling insides
+   ----------------------------------------------------------------------
+   Every panel grew to fit its content, so ONE long list (71 items in
+   "Active now") made the Overview metres long and pushed the panels below
+   it off the screen entirely — and the Films grid was ragged, because each
+   card was as tall as its own error message. These primitives give a card
+   a predictable box and move the overflow INSIDE it.
+
+   Two rules the whole section is built on. Both are bugs waiting to be
+   reintroduced, so they are baked into the primitives rather than left to
+   whoever applies the classes:
+
+   1. THE SCROLLER IS ALWAYS AN INNER ELEMENT. `.panel` and `.card` stay
+      overflow: visible (see `.panel { overflow: visible }` above) because
+      the per-row action dropdowns (`.rowmenu .menu-pop`) are absolutely
+      positioned and have to escape their card. Any scroll container clips
+      them — a menu on the last visible row would open into nothing. So the
+      head and the foot don't scroll, and that is where anything carrying a
+      dropdown belongs.
+   2. A FLEX OR GRID CHILD WILL NOT SHRINK BELOW ITS CONTENT unless it is
+      told to. `min-height: 0` on the scrolling body is what makes it scroll
+      instead of stretching its parent past the height we just set; the same
+      declaration on a bounded card is the grid-item form of it, because a
+      grid item's automatic minimum size overrides the `height` you gave it.
+      Miss either one and the box silently goes back to growing.
+
+   Heights are viewport-relative and clamped at BOTH ends: a floor, so a
+   bounded box is never thinner than a couple of rows on a short laptop or
+   in the one-column layout below 980px, and a ceiling, so a 4K screen
+   doesn't hand a three-row panel 900px of empty space.
+   ====================================================================== */
+:root {
+  /* panel bodies: sidebar → default → primary list → page-dominant.
+     --fit-lg keeps .liblist's 62vh and --fit-xl pre.logs' 65vh, which is
+     where these numbers come from — those two were the precedent. */
+  --fit-sm: clamp(170px, 30vh, 340px);
+  --fit-md: clamp(220px, 44vh, 520px);
+  --fit-lg: clamp(280px, 62vh, 720px);
+  --fit-xl: clamp(320px, 65vh, 820px);
+  /* item cards: ONE height for the whole grid, so rows can't be ragged.
+     The floor clears the poster (87px) plus the title and the action row. */
+  --card-h: clamp(184px, 24vh, 260px);
+  --showcard-h: clamp(116px, 16vh, 158px);
+}
+@media (max-width: 980px) {
+  /* .dash-cols is one column here, so bounded panels stack: keep them a
+     little shorter, or two panels fill the screen and the third is a
+     scroll away. Cards get taller instead — a narrow card wraps more. */
+  :root {
+    --fit-sm: clamp(160px, 28vh, 300px);
+    --fit-md: clamp(200px, 38vh, 400px);
+    --fit-lg: clamp(260px, 52vh, 560px);
+    --fit-xl: clamp(300px, 60vh, 640px);
+    --card-h: clamp(200px, 30vh, 300px);
+  }
+}
+
+/* ---- the scrolling region ------------------------------------------
+   `.scroll-y` is the primitive; `.panel-body` and `.card-scroll` are the
+   same thing wearing a name that says where it lives. */
+.scroll-y, .panel-body, .card-scroll {
+  flex: 1 1 auto;
+  min-height: 0;                /* rule 2 — without this it never scrolls */
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;           /* a bounded body must never scroll sideways */
+  /* release names are long and have no spaces to break at, so the intrinsic
+     min-width of one row would otherwise set the width of the card */
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain; /* hitting the end doesn't scroll the page */
+  scrollbar-gutter: stable;     /* no reflow when a list crosses the threshold */
+}
+/* Standalone use: a scroll box inside an ordinary, unbounded panel — no
+   restructuring needed. Inside a .panel.fixed/.capped the parent's height
+   is the bound and this max-height never binds. */
+.scroll-y, .panel.fixed, .panel.capped { --fit: var(--fit-md); }
+.scroll-y.short, .panel.short { --fit: var(--fit-sm); }
+.scroll-y.tall,  .panel.tall  { --fit: var(--fit-lg); }
+.scroll-y.full,  .panel.full  { --fit: var(--fit-xl); }
+.scroll-y { max-height: var(--fit); }
+/* Content that genuinely cannot fit (a wide table) scrolls in its OWN box
+   rather than making the card scroll sideways. */
+.scroll-x { max-width: 100%; overflow-x: auto; }
+
+/* ---- bounded panel: head / body / foot ------------------------------
+   .fixed = a definite box (use in .dash-cols, where the columns should
+   line up); .capped = shrink to fit but never taller than the cap (use
+   where the content is usually short — an empty "All clear 🎉" panel
+   shouldn't be 44vh of nothing). Both need a .panel-body to scroll in. */
+.panel.fixed, .panel.capped {
+  display: flex; flex-direction: column;
+  /* rule 2 again: as a .dash-cols GRID item its automatic minimum size is
+     its content, which silently beats the height set below. */
+  min-height: 0;
+  overflow: visible;            /* never clip — the dropdowns leave through here */
+}
+.panel.fixed  { height: var(--fit); }
+.panel.capped { max-height: var(--fit); }
+.panel-head, .panel-foot { flex: 0 0 auto; min-width: 0; }
+.panel-head { margin-bottom: 8px; }
+/* the hairline reads as the edge of the scrolling area, not decoration */
+.panel-foot { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+/* A table header inside a scrolling body has to stay put, and with
+   border-collapse a sticky th's own border scrolls away — hence the inset
+   shadow instead of border-bottom. */
+.panel-body thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--panel); box-shadow: inset 0 -1px 0 var(--border);
+}
+
+/* ---- item cards: one height per grid, the detail scrolls -------------
+   The poster, the title and the action row are pinned; only .card-scroll
+   moves. That is what keeps the row menu (which lives in .card-row) out of
+   a clipping container — see rule 1. */
+.cardgrid.fixed > .card, .card.fixed {
+  height: var(--card-h);
+  min-height: 0;                /* rule 2, grid-item form */
+  overflow: visible;            /* the row menu still has to escape */
+}
+.cardgrid.fixed > .card > .card-body, .card.fixed > .card-body { min-height: 0; }
+/* everything in the body is pinned except the one region marked to scroll */
+.cardgrid.fixed .card-body > *:not(.card-scroll),
+.card.fixed .card-body > *:not(.card-scroll) { flex: 0 0 auto; }
+/* a four-line title would eat the card; the full text stays in title= */
+.cardgrid.fixed .card-title, .card.fixed .card-title {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* Show cards. An OPEN one spans the grid (`.showcard.open`) and holds a
+   whole season table, so it is deliberately left unbounded — add
+   `scroll-y` to its .showcard-detail if you want it capped (safe here:
+   episode rows use plain buttons, not .rowmenu dropdowns). */
+.showcardgrid.fixed > .showcard:not(.open), .showcard.fixed:not(.open) {
+  height: var(--showcard-h); min-height: 0;
+  display: flex; flex-direction: column;
+}
+.showcardgrid.fixed > .showcard:not(.open) > .showcard-head,
+.showcard.fixed:not(.open) > .showcard-head { flex: 1 1 auto; min-height: 0; }
+.showcardgrid.fixed > .showcard:not(.open) .showcard-meta,
+.showcard.fixed:not(.open) .showcard-meta {
+  flex: 1 1 auto; min-height: 0;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
+/* the title is what identifies the card, so it stays put while the pills
+   below it scroll. The shadow fills the 4px flex gap it would show through. */
+.showcardgrid.fixed .showcard-title, .showcard.fixed .showcard-title {
+  position: sticky; top: 0; background: var(--panel2);
+  box-shadow: 0 4px 0 var(--panel2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.showcard-detail.scroll-y { --fit: var(--fit-lg); }
+
+/* ---- the two pre-existing scrollers, restated in the same terms ---- */
+.liblist { max-height: var(--fit-lg); }
+pre.logs { max-height: var(--fit-xl); }   /* pre.logs.mini still wins on specificity */
+
+/* ---- scrollbars ------------------------------------------------------
+   Visible enough that a bounded body reads as a scroll region, quiet
+   enough that it doesn't read as a broken card. scrollbar-width/color are
+   inherited, so the two selectors cover every scroller inside a panel or
+   a modal — including .liblist and pre.logs, which had none. */
+.panel, .modal, .scroll-y { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.panel ::-webkit-scrollbar, .modal ::-webkit-scrollbar, .scroll-y::-webkit-scrollbar {
+  width: 10px; height: 10px;
+}
+.panel ::-webkit-scrollbar-track, .modal ::-webkit-scrollbar-track,
+.scroll-y::-webkit-scrollbar-track { background: transparent; }
+/* transparent border + padding-box clip = a 4px thumb in a 10px gutter */
+.panel ::-webkit-scrollbar-thumb, .modal ::-webkit-scrollbar-thumb,
+.scroll-y::-webkit-scrollbar-thumb {
+  background: var(--border); background-clip: padding-box;
+  border: 3px solid transparent; border-radius: 999px;
+}
+.panel ::-webkit-scrollbar-thumb:hover, .modal ::-webkit-scrollbar-thumb:hover,
+.scroll-y::-webkit-scrollbar-thumb:hover { background: #3d4a5a; background-clip: padding-box; }
+.panel ::-webkit-scrollbar-corner, .modal ::-webkit-scrollbar-corner,
+.scroll-y::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---- corrections found reviewing the applied result -----------------
+   The Library header is a GRID that has to line up with the rows in the
+   scrolling body below it — and that body reserves a 10px scrollbar
+   gutter, so the header must reserve the same or every column boundary is
+   10px out. Its border-bottom is also the top edge of the list, so unlike
+   an ordinary head it stays flush (no 8px gap). */
+.libhead.panel-head { margin-bottom: 0; padding-right: 10px; }
+/* A bounded body never scrolls sideways (that is the point), so the
+   Settings form has to stop being three fixed-ish columns before it gets
+   narrower than they are — otherwise the help column is clipped with no
+   way to reach it. Stacking is the only honest answer at this width. */
+@media (max-width: 560px) {
+  .form-grid { grid-template-columns: minmax(0, 1fr); gap: 4px 0; }
+  .form-grid label { margin-top: 10px; }
+}

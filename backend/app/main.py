@@ -15,6 +15,7 @@ async def _lifespan(_app):
     """Migrations, then the scheduler. `@app.on_event("startup")` is deprecated and slated for
     removal, and it swallowed the distinction between 'the app failed to start' and 'a startup
     step raised' — a lifespan failure stops the app cleanly instead."""
+    core.verify_or_restore_db()     # a corrupt DB restores from last night's snapshot, not a human
     core.init_db()
     core.init_tv()
     core.init_indexes()
@@ -126,6 +127,10 @@ def status():
     return {"enabled": cfg["enabled"], "grab_mode": cfg["grab_mode"],
             "paused": bool(cfg.get("paused")), "hold": pipeline.hold_reason(cfg),
             "merging_now": len(pipeline._merging_now()),
+            # the watchdogs' memory: which dependencies are down and for how long, and whether
+            # the disk floor is holding merges — so the UI can say it instead of looking idle
+            "deps_down": {k: int(time.time() - v) for k, v in pipeline.DEP_DOWN.items()},
+            "disk": dict(pipeline.DISK_STATE),
             "counts": core.status_counts(), "states": core.STATES}
 
 
@@ -383,21 +388,14 @@ def do_rescan(forget: bool = False, scope: str = "all"):
         try:
             # whatever the scopes say; pilot cleared so a pilot list can't shrink a rescan
             cfg = dict(core.load_config(), series_pilot=[])
-            # A scan adds what is new; this is the other half — drop what is gone. Nothing else
-            # ever removes a probe or a record, so a deleted title keeps being counted (and keeps
-            # dragging coverage down) forever. Guarded on the mount actually being there: if
-            # /media is unmounted every path is "missing" and a blind prune would wipe the DB.
-            mount = (cfg.get("media_mount") or "/media").rstrip("/")
-            if os.path.isdir(mount) and os.listdir(mount):
-                st["phase"] = "pruning deleted files"
-                st["pruned"] = core.prune_missing_probes()
-                mv, ep = core.prune_missing_records()
-                st["pruned_records"] = mv + ep
-                if st["pruned"] or st["pruned_records"]:
-                    core.log(f"rescan({scope}): dropped {st['pruned']} probe(s) and "
-                             f"{mv} movie/{ep} episode record(s) whose file is gone")
-            else:
-                core.log(f"rescan({scope}): {mount} looks unmounted — skipping the prune")
+            # A scan adds what is new; the prune drops what is gone. One shared implementation
+            # (pipeline.prune_library — mount-alive guard included) with the daily housekeeping
+            # job, so a rescan and the schedule can never disagree about what pruning means.
+            st["phase"] = "pruning deleted files"
+            pruned = pipeline.prune_library(cfg)
+            if pruned is not None:
+                st["pruned"] = pruned[0]
+                st["pruned_records"] = pruned[1] + pruned[2]
             if scope in ("all", "films"):
                 st["phase"] = "films"
                 st["films"] = pipeline.scan(cfg)
@@ -423,11 +421,9 @@ def do_rescan(forget: bool = False, scope: str = "all"):
     return {"ok": True, "started": True, "scope": scope, "probes": core.probe_stats()}
 
 
-# The one probe error that describes the FILE rather than our tools: mkvmerge read the container
-# and found no audio, and ffprobe independently agreed. Nothing else may authorise a deletion —
-# "unsupported container" and "audio mkvmerge can't read" mean the file is probably fine and we
-# simply can't mux it, and "unreadable" means we know nothing at all.
-BROKEN_ERR = "no audio track"
+# The one probe error that may authorise a deletion — now lives beside the repair pass itself
+# (pipeline.run_repair), which the auto_repair schedule shares with this endpoint.
+BROKEN_ERR = pipeline.BROKEN_ERR
 
 
 # What counts as vo-merge having actually CHANGED a file. `replaced` legitimately records no
@@ -691,59 +687,6 @@ def library(state: str = "incomplete", lib: str = "", q: str = "",
             "libraries": [{"name": k, "total": v} for k, v in sorted(libs.items())]}
 
 
-def _owner_index(cfg, paths):
-    """Map each /media path to the *arr record that owns it.
-
-    Radarr answers in one call (`movieFile` is embedded in the movie). Sonarr has no
-    library-wide file endpoint, so only the series whose folder actually contains one of `paths`
-    is queried — a repair of 30 files costs a handful of calls, not one per series."""
-    out, want = {}, set(paths)
-    try:
-        for m in Radarr(cfg["radarr_url"], cfg["radarr_key"]).movies() or []:
-            mf = m.get("movieFile") or {}
-            p = media.to_media(mf.get("path"), cfg) if mf.get("path") else None
-            if p in want:
-                out[p] = {"arr": "radarr", "kind": "movie", "id": m["id"],
-                          "file_id": mf["id"], "title": m.get("title") or ""}
-    except Exception as e:
-        core.log(f"repair: Radarr lookup failed: {e}")
-    rest = [p for p in want if p not in out]
-    if not rest:
-        return out
-    try:
-        s = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
-        folders = []
-        for se in s.series() or []:
-            sp = media.to_media(se.get("path"), cfg)
-            if sp:
-                folders.append((sp.rstrip("/") + "/", se))
-        cache = {}
-        for p in rest:
-            se = next((x for pre, x in folders if p.startswith(pre)), None)
-            if not se:
-                continue
-            sid = se["id"]
-            if sid not in cache:
-                efs = {}
-                for ef in s.episode_files(sid) or []:
-                    mp = media.to_media(ef.get("path"), cfg)
-                    if mp:
-                        efs[mp] = ef["id"]
-                eps = {}
-                for e in s.episodes(sid) or []:
-                    if e.get("episodeFileId"):
-                        eps.setdefault(e["episodeFileId"], []).append(e["id"])
-                cache[sid] = (efs, eps)
-            efs, eps = cache[sid]
-            fid = efs.get(p)
-            if fid:
-                out[p] = {"arr": "sonarr", "kind": "episode", "id": sid, "file_id": fid,
-                          "episode_ids": eps.get(fid, []), "title": se.get("title") or ""}
-    except Exception as e:
-        core.log(f"repair: Sonarr lookup failed: {e}")
-    return out
-
-
 class RepairIn(BaseModel):
     paths: list[str] | None = None   # None = every file currently probed as audio-less
     dry_run: bool = True
@@ -771,8 +714,9 @@ def library_repair(body: RepairIn):
     - **`dry_run` is the default** and changes nothing.
 
     A real run re-probes every candidate, so it takes minutes: it runs in a thread under
-    SCAN_LOCK (one heavy file pass at a time) and `GET /api/library/repair` reports progress."""
-    import threading
+    SCAN_LOCK (one heavy file pass at a time) and `GET /api/library/repair` reports progress.
+    The pass itself lives in `pipeline.run_repair`, shared with the `auto_repair` schedule, so
+    an operator-triggered repair and an automatic one can never apply different guards."""
     cfg = core.load_config()
     if body.paths is None:
         with core.db() as c:
@@ -785,77 +729,15 @@ def library_repair(body: RepairIn):
     if body.dry_run:
         # Cheap: report what a real run would attempt, from the probes already on record. The
         # real run re-verifies each one anyway, so this list is a preview, not a promise.
-        owners = _owner_index(cfg, paths) if paths else {}
+        owners = pipeline._owner_index(cfg, paths) if paths else {}
         return {"dry_run": True, "total": len(paths),
                 "candidates": [{"path": p, "title": (owners.get(p) or {}).get("title") or "",
                                 "kind": (owners.get(p) or {}).get("kind") or "",
                                 "known": p in owners} for p in paths],
                 "unknown": sum(1 for p in paths if p not in owners)}
 
-    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+    if not pipeline.start_repair(paths, cfg):
         return {"ok": True, "started": False, "note": "a scan or repair is already running"}
-
-    def _run():
-        st = pipeline.REPAIR_STATE
-        st.update(running=True, started=time.time(), finished=0, phase="verifying",
-                  checked=0, total=len(paths), deleted=0, searched=0,
-                  skipped=[], done=[], error=None)
-        try:
-            radarr = Radarr(cfg["radarr_url"], cfg["radarr_key"])
-            sonarr = Sonarr(cfg["sonarr_url"], cfg["sonarr_key"])
-            confirmed = []
-            for p in paths:
-                st["checked"] += 1
-                if not os.path.exists(p):
-                    st["skipped"].append({"path": p, "reason": "already gone"})
-                    continue
-                _, _, err = media.audit(p, refresh=True)    # never trust the cache for a delete
-                if err != BROKEN_ERR:
-                    st["skipped"].append({"path": p,
-                                          "reason": f"re-probe says: {err or 'the file is fine'}"})
-                    continue
-                confirmed.append(p)
-            st["phase"] = "matching to Radarr/Sonarr"
-            owners = _owner_index(cfg, confirmed) if confirmed else {}
-            st["phase"] = "deleting"
-            for p in confirmed:
-                o = owners.get(p)
-                if not o:
-                    st["skipped"].append({"path": p, "reason":
-                        "not in Radarr/Sonarr — deleting it would just lose the title"})
-                    continue
-                try:
-                    if o["arr"] == "radarr":
-                        radarr.delete_movie_file(o["file_id"])
-                        radarr.search([o["id"]])
-                    else:
-                        sonarr.delete_episode_file(o["file_id"])
-                        if o["episode_ids"]:
-                            sonarr.search(o["episode_ids"])
-                        else:                  # no episode row points at it — re-scan instead
-                            sonarr.rescan(o["id"])
-                    core.forget_probe(p)
-                    st["deleted"] += 1
-                    st["searched"] += 1
-                    st["done"].append({"path": p, "title": o["title"], "kind": o["kind"]})
-                    core.log(f"repair: deleted audio-less {o['kind']} "
-                             f"{o['title'] or os.path.basename(p)} and asked "
-                             f"{o['arr'].title()} to search again")
-                except Exception as e:
-                    st["skipped"].append({"path": p, "reason": f"delete failed: {e}"})
-            core.prune_missing_records()
-            st["phase"] = "done"
-            core.log(f"repair: {st['deleted']} file(s) deleted and re-searched, "
-                     f"{len(st['skipped'])} skipped")
-        except Exception as e:
-            st["error"] = str(e)
-            st["phase"] = "error"
-            core.log(f"repair error: {e}")
-        finally:
-            st.update(running=False, finished=time.time())
-            pipeline.SCAN_LOCK.release()
-
-    threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "started": True, "total": len(paths)}
 
 
@@ -864,6 +746,259 @@ def library_repair_state():
     """Progress of a running (or the last) repair pass — it re-probes every candidate, so it
     takes minutes."""
     return pipeline.REPAIR_STATE
+
+
+@api.get("/queue")
+def queue(limit: int = 100):
+    """The merge queue, in the order it will actually be drained, plus WHY it is or isn't
+    draining. The dashboard could show that five downloads had finished and that the merger was
+    idle, but never the connection between them — a deliberate hold (paused, low disk) and a
+    dead worker looked identical."""
+    cfg = core.load_config()
+    lim = max(1, min(limit, 500))
+    items, now = [], time.time()
+    live = pipeline._merging_now()
+    for pos, (kind, rid, ts) in enumerate(pipeline.merge_queue(cfg), start=1):
+        rec = (core.get_movie(rid) if kind == "movie" else core.get_episode(rid)) or {}
+        items.append({
+            "pos": pos, "kind": kind, "key": str(rid),
+            "title": (rec.get("title") if kind == "movie" else
+                      f"{rec.get('series_title', '')} "
+                      f"S{(rec.get('season') or 0):02d}E{(rec.get('episode') or 0):02d}"),
+            "sub": rec.get("candidate_title"), "poster": rec.get("poster"),
+            "priority": rec.get("priority") or 0, "waiting_s": now - (rec.get("updated") or now),
+            "merging": f"{'m' if kind == 'movie' else 'e'}{rid}" in live,
+        })
+        if len(items) >= lim:
+            break
+    return {"items": items, "total": len(pipeline.merge_queue(cfg)),
+            "merging_now": len(live), "workers": scheduler.merge_workers_alive(),
+            "hold": pipeline.merge_hold_reason(cfg), "disk": dict(pipeline.DISK_STATE),
+            "now": now}
+
+
+class QueueTopIn(BaseModel):
+    kind: str | None = None      # "movie" | "episode" — one record
+    key: str | None = None
+    hash: str | None = None      # ...or every record sharing this donor (a folded pack row)
+
+
+def _priority_ceiling():
+    """One above the highest priority anything unfinished currently carries, so "to the front"
+    really is the front. Read across both tables and every state the ordering touches."""
+    top = 0
+    with core.db() as c:
+        for t in ("movies", "episodes"):
+            r = c.execute(f"SELECT MAX(COALESCE(priority,0)) p FROM {t} "
+                          "WHERE status NOT IN ('merged','ignored')").fetchone()
+            top = max(top, r["p"] or 0)
+    return top + 1
+
+
+@api.post("/queue/top")
+def queue_top(body: QueueTopIn):
+    """Move an item — or a whole season pack — to the front of the queue.
+
+    Priority is what BOTH queues already order on (`get_movies`/`get_episodes` for the search
+    sweep, `merge_queue` for merging), so "jump the queue" is one number rather than a second
+    ordering to keep in sync. It survives the item finishing, deliberately: see
+    core.set_priority.
+
+    `hash` exists because the dashboard folds a season pack into ONE row — 28 episodes behind a
+    single torrent. Bumping the row has to bump the pack, or the operator moves one episode to
+    the front and the other 27 stay where they were."""
+    top = _priority_ceiling()
+    if body.hash:
+        h = body.hash.lower()
+        n = 0
+        for m in core.get_movies():
+            if (m.get("dl_hash") or "").lower() == h and m["status"] not in ("merged", "ignored"):
+                core.set_priority("movie", m["tmdb_id"], top); n += 1
+        for e in core.get_episodes():
+            if (e.get("dl_hash") or "").lower() == h and e["status"] not in ("merged", "ignored"):
+                core.set_priority("episode", e["id"], top); n += 1
+        if not n:
+            raise HTTPException(404, "no unfinished records use that download")
+        core.log(f"queue: {n} record(s) on donor {h[:12]} moved to the front (priority {top})")
+        return {"ok": True, "priority": top, "records": n}
+    if body.kind not in ("movie", "episode") or not body.key:
+        raise HTTPException(422, "give kind+key, or hash")
+    ident = int(body.key) if body.kind == "movie" else body.key
+    if not (core.get_movie(ident) if body.kind == "movie" else core.get_episode(ident)):
+        raise HTTPException(404, "unknown record")
+    core.set_priority(body.kind, ident, top)
+    core.log(f"queue: {body.kind} {ident} moved to the front (priority {top})")
+    return {"ok": True, "priority": top, "records": 1}
+
+
+@api.post("/downloads/{dl_hash}/cancel")
+def download_cancel(dl_hash: str):
+    """Drop a download and send every record behind it back for a different release.
+
+    The counterpart of "move to the front" on the same row: a season pack that has finished but
+    can never be used (wrong numbering, no usable audio) otherwise sits in a grab slot with no
+    control over it but the qB UI, where deleting it just strands the records. This blocklists
+    the release, deletes the torrent with its files, and re-queues every record it owned —
+    which is exactly what the automatic stall handling does, on demand."""
+    from . import tv
+    h = dl_hash.lower()
+    movies = [m for m in core.get_movies() if (m.get("dl_hash") or "").lower() == h]
+    eps = [e for e in core.get_episodes() if (e.get("dl_hash") or "").lower() == h]
+    if not movies and not eps:
+        raise HTTPException(404, "no records use that download")
+    for m in movies:
+        pipeline.abort_merge("movie", m["tmdb_id"])
+        pipeline.retry_movie(m["tmdb_id"])
+    for e in eps:
+        pipeline.abort_merge("episode", e["id"])
+        tv.retry_episode(e["id"])
+    core.log(f"cancel {h[:12]}: dropped, {len(movies)} movie(s) / {len(eps)} episode(s) re-queued")
+    return {"ok": True, "movies": len(movies), "episodes": len(eps)}
+
+
+@api.post("/movie/{tmdb_id}/abort")
+def movie_abort(tmdb_id: int):
+    """Stop this film's merge — kill the decode or mux running right now, or take it off the
+    queue if it hasn't started. Until this existed the only ways to stop a merge that was going
+    wrong were to wait out `mux_timeout_min` (4 hours) or restart the container, which drops
+    every other in-flight download with it."""
+    if not core.get_movie(tmdb_id):
+        raise HTTPException(404, "unknown movie")
+    return {"ok": True, "result": pipeline.abort_merge("movie", tmdb_id)}
+
+
+@api.post("/episode/{ep_id}/abort")
+def episode_abort(ep_id: str):
+    """Episode mirror of movie_abort."""
+    if not core.get_episode(ep_id):
+        raise HTTPException(404, "unknown episode")
+    return {"ok": True, "result": pipeline.abort_merge("episode", ep_id)}
+
+
+@api.post("/tv/{series_id}/reset")
+def tv_series_reset(series_id: int, rescan: bool = True):
+    """Start a whole show over. Stops any merge of its episodes, deletes their DOWNLOADS, and
+    clears every trace the pipeline left on the records — blocklist, attempts, candidates, sync
+    measurements, AI verdicts, merge outcomes.
+
+    **The library files are never touched** — this deletes donors, not media. A graft that
+    already happened cannot be undone (those tracks are part of the file now), which is exactly
+    why `rescan=true` re-reads every file afterwards: whatever each episode contains TODAY
+    becomes the starting point, instead of a stale record claiming a merge that has been
+    thrown away."""
+    from . import tv
+    eps = [e for e in core.get_episodes() if e["series_id"] == series_id]
+    if not eps:
+        raise HTTPException(404, "no records for this series")
+    out = pipeline.reset_records(episodes=eps)
+    if rescan:
+        r = tv_series_rescan(series_id, search=False)   # re-read first; searching is a decision
+        out["rescan"] = r.get("started", False)
+        out["note"] = r.get("note", "")
+    return {"ok": True, **out}
+
+
+@api.post("/movie/{tmdb_id}/reset")
+def movie_reset(tmdb_id: int, rescan: bool = True):
+    """Film mirror of tv_series_reset — see it for what is and is not touched."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    out = pipeline.reset_records(movies=[mv])
+    if rescan:
+        try:
+            out["rescan"] = movie_rescan(tmdb_id, search=False).get("outcome")
+        except HTTPException as e:
+            out["note"] = f"reset done, re-read skipped: {e.detail}"
+    return {"ok": True, **out}
+
+
+@api.post("/tv/{series_id}/rescan")
+def tv_series_rescan(series_id: int, search: bool = True):
+    """Re-read every file of ONE show, then search for whatever it still lacks.
+
+    The unit the operator actually works in. A library-wide re-read is minutes of mkvmerge over
+    tens of thousands of files, and the hourly sweep is a sweep — so after replacing one show's
+    files (a fresh MULTI rip of a long-running anime, say) there was no way to say "re-read THIS
+    and act on it now". The Sonarr webhook already does exactly this per import; this is the same
+    path with a button on it.
+
+    The probe cache is bypassed (`refresh=True`) — the point of asking is that the files on disk
+    changed, and the cache is keyed on size+mtime, which a re-download does change but a remux in
+    place might not resolve within the cache's tolerance.
+
+    Runs in a thread under SCAN_LOCK: one heavy file pass at a time, and a 148-episode show is
+    148 probes, far longer than any HTTP client waits. Progress comes back on `GET /api/rescan`
+    like every other scan. `search=false` re-reads without acting."""
+    import threading
+    from . import tv
+    cfg = core.load_config()
+    if not pipeline.SCAN_LOCK.acquire(blocking=False):
+        return {"ok": True, "started": False, "note": "a scan is already running",
+                "state": pipeline.SCAN_STATE}
+    try:
+        title = (Sonarr(cfg["sonarr_url"], cfg["sonarr_key"]).series_one(series_id)
+                 or {}).get("title") or f"series {series_id}"
+    except Exception:
+        title = f"series {series_id}"
+
+    def _run():
+        st = pipeline.SCAN_STATE
+        st.update(running=True, scope=title, started=time.time(), finished=0, phase="reading files",
+                  films=None, episodes=None, error=None, pruned=None, pruned_records=None,
+                  full=True)
+        media.reset_stats()
+        try:
+            st["episodes"] = tv.scan(cfg, only_series=series_id, refresh=True)
+            # Searching is ACTING, so unlike the read above it honours the operator's own brakes
+            # (paused / scope_series / the in-flight cap). stage_search logs which one held it.
+            if search:
+                st["phase"] = "searching"
+                tv.stage_search(cfg, only_series=series_id)
+            st["phase"] = "done"
+            core.log(f"rescan({title}): {st['episodes']} episode gap(s) · "
+                     f"read {media.STATS['probed']} file(s)")
+        except Exception as e:
+            st["error"] = str(e); st["phase"] = "error"
+            core.log(f"rescan({title}) failed: {e}")
+        finally:
+            st.update(running=False, finished=time.time())
+            st["read"], st["reused"] = media.STATS["probed"], media.STATS["cached"]
+            pipeline.SCAN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "started": True, "scope": title, "searching": bool(search)}
+
+
+@api.post("/movie/{tmdb_id}/rescan")
+def movie_rescan(tmdb_id: int, search: bool = True):
+    """The film mirror of tv_series_rescan — re-read THIS file and act on it.
+
+    One file is one probe, so unlike a whole show this runs inline. Goes through
+    `pipeline.ingest_movie`, the same function the library sweep and the Radarr webhook use, so a
+    re-scan can never judge a file differently from the way it would have been judged anyway."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    if not mv.get("radarr_id"):
+        raise HTTPException(409, "no Radarr id on this record — nothing to re-read it from")
+    cfg = core.load_config()
+    try:
+        m = Radarr(cfg["radarr_url"], cfg["radarr_key"]).movie(mv["radarr_id"])
+    except Exception as e:
+        raise HTTPException(503, f"Radarr unavailable: {core.redact(str(e))}")
+    if not m:
+        raise HTTPException(404, "Radarr no longer has this movie")
+    outcome = pipeline.ingest_movie(m, cfg, refresh=True)
+    rec = core.get_movie(tmdb_id) or {}
+    searched = False
+    if search and rec.get("status") == "pending" and not pipeline.hold_reason(cfg):
+        try:
+            pipeline.search_movie(tmdb_id, cfg)
+            searched = True
+        except pipeline.SearchUnavailable as e:
+            raise HTTPException(503, f"re-read OK, but the indexer is unavailable: {e}")
+    return {"ok": True, "outcome": outcome, "searched": searched, "movie": core.get_movie(tmdb_id)}
 
 
 @api.post("/recheck")
@@ -1263,19 +1398,15 @@ def research(tmdb_id: int):
 def another(tmdb_id: int):
     """Pick another version: blocklist the current release, drop its download, grab the
     next-best candidate."""
-    import json as _json
     cfg = core.load_config()
     mv = core.get_movie(tmdb_id) or {}
-    tried = _json.loads(mv.get("tried") or "[]")
-    if mv.get("dl_id") and mv["dl_id"] not in tried:
-        tried.append(mv["dl_id"])
     try:
         qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
         if mv.get("dl_hash"):
             qb.delete([mv["dl_hash"]], delete_files=True)
     except Exception:
         pass
-    core.set_status(tmdb_id, "pending", error=None, tried=_json.dumps(tried),
+    core.set_status(tmdb_id, "pending", error=None, tried=pipeline.blocklist(mv),
                     **pipeline.DONOR_RESET, **pipeline.AI_RESET)
     try:
         pipeline.search_movie(tmdb_id)
@@ -1346,6 +1477,8 @@ def movie_ai_result(tmdb_id: int, body: AiResultIn):
     core.set_status(tmdb_id, mv["status"], ai_status=body.status,
                     ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
     core.log(f"ai_result movie {tmdb_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    if body.status in ("failed", "needs_human"):
+        pipeline.notify_needs_human()      # the AI handing back IS the event a human must hear
     return {"ok": True}
 
 
@@ -1360,7 +1493,53 @@ def episode_ai_result(ep_id: str, body: AiResultIn):
     core.set_ep_status(ep_id, e["status"], ai_status=body.status,
                        ai_verdict=(body.verdict or body.action_taken), ai_at=time.time())
     core.log(f"ai_result episode {ep_id}: {body.status} — {(body.verdict or body.action_taken or '')[:80]}")
+    if body.status in ("failed", "needs_human"):
+        pipeline.notify_needs_human()
     return {"ok": True}
+
+
+@api.get("/merged")
+def merged_log(limit: int = 50, offset: int = 0, q: str = ""):
+    """The FULL recently-merged history, paginated — what the dashboard panel shows the top ten
+    of. Same `DID_WORK` predicate as that panel, the 24h/7d counters and the forecast, so the
+    list you can page through can never disagree with the number above it about what counts as
+    a merge vo-merge actually performed (`already` — a scan closing out a file that was correct
+    on its own — is work nobody did, and stays out of all four).
+
+    Movies and episodes are paginated as ONE ordered stream via UNION ALL rather than fetched
+    per-table and merged in Python: with a LIMIT per table, page 2 would re-show rows page 1
+    already displayed as soon as one table ran ahead of the other.
+
+    `q` filters on the title (film title, or the series title for an episode), which is the only
+    way to answer "did X ever get done?" against a few thousand rows."""
+    lim = max(1, min(limit, 200))
+    off = max(0, offset)
+    like = f"%{q.strip()}%" if q.strip() else None
+    mq = f"status='merged' AND {DID_WORK}" + (" AND title LIKE ?" if like else "")
+    eq = f"status='merged' AND {DID_WORK}" + (" AND series_title LIKE ?" if like else "")
+    one = [like] if like else []
+    args = one + one                       # the UNION binds the filter once per branch
+    with core.db() as c:
+        total = (c.execute(f"SELECT COUNT(*) n FROM movies WHERE {mq}", one).fetchone()["n"]
+                 + c.execute(f"SELECT COUNT(*) n FROM episodes WHERE {eq}", one).fetchone()["n"])
+        rows = c.execute(
+            f"""SELECT 'movie' AS kind, title AS title, NULL AS season, NULL AS episode,
+                       added_langs, added_subs, merge_kind, poster,
+                       COALESCE(merged_at, updated) AS ts
+                FROM movies WHERE {mq}
+                UNION ALL
+                SELECT 'episode', series_title, season, episode,
+                       added_langs, added_subs, merge_kind, poster,
+                       COALESCE(merged_at, updated) FROM episodes WHERE {eq}
+                ORDER BY ts DESC LIMIT ? OFFSET ?""",
+            tuple(args) + (lim, off)).fetchall()
+    items = [{"kind": r["kind"],
+              "title": (r["title"] if r["kind"] == "movie"
+                        else f"{r['title']} S{r['season']:02d}E{r['episode']:02d}"),
+              "langs": r["added_langs"], "subs": r["added_subs"],
+              "how": r["merge_kind"] or "grafted", "poster": r["poster"], "ts": r["ts"]}
+             for r in rows]
+    return {"items": items, "total": total, "offset": off, "limit": lim, "now": time.time()}
 
 
 @api.get("/ai_log")
@@ -1927,6 +2106,11 @@ def dashboard():
             "merged_24h": merged_24h, "merged_7d": merged_7d, "merged_kinds": mk,
             "inflight": inflight, "inflight_cap": int(cfg.get("max_inflight_downloads", 5)),
             "merge_cap": pipeline.MERGE_GATE.limit(cfg),
+            # WHY the merger is idle. "0/2 · idle" beside five finished downloads is
+            # indistinguishable from a broken app; every brake that can stop the worker
+            # answers here (see pipeline.merge_hold_reason).
+            "merge_hold": pipeline.merge_hold_reason(cfg),
+            "merge_workers": scheduler.merge_workers_alive(),
             "disk": disk, "next_runs": next_runs, "now": now}
 
 
@@ -2021,6 +2205,28 @@ def tv_scan():
     """Progressive series+anime scan — see do_scan for why it is backgrounded, and why it is not
     a rescan."""
     return _bg_scan("tv")
+
+
+@api.get("/tv/{series_id}/candidates")
+def tv_series_candidates(series_id: int):
+    """Whole-show releases: complete-series batches and multi-season packs.
+
+    Every other pack search composes `Title Sxx`, so an indexer never returns a release called
+    "(Complete Series + Movies) … (Batch)" — the one release that can fill a 150-episode gap in
+    a single grab was unreachable, however many times the per-season search ran."""
+    from . import tv
+    try:
+        return tv.series_candidates(series_id)
+    except pipeline.SearchUnavailable as e:
+        raise HTTPException(503, f"indexer unavailable: {e}")
+
+
+@api.post("/tv/{series_id}/grab")
+def tv_series_grab(series_id: int, body: GrabIn):
+    """Grab a whole-show release and claim every gap episode it covers."""
+    from . import tv
+    n = tv.grab_series(series_id, body.link, body.rid, body.title)
+    return {"ok": True, "episodes": n}
 
 
 @api.get("/tv/{series_id}/{season}/candidates")
