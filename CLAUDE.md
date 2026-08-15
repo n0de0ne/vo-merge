@@ -21,13 +21,23 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
 ## Stack & layout
 
 - **Backend**: FastAPI + SQLite + APScheduler (`backend/app/`). Serves the built SPA too.
-- **Frontend**: React + Vite + TS SPA (`frontend/src/`), built into `/app/static`.
+- **Frontend**: React + Vite + TS SPA (`frontend/src/`), built into `/app/static`. Laid out like
+  Sonarr/Radarr — a persistent left rail, a thin top bar carrying global state, and a hash-routed
+  page (see "The SPA" below).
 - **Image** (`Dockerfile`): python:3.12-slim + **mkvtoolnix (mkvmerge)** + **ffmpeg** +
   **Intel iHD VAAPI driver** (non-free) for iGPU decode. Two-stage (node build → python).
 - Listens on **8080** inside the container (Unraid template maps host **8090**).
 
 ### Backend modules
 - `main.py` — FastAPI app + all REST endpoints (`/api/...`) + SPA static serving.
+- `inventory.py` — the ONE classifier over the `probes` table (`build`, `totals`, `DID_WORK`).
+  Lived inside main.py, so it was reachable only from a request handler; the daily history sampler
+  needs the same answer, and a second definition of "complete" is the one duplication this app
+  can't afford.
+- `history.py` — the only endpoints with a time axis (see "Charts need a time axis" below).
+- `problems.py` — the failure taxonomy: which cause a failure has, and the remedy that fixes it.
+- `lipsync.py` — audio-vs-PICTURE sync, the only absolute sync signal here.
+- `settings_meta.py` — every config key described as data, so the settings page renders itself.
 - `core.py` — SQLite (`movies`, `episodes` tables), `DEFAULTS` config, `load/save_config`,
   `set_status`/`set_ep_status` (**dynamic-column UPDATE — pass any column as kwarg**),
   `_ensure_cols` migrations, `log`/`tail_log`, `STATES`.
@@ -42,6 +52,37 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
 - `offdet.py` — audio cross-correlation (fallback sync signal).
 - `scheduler.py` — APScheduler: `_search_job` (every `search_interval_min`) and `_finish_job`
   (every `finish_interval_min`).
+
+### The SPA (`frontend/src/`)
+
+It was one 2,330-line `App.tsx` with a row of tabs. The shape is now:
+
+```
+App.tsx            the shell: rail + top bar + hash route + API-key gate + error banner
+lib/router.ts      a hash router in thirty lines
+lib/poll.ts        usePoll, the global error sink, runAction, useStored
+lib/format.ts      every formatter, so a table cell and a tooltip can't disagree
+components/ui.tsx  Pill, Poster, RowMenu, Tile, Modal, DownloadBar, Tracks, Act…
+components/charts.tsx   the SVG chart kit (no chart library — 500KB to draw four charts)
+components/modals.tsx   ReleaseModal, SyncEditor (ported verbatim), LipSyncModal
+pages/*.tsx        Overview, Films, Series, Library, Activity, Problems, Settings, System
+```
+
+Three things the old shape made impossible, in rough order of how often they hurt:
+
+- **Nothing was linkable.** The current tab lived in `useState`, so Back did nothing, a reload
+  always landed on the Overview, and "look at this failing title" was a set of instructions rather
+  than a URL. Every page, filter and search term is now in the hash.
+- **There was nowhere to put a count.** A rail carries the Problems badge on every page — the one
+  number that means *you* have work, as opposed to the machine having work.
+- **Activity did not exist.** The queue was a cramped modal and there was no history at all.
+
+Chart rules worth not undoing: colour follows the ENTITY, never its rank (filtering a series out
+must not repaint the survivors); the categorical palette is validated as a set against the panel
+surface and used in fixed order; status (complete / short / broken) uses a **reserved** palette and
+always ships a label with a count, never hue alone; a `null` in a series breaks the line rather
+than plotting at zero; and every chart has a table twin behind a toggle, which is what makes a
+colour-encoded chart acceptable at all. Never two y-axes on one plot.
 
 ## Pipeline & states
 
@@ -282,6 +323,40 @@ codes, not the track list — so a library grafted before this fix needs a **re-
   release's video is at least as good, and a deliberately tiny release never is.
 - A donor with no new audio but wanted subs still merges (subtitle-only graft); "nothing to add"
   only closes the record when there's neither.
+
+## Charts need a time axis, and nothing had one (`history.py`)
+
+Everything this app stored was a SNAPSHOT: `movies`/`episodes` are current state, `probes` is what
+each file holds right now. So every question of the form *is this getting better?* was
+unanswerable, and the one feature that needed a rate — the forecast — had to reconstruct it from
+`merged_at`, the single timestamp that happens to persist, which exists for one of the twelve
+states. Two series fix that permanently:
+
+- **`events`** is the transition log. It is written from `core._set_row` (plus the two `claim_*`
+  helpers) — the one place every status change already passes through — which is why it cannot
+  drift from reality. `_set_row` now reads the row before updating it, because a blind UPDATE
+  can't tell a real transition from a scan re-writing the same status, and that difference is the
+  entire content of the log. Titles are **denormalised into the row**: `prune_library` deletes
+  records for files that have left the library, and a chart that silently loses its early months
+  is worse than no chart. `searching` is skipped (entered and left once per pending record per
+  sweep — keeping it turns hundreds of meaningful rows a day into tens of thousands).
+  `merge_kind` rides along as `tag`, so a library re-read closing out thousands of already-correct
+  files does not draw as thousands of merges.
+- **`coverage_history`** is a daily roll-up of `inventory.totals`, keyed by DAY so re-sampling is
+  idempotent — every rescan samples, and a busy day must not weigh more than a quiet one. Sampled
+  at the end of every scan, by the daily housekeeping job, and once at startup if the table is
+  empty but the library has been probed (otherwise an existing install stares at a blank chart
+  until the next scan).
+
+**The two series are read differently, and conflating them is how a chart starts lying.** A day
+with no coverage SAMPLE comes back `null` — nobody probed the library that day; the library did
+not become 0% complete, and plotting it at the baseline shows a collapse that never happened. A
+day with no EVENTS really is zero, and filling it in is the point: leaving it out compresses the
+axis and turns a quiet week into a vertical cliff. `test_revamp.py` pins both directions.
+
+The coverage percentage excludes unreadable files from its denominator — an unreadable file is not
+a language problem, and leaving it in caps the chart below 100% forever with nothing on screen to
+explain why.
 
 ## "When will the library be at 90%?" (`GET /api/forecast?target=`)
 
@@ -1027,6 +1102,99 @@ list**. Comparing those two lists *is* the diagnosis for a numbering mismatch.
 | `POST /search_releases {query}` | The `no_release` backlog. The built-in search now walks a **query ladder** itself (original title → *arr title → alternate titles, once `search_rounds` ≥ 1), so this is the step BEYOND the ladder: an arbitrary Prowlarr query for whatever the AI can think of that Radarr/Sonarr didn't know. Records that exhaust `no_release_escalate_rounds` fruitless rounds are paged once with exactly this instruction. |
 | `POST /movie\|episode/{id}/unfixable {reason}` | Terminal give-up **with a recorded reason** (sets `ignored` + `ai_status=needs_human`), so it doesn't read as an unexamined skip. `ignored` is re-examined every `ignored_revisit_days` with one cheap search (capped/day) — "no release exists" decays as truth, so the verdict must not be permanent by accident. |
 
+## Failures have CAUSES, and each cause has a remedy (`problems.py`, `GET /api/problems`)
+
+The Review tab listed failures one per row, newest first, with the raw `error` string and four
+generic buttons. That is fine for five failures and useless for four hundred: one bad season pack
+produces forty rows saying the same sentence, and the actual decision — *this whole group is a PAL
+transfer, apply the ratio* — is invisible because nothing ever puts the forty rows next to each
+other. Worse, the generic buttons don't match the causes: "Retry" on a numbering mismatch
+re-downloads a pack that will fail identically, and "Pick another" on a vanished donor is right but
+nobody could know that from the message. So records that had a mechanical fix sat in the backlog
+looking impossible.
+
+`problems.classify(status, error)` maps a failure onto one of ~18 causes, matched against the
+**literal strings** `pipeline.py` and `tv.py` write. `test_revamp.py` parametrises every one of
+those strings, so changing a message without updating the taxonomy fails the build — a taxonomy
+that has silently stopped matching production is worse than none, because the page still looks
+authoritative. Each cause carries `why` (what happened), `fix` (what will help) and an ordered
+list of remedies, plus a severity that sorts **fixable ahead of judgement ahead of external** —
+the page exists to empty the mechanical bucket, and burying it under a large judgement group is
+how a backlog stops looking actionable.
+
+Two things make this more than a nicer list:
+
+- **The PAL ratio is already in the error string.** `_sync_fail_reason` writes the arithmetic
+  ratio into the message so the on-call AI needn't re-derive it; `problems.drift_of` reads it back,
+  and "apply the computed rate" becomes a button that fixes a whole season at once. It is offered
+  ONLY when a record in the group actually quotes a ratio — a button that does nothing is worse
+  than no button.
+- **Explicit keys beat the group.** `POST /problems/act` takes either a `code` (the whole group)
+  or `keys` (a selection), and keys win. That is the difference between retrying six records and
+  retrying four hundred, and it must never be decided by accident.
+
+Slow remedies (anything that decodes video) run in a background thread behind one lock with the
+same progress-state shape the rescan and repair passes use — two bulk passes over the same records
+would race each other's writes, and the second would act on records the first had already moved.
+
+## Lip-sync: the only ABSOLUTE sync signal (`lipsync.py`)
+
+Every other measurement here is RELATIVE. `offdet_video` correlates the donor's scene cuts against
+the base's; `offdet` correlates their audio envelopes; `qc_grafted_audio` correlates the grafted
+track against the base's own track inside the output. **All three are satisfied by two files that
+agree with each other and are both wrong** — a donor with a 40s leader and a base with the same
+leader align perfectly — and none of them can say anything at all about a file with one audio
+track. Correlating mouth movement in the PICTURE against the speech envelope of a track asks a
+different question, and the picture is ground truth.
+
+- **Finding the mouth without a face detector.** A talking mouth is the thing in frame whose motion
+  sits at the syllable rate (2–8 Hz), so instead of detecting a face we per-pixel FFT the motion
+  volume and keep the pixels whose energy lives in that band. The per-frame median is subtracted
+  first — a pan or a shake moves every pixel at once and would otherwise be the strongest
+  "speaker" in frame. opencv sharpens this when importable but is **not a dependency**: OpenCV 5
+  removed `CascadeClassifier` and the bundled cascade data, so shipping it would have pinned us to
+  4.x and a routine dependabot bump would have silently disabled the better path.
+- **The search range comes from the AUDIO.** The visual window is short (video decode is the
+  expensive part) and the speech envelope is decoded padded by ±`max_lag` on each side; the
+  correlation slides the short signal over the long one. So widening the search to ±60s costs one
+  more ffmpeg *audio* pass, not five times the frames. Normalisation is against the **local** audio
+  norm (cumulative sums), not the whole envelope — otherwise one loud passage scores every lag
+  near it highly and the peak lands on volume rather than on alignment.
+- **The sign is the correction, not the displacement.** `measure()` returns what `--sync` should
+  ADD to the audio's timestamps; negative means the audio plays late and must be pulled earlier.
+  Getting this backwards would double the error rather than cancel it, so it is pinned by a test
+  over +/−/0 displacements.
+- **The rescue is ONE measurement, not a difference of two.** `rescue()` correlates the BASE's
+  picture against the DONOR's audio directly, which is exactly the number the merge needs.
+  Measuring each file against its own picture would give each file's internal displacement and say
+  nothing about the content offset *between* them. It also never compares the two PICTURES —
+  precisely the comparison that fails on a different cut. It is skipped when the framerates differ
+  and no stretch was found: lip-sync returns one number, and a constant cannot correct a rate
+  difference.
+- **What it honestly cannot do.** On original-language audio the phonemes match the lips and it is
+  good to a frame or two. On a DUB it still works but coarser (~±150 ms), because dubbing matches
+  *when* each character speaks rather than how their lips move — which is enough for the failures
+  that matter, and is not a lip-sync QUALITY judgement. It fails, and says so, on films with
+  little on-screen dialogue, narration over cutaways, animation, and windows landing on action or
+  music. Hence the multi-window consensus: windows that don't resolve are discarded and
+  `lipsync_min_windows` must agree.
+
+Wired in three places: `POST /movie|episode/{id}/lipsync` (measure, optionally apply), the rescue
+rung below `wide_probe_rescue` in both merge paths, and an optional post-merge gate
+(`lipsync_qc`, off by default — it costs a second decode pass, and inconclusive ACCEPTS, exactly
+like the existing QC).
+
+## Settings are described as data (`settings_meta.py`, `GET /api/settings/schema`)
+
+`DEFAULTS` has 111 keys; the old form hand-wrote about forty. The other seventy — every autonomy
+key, every timeout, the notify channel, the whole disk and recycle policy — could only be changed
+by editing `/config/config.json` on the host and restarting, which silently decided which parts of
+this app an operator was allowed to run. Each key now carries a group, label, type, help text and
+an `advanced`/`danger`/`secret` flag, and the page renders itself from that; adding a key to
+DEFAULTS and describing it here is the whole change. `test_revamp.py` asserts the two stay in step
+**in both directions** — an undescribed key and a described key that no longer exists both fail.
+The schema takes its current values from the already-masked config, never the raw one.
+
 ## Autonomy & failure management
 
 The design goal after the July 2026 autonomy review (`docs/AUTONOMY.md`): **a human never does
@@ -1252,6 +1420,13 @@ and every defect in the July 2026 review was the kind a unit test catches at the
 - **`test_regressions.py`** pins each fixed defect, named for the failure it prevents. Add to it
   rather than starting a new file — a test that says *why* is the only durable form of these
   notes.
+- **`test_revamp.py`** covers the pieces the UI revamp added. Three of them guard against ROT
+  rather than a specific bug, which is why they are worth keeping even though nothing is broken
+  today: the settings schema falling behind `DEFAULTS` (both directions), the error taxonomy
+  falling behind the literal strings `pipeline.py`/`tv.py` write (every one is parametrised), and
+  a chart series treating a missing sample as a zero. The lip-sync tests exercise the correlation
+  core directly with synthetic signals — no ffmpeg, no media — including the sign convention and
+  the "does not invent an offset from unrelated signals" case.
 
 Write the test first when a bug is silent in production (a desynced file marked `merged`, a
 secrets file served over HTTP). Those are exactly the ones nobody notices twice.
