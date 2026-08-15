@@ -69,13 +69,20 @@ def totals(cfg):
     """Collapse the inventory into the counters the coverage chart and its history both use.
 
     Returns {total, complete, missing_audio, missing_subs, missing_both, unreadable,
-             libs: {name: {total, complete}}}. The five middle counters partition `total`
-    exactly — every probed file is complete, short of audio, short of subs, short of both, or
-    unreadable. There is deliberately no "not targeted" bucket: a probed file is one of those
-    five, which is what makes the stacked bar add up to the library."""
+             libs: {name: {total, complete}}}. The five counters partition `total` exactly —
+    every probed file is complete, short of audio, short of subs, short of both, or unreadable.
+    There is deliberately no "not targeted" bucket: a probed file is one of those five, which is
+    what makes the stacked bar add up to the library.
+
+    The classification is a LITERAL copy of the one in `main.coverage`, down to the elif order,
+    and it must stay that way. An earlier version here conditioned the subtitle shortfall on
+    `subs_only_gap` — defensible on its own (why count a gap the pipeline will never chase?) but
+    it made the daily history sample disagree with the coverage panel drawn above it whenever
+    that setting was off. Two numbers labelled "complete" that differ is exactly the failure this
+    module was extracted to prevent; if the rule should change, it changes in both places or in
+    neither."""
     out = {"total": 0, "complete": 0, "missing_audio": 0, "missing_subs": 0,
            "missing_both": 0, "unreadable": 0, "libs": {}}
-    subs_gap = bool(cfg.get("subs_only_gap", True))
     for _r, top, _kind, _wa, _ws, _ha, _hs, miss_a, miss_s in build(cfg):
         lib = out["libs"].setdefault(top, {"total": 0, "complete": 0})
         out["total"] += 1
@@ -83,15 +90,11 @@ def totals(cfg):
         if miss_a is None:                      # err set: the probe could not read it
             out["unreadable"] += 1
             continue
-        # A subtitle-only shortfall is only a gap when the pipeline would actually chase it.
-        # Counting it as incomplete while `subs_only_gap` is off would report a backlog nothing
-        # will ever work on, which is how a coverage number stops being trusted.
-        short_s = bool(miss_s) and subs_gap
-        if miss_a and short_s:
+        if miss_a and miss_s:
             out["missing_both"] += 1
         elif miss_a:
             out["missing_audio"] += 1
-        elif short_s:
+        elif miss_s:
             out["missing_subs"] += 1
         else:
             out["complete"] += 1

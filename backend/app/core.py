@@ -921,16 +921,21 @@ def init_history():
             libs TEXT )""")          # libs = JSON {lib: {total, complete}}
 
 
-# Transitions that say nothing and would drown the log. `searching` is entered and left within one
-# sweep for every pending record, so keeping it turns a few hundred meaningful rows a day into tens
-# of thousands and makes "what happened to this title" unreadable.
+# Transitions INTO these say nothing. Every pending record is claimed into `searching` and out of
+# it again within one sweep, so logging the entry turns a few hundred meaningful rows a day into
+# tens of thousands and makes "what happened to this title" unreadable.
+#
+# Only the entry is dropped, never the exit: `searching -> no_release` and `searching -> downloading`
+# ARE the outcome of the search and are the whole reason to look. (The first version of this tested
+# `sts in _EVENT_SKIP and frm in _EVENT_SKIP`, which is a condition no real transition can satisfy —
+# so it silently skipped nothing at all.)
 _EVENT_SKIP = {"searching"}
 
 
 def log_event(kind, key, frm, sts, title=None, sub=None, detail=None, tag=None):
     """Append one state transition. Never raises: history is a nice-to-have, and a failure to
     record one must not roll back the state change it describes."""
-    if sts in _EVENT_SKIP and frm in _EVENT_SKIP:
+    if sts in _EVENT_SKIP:
         return
     try:
         with db() as c:
@@ -1255,11 +1260,14 @@ def _set_row(table, key_col, key, status, fields, expect=None):
         cur = c.execute(f"UPDATE {table} SET {sets} WHERE {where}", tuple(vals) + tuple(args))
         ok = cur.rowcount == 1
     if ok and before is not None and before["status"] != status:
-        _log_transition(table, before, status, fields)
+        # `expect` is the status the UPDATE itself required, so when it is given it is the
+        # authoritative `from` — the SELECT above is a separate statement and another connection
+        # can commit between the two, which would otherwise put a stale status in the log.
+        _log_transition(table, before, status, fields, frm=expect)
     return ok
 
 
-def _log_transition(table, before, status, fields):
+def _log_transition(table, before, status, fields, frm=None):
     """Denormalise a row into one `events` entry. `detail` carries the one line that explains the
     transition — the error for a failure, what was added for a merge, the release for a grab —
     because a bare "error" in a timeline tells you nothing you can act on."""
@@ -1282,7 +1290,7 @@ def _log_transition(table, before, status, fields):
                                            fields.get("added_subs")) if x) or None
     if not detail:
         detail = fields.get("progress") or fields.get("candidate_title")
-    log_event(kind, key, before["status"], status, title, sub, detail, tag)
+    log_event(kind, key, frm or before["status"], status, title, sub, detail, tag)
 
 
 def set_status(tmdb_id, status, expect=None, **fields):
@@ -1302,7 +1310,9 @@ def claim_movie(tmdb_id, from_status, to_status, **fields):
                         tuple(fields.values()) + (tmdb_id, from_status))
         ok = cur.rowcount == 1
     if ok and before is not None:
-        _log_transition("movies", before, to_status, fields)
+        # from_status is what the UPDATE matched on, so it is true by construction — unlike the
+        # SELECT above, which a concurrent commit can invalidate.
+        _log_transition("movies", before, to_status, fields, frm=from_status)
     return ok
 
 
@@ -1317,7 +1327,7 @@ def claim_episode(ep_id, from_status, to_status, **fields):
                         tuple(fields.values()) + (ep_id, from_status))
         ok = cur.rowcount == 1
     if ok and before is not None:
-        _log_transition("episodes", before, to_status, fields)
+        _log_transition("episodes", before, to_status, fields, frm=from_status)
     return ok
 
 

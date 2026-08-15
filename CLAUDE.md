@@ -336,10 +336,14 @@ states. Two series fix that permanently:
   helpers) — the one place every status change already passes through — which is why it cannot
   drift from reality. `_set_row` now reads the row before updating it, because a blind UPDATE
   can't tell a real transition from a scan re-writing the same status, and that difference is the
-  entire content of the log. Titles are **denormalised into the row**: `prune_library` deletes
-  records for files that have left the library, and a chart that silently loses its early months
-  is worse than no chart. `searching` is skipped (entered and left once per pending record per
-  sweep — keeping it turns hundreds of meaningful rows a day into tens of thousands).
+  entire content of the log — but where the write was GUARDED (`expect=`, or the `claim_*`
+  helpers' `from_status`) that guard is the authoritative `from`, since the read is a separate
+  statement the merge worker can commit between. Titles are **denormalised into the row**:
+  `prune_library` deletes records for files that have left the library, and a chart that silently
+  loses its early months is worse than no chart. Entering `searching` is skipped (every pending
+  record is claimed in and out of it on every sweep, which would turn hundreds of meaningful rows
+  a day into tens of thousands) — but LEAVING it is kept, because `searching → no_release` is the
+  outcome of the search and the whole reason to look.
   `merge_kind` rides along as `tag`, so a library re-read closing out thousands of already-correct
   files does not draw as thousands of merges.
 - **`coverage_history`** is a daily roll-up of `inventory.totals`, keyed by DAY so re-sampling is
@@ -354,9 +358,13 @@ not become 0% complete, and plotting it at the baseline shows a collapse that ne
 day with no EVENTS really is zero, and filling it in is the point: leaving it out compresses the
 axis and turns a quiet week into a vertical cliff. `test_revamp.py` pins both directions.
 
-The coverage percentage excludes unreadable files from its denominator — an unreadable file is not
-a language problem, and leaving it in caps the chart below 100% forever with nothing on screen to
-explain why.
+**`inventory.totals` classifies identically to `main.coverage`, down to the elif order, and the
+trend line divides by the same denominator the panel does** (every probed file, unreadable
+included). Both rules were briefly "improved" here — skipping a subtitle-only shortfall when
+`subs_only_gap` is off, and dropping unreadable files so the chart could reach 100% — and each
+change was defensible alone while making the chart disagree with the panel drawn directly above
+it about the same library on the same day. Two numbers labelled "complete" that differ is the
+exact failure this module was extracted to prevent: the rule changes in both places or in neither.
 
 ## "When will the library be at 90%?" (`GET /api/forecast?target=`)
 

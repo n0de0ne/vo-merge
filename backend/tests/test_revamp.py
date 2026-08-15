@@ -49,13 +49,38 @@ def test_only_real_state_changes_are_logged(app_env):
     core = app_env
     _movie(core)
     core.set_status(1, "pending", audio_langs="fre")      # no transition: pending -> pending
-    core.set_status(1, "searching", progress="looking")   # skipped by _EVENT_SKIP on both ends
     core.set_status(1, "downloading")                     # a real one
     core.set_status(1, "downloading", progress="45%")     # not a transition
     with core.db() as c:
         rows = [dict(r) for r in c.execute("SELECT frm, sts FROM events ORDER BY id")]
-    assert [(r["frm"], r["sts"]) for r in rows] == [("pending", "searching"),
-                                                    ("searching", "downloading")]
+    assert [(r["frm"], r["sts"]) for r in rows] == [("pending", "downloading")]
+
+
+def test_entering_searching_is_dropped_but_its_outcome_is_kept(app_env):
+    """Every pending record is claimed into `searching` and out again on every sweep, so logging
+    the entry buries the log — but the EXIT is the outcome of the search and is the whole reason
+    to look at it. The first version of this guard tested that both ends were `searching`, a
+    condition no real transition can satisfy, so it skipped nothing at all."""
+    core = app_env
+    _movie(core)
+    core.set_status(1, "searching", progress="looking")   # dropped
+    core.set_status(1, "no_release")                      # kept: this is the answer
+    with core.db() as c:
+        rows = [(r["frm"], r["sts"]) for r in c.execute("SELECT frm, sts FROM events ORDER BY id")]
+    assert rows == [("searching", "no_release")]
+
+
+def test_a_guarded_write_logs_the_status_it_actually_matched(app_env):
+    """`expect=` and `claim_*` both make the UPDATE conditional on a status, so that status is
+    true by construction. The SELECT that would otherwise supply it is a separate statement, and
+    the merge worker commits between the two often enough to matter."""
+    core = app_env
+    _movie(core)
+    core.set_status(1, "ready")
+    assert core.claim_movie(1, "ready", "merging") is True
+    with core.db() as c:
+        last = c.execute("SELECT frm, sts FROM events ORDER BY id DESC LIMIT 1").fetchone()
+    assert (last["frm"], last["sts"]) == ("ready", "merging")
 
 
 def test_history_survives_the_record_being_pruned(app_env):
@@ -111,13 +136,35 @@ def test_a_day_with_no_events_really_is_zero(app_env):
     assert all(d["merged"] == 0 for d in thru)
 
 
-def test_coverage_percentage_excludes_unreadable_files(app_env):
-    """An unreadable file is not a language problem. Leaving it in the denominator caps the chart
-    below 100% forever with nothing on screen to explain why."""
+def test_the_trend_line_and_the_coverage_panel_agree(app_env):
+    """Both divide by every probed file, unreadable included. Excluding them from the trend reads
+    better — the chart can reach 100% — but it made the line and the panel directly above it show
+    different percentages for the same library on the same day, with nothing to say which was
+    right. /api/coverage is the incumbent; this follows it."""
     core = app_env
     core.snapshot_coverage({"total": 100, "complete": 90, "unreadable": 10, "libs": {}})
     from app import history
-    assert history.coverage_series(1)[0]["pct"] == 100.0
+    assert history.coverage_series(1)[0]["pct"] == 90.0
+
+
+def test_the_history_sampler_classifies_exactly_like_the_coverage_endpoint(app_env):
+    """The reason inventory.py exists. An earlier version of `totals` conditioned the subtitle
+    shortfall on `subs_only_gap`, so with that setting off the daily sample and the coverage panel
+    disagreed about how many files were complete."""
+    from app import core, inventory
+    core.put_probe("/media/Films/A/A.mkv", auds="fre,eng", subs="fre", ntracks=2)   # subs-only gap
+    core.put_probe("/media/Films/B/B.mkv", auds="fre", subs="fre,eng", ntracks=1)   # audio gap
+    for flag in (True, False):
+        cfg = dict(core.DEFAULTS, media_mount="/media", subs_only_gap=flag)
+        t = inventory.totals(cfg)
+        # Mirror of main.coverage's elif chain, evaluated over the same generator.
+        exp = {"complete": 0, "missing_audio": 0, "missing_subs": 0, "missing_both": 0}
+        for _r, _top, _k, _wa, _ws, _ha, _hs, ma, ms in inventory.build(cfg):
+            if ma is None:
+                continue
+            exp["missing_both" if (ma and ms) else "missing_audio" if ma
+                else "missing_subs" if ms else "complete"] += 1
+        assert {k: t[k] for k in exp} == exp, f"disagreed with subs_only_gap={flag}"
 
 
 def test_snapshotting_twice_in_a_day_refreshes_rather_than_double_counts(app_env):

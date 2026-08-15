@@ -54,13 +54,15 @@ def coverage_series(days=30):
             out.append({"day": d, "total": None, "complete": None, "pct": None})
             continue
         total, comp = int(r["total"] or 0), int(r["complete"] or 0)
-        # The percentage is of what could ever be complete: an unreadable file is not a language
-        # problem, and leaving it in the denominator caps the chart below 100% forever with no
-        # explanation on screen.
-        denom = total - int(r["unreadable"] or 0)
+        # Denominator = every probed file, unreadable ones included, because that is what the
+        # coverage panel on the same page divides by. Excluding them reads better (the chart can
+        # reach 100%) and was the first version here, but it made the trend line and the panel
+        # directly above it show different percentages for the same library on the same day —
+        # and a reader has no way to tell which one is wrong. An unreadable file does not meet
+        # its target either; it gets its own segment in the bar, which is where it is explained.
         out.append({
             "day": d, "total": total, "complete": comp,
-            "pct": round(100.0 * comp / denom, 2) if denom > 0 else None,
+            "pct": round(100.0 * comp / total, 2) if total > 0 else None,
             "missing_audio": int(r["missing_audio"] or 0),
             "missing_subs": int(r["missing_subs"] or 0),
             "missing_both": int(r["missing_both"] or 0),
