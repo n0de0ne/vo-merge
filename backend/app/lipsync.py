@@ -54,7 +54,7 @@ import subprocess
 
 import numpy as np
 
-from . import core, media
+from . import core, media, offdet_video
 
 # Speech modulates the mouth at the syllable rate. This band is what separates a talking face from
 # a flickering fire, a rippling lake or a panning camera — all of which have plenty of motion
@@ -87,26 +87,53 @@ def _cv2():
 
 
 # --------------------------------------------------------------------------- signal extraction
-def _frames(path, start, dur, fps, w=128, h=72, threads=2, timeout=None):
-    """A window of the video as a (T, h, w) float array of luma, decoded small and cheap.
+def _decode(path, start, dur, fps, w, h, threads, hwaccel, device, timeout):
+    """One decode attempt. Returns (frames, returncode); frames is (T, h, w) luma in 0..1.
 
-    Deliberately software-decoded at this size: the frames are tiny, the filter chain is a scale
-    and a format conversion, and the VAAPI path's win (keeping 4K surfaces off the CPU) is
-    irrelevant when we are asking for 128x72 at 12fps. Avoiding hwaccel here also avoids the
-    class of failure that made `scene_cuts` need a software fallback in the first place."""
-    cmd = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", str(threads),
-           "-ss", str(start), "-t", str(dur), "-i", path,
-           "-vf", f"fps={fps},scale={w}:{h}", "-pix_fmt", "gray",
-           "-an", "-sn", "-f", "rawvideo", "-"]
+    The downscale happens ON THE GPU (`scale_vaapi`/`scale_qsv` + `hwdownload`) so only 128x72
+    frames cross PCIe — the same shape as `offdet_video._run`, and for the same reason. `fps=` and
+    `scale=` are FILTERS: they run after the decoder, so asking for 12fps at 128x72 does not make
+    the decode cheap. Every frame of the window is still decoded at full resolution, which on a 4K
+    source is precisely the work the iGPU exists to take."""
+    pre = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", str(threads)]
+    if hwaccel == "vaapi":
+        pre += ["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]
+        vf = f"fps={fps},scale_vaapi={w}:{h},hwdownload,format=nv12"
+    elif hwaccel == "qsv":
+        pre += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        vf = f"fps={fps},scale_qsv={w}:{h},hwdownload,format=nv12"
+    else:
+        vf = f"fps={fps},scale={w}:{h}"
+    # -pix_fmt gray on the OUTPUT, so the nv12 the GPU hands back becomes a plain luma plane
+    # without another filter — the conversion is on 128x72 frames and costs nothing.
+    cmd = pre + ["-ss", str(start), "-t", str(dur), "-i", path,
+                 "-vf", vf, "-pix_fmt", "gray", "-an", "-sn", "-f", "rawvideo", "-"]
     try:
         p = core.run_proc(cmd, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return np.zeros((0, h, w))
+        # Reported as its own code so the caller does NOT then retry in software, which would
+        # hang for exactly as long a second time. Same contract as offdet_video.
+        return np.zeros((0, h, w)), offdet_video.TIMEOUT_RC
     n = len(p.stdout) // (w * h)
     if n < 8:
-        return np.zeros((0, h, w))
+        return np.zeros((0, h, w)), p.returncode
     a = np.frombuffer(p.stdout[:n * w * h], dtype=np.uint8).astype(np.float64)
-    return a.reshape(n, h, w) / 255.0
+    return a.reshape(n, h, w) / 255.0, p.returncode
+
+
+def _frames(path, start, dur, fps, w=128, h=72, threads=2, cfg=None, timeout=None):
+    """A window of the video as a (T, h, w) luma array, decoded on the iGPU when one is
+    configured, falling back to software only on a real hardware failure."""
+    cfg = cfg or {}
+    hw = cfg.get("sync_hwaccel", "vaapi")
+    hw = None if hw in (None, "", "none") else hw
+    device = cfg.get("sync_hwaccel_device", "/dev/dri/renderD128")
+    frames, rc = _decode(path, start, dur, fps, w, h, threads, hw, device, timeout)
+    # Fall back only on a genuine hwaccel failure — never on a timeout (it would hang again), and
+    # never on a window that legitimately decoded fine but held few frames.
+    if hw and rc != offdet_video.TIMEOUT_RC and (rc != 0 or len(frames) < 8):
+        frames, _rc = _decode(path, start, dur, fps, w, h, threads, None, device, timeout)
+    return frames
 
 
 def _speech_env(path, ai, start, dur, fps, timeout=None):
@@ -312,7 +339,7 @@ def measure(path, ai=0, dur=None, cfg=None, tag="", on_progress=None,
         if on_progress:
             on_progress(f"lip-sync: window {i + 1}/{len(starts)}")
         frames = _frames(path, st, wdur, fps, threads=int(cfg.get("sync_ffmpeg_threads", 4)),
-                         timeout=timeout)
+                         cfg=cfg, timeout=timeout)
         vis, had_face = _visual_signal(frames, fps)
         faces += 1 if had_face else 0
         # The audio window is padded by max_lag on both sides — that padding IS the search range,

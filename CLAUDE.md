@@ -1162,6 +1162,15 @@ different question, and the picture is ground truth.
   "speaker" in frame. opencv sharpens this when importable but is **not a dependency**: OpenCV 5
   removed `CascadeClassifier` and the bundled cascade data, so shipping it would have pinned us to
   4.x and a routine dependabot bump would have silently disabled the better path.
+- **Video decode goes to the iGPU, exactly like `offdet_video`.** `-hwaccel vaapi` +
+  `scale_vaapi=128:72,hwdownload` so the downscale happens ON the GPU and only tiny frames cross
+  PCIe, with a software fallback on a real hardware failure and — as ever — no fallback after a
+  TIMEOUT, which would hang for just as long again. The first version skipped hwaccel on the
+  reasoning that asking for 128x72 at 12fps is already cheap. That is wrong, and measurably so:
+  `fps=` and `scale=` are FILTERS, so they run *after* the decoder and every frame of the window
+  is still decoded at full resolution. Measured on identical content, producing the identical
+  128x72 output costs **7× more from a 1080p source and 30× more from a 4K one** than from a
+  320x180 one — the cost is the decode, which is precisely what the iGPU is there to take.
 - **The search range comes from the AUDIO.** The visual window is short (video decode is the
   expensive part) and the speech envelope is decoded padded by ±`max_lag` on each side; the
   correlation slides the short signal over the long one. So widening the search to ±60s costs one

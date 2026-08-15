@@ -421,6 +421,84 @@ def test_lipsync_locates_the_mouth_by_its_syllable_rate(app_env):
     assert 2.0 <= peak <= 8.0, f"picked up a {peak:.1f} Hz region instead of the talking one"
 
 
+def test_lipsync_decodes_on_the_igpu_and_downscales_there(app_env):
+    """`fps=` and `scale=` are FILTERS — they run after the decoder, so asking for 128x72 at 12fps
+    does NOT make the decode cheap: every frame of the window is still decoded at full resolution.
+    Measured on this content, the identical 128x72 output costs 7x more CPU from a 1080p source
+    and 30x more from a 4K one. That is exactly the work `-hwaccel vaapi` + `scale_vaapi` moves
+    off the CPU, and the first version of this module skipped it on the reasoning that tiny output
+    frames must mean a cheap decode."""
+    from app import core, lipsync
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"] = cmd
+        raise AssertionError("not reached")
+
+    monkey = getattr(core, "run_proc")
+    core.run_proc = fake
+    try:
+        try:
+            lipsync._decode("/x.mkv", 0, 8, 12, 128, 72, 4, "vaapi", "/dev/dri/renderD128", 60)
+        except AssertionError:
+            pass
+        cmd = " ".join(seen["cmd"])
+        assert "-hwaccel vaapi" in cmd
+        assert "-hwaccel_output_format vaapi" in cmd
+        # The downscale must happen ON the GPU: without scale_vaapi before hwdownload, full-size
+        # surfaces cross PCIe to be scaled on the CPU, which is most of the win thrown away.
+        assert "scale_vaapi=128:72,hwdownload" in cmd
+        assert cmd.index("scale_vaapi") < cmd.index("hwdownload")
+    finally:
+        core.run_proc = monkey
+
+
+def test_lipsync_never_retries_a_timed_out_decode_in_software(app_env):
+    """A hung decode is the one failure the software fallback must NOT answer: it would hang for
+    exactly as long a second time, and the merge worker is already holding its slot. Same contract
+    as offdet_video, which learned it first."""
+    import subprocess as sp
+    from app import core, lipsync, offdet_video
+    calls = []
+
+    def fake(cmd, **kw):
+        calls.append(cmd)
+        raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+
+    monkey = core.run_proc
+    core.run_proc = fake
+    try:
+        frames, rc = lipsync._decode("/x.mkv", 0, 8, 12, 128, 72, 4, "vaapi", "/dev/dri/r", 1)
+        assert rc == offdet_video.TIMEOUT_RC
+        lipsync._frames("/x.mkv", 0, 8, 12, cfg={"sync_hwaccel": "vaapi"}, timeout=1)
+    finally:
+        core.run_proc = monkey
+    # one attempt inside _decode, one inside _frames — and crucially no software retry after either
+    assert len(calls) == 2, f"a timed-out decode was retried: {len(calls)} attempts"
+
+
+def test_lipsync_falls_back_to_software_when_the_igpu_fails(app_env):
+    """A box with no /dev/dri, or a wedged driver, must still get an answer — just slower."""
+    from app import core, lipsync
+    import numpy as np
+    calls = []
+
+    def fake_decode(path, start, dur, fps, w, h, threads, hwaccel, device, timeout):
+        calls.append(hwaccel)
+        if hwaccel:                       # pretend VAAPI is unavailable
+            return np.zeros((0, h, w)), 1
+        return np.ones((40, h, w)), 0
+
+    monkey = lipsync._decode
+    lipsync._decode = fake_decode
+    try:
+        out = lipsync._frames("/x.mkv", 0, 8, 12, cfg={"sync_hwaccel": "vaapi"}, timeout=60)
+    finally:
+        lipsync._decode = monkey
+    assert calls == ["vaapi", None]
+    assert out.shape[0] == 40
+
+
 def test_lipsync_refuses_a_file_too_short_to_sample(app_env):
     """An honest "no reading" beats a number from two windows that overlap."""
     from app import core, lipsync
