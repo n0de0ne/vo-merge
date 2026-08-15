@@ -5,7 +5,7 @@ import { setParam, useRoute } from "../lib/router";
 import { fmtNum, fmtSE } from "../lib/format";
 import {
   Act, AiPill, DownloadBar, DriftBadge, Empty, LiveDot, Pill, Poster, QueuedLine,
-  STATE_LABEL, Tracks, TV_STATES,
+  RowMenu, STATE_LABEL, Tracks, TV_STATES,
 } from "../components/ui";
 import { LipSyncModal, ReleaseModal } from "../components/modals";
 
@@ -33,6 +33,27 @@ interface Show {
 /** A show's (or season's) states, counted. The whole point of the collapsed row: fifty episodes
  *  in one line you can read, instead of fifty rows you have to scroll past. Clicking one filters
  *  the page to that state — the old chips were decorative, which made the count a dead end. */
+/** How much of what this show needed has actually been done. `merged` is the terminal state for
+ *  a record that met its profile, so it is the only honest numerator here. */
+function ShowProgress({ sh }: { sh: Show }) {
+  const done = sh.byStatus.merged ?? 0;
+  const total = sh.eps.length;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const left = total - done;
+  return (
+    <div className="showprog" title={`${done} of ${total} tracked episode(s) now meet the profile`}>
+      <div className="showprog-bar">
+        <span style={{ width: pct + "%" }} className={done === total ? "all" : undefined} />
+      </div>
+      <div className="sub">
+        <b>{done}</b> of {total} gap{total === 1 ? "" : "s"} closed
+        {left > 0 && <> · {left} to go</>}
+        {" · "}{sh.seasons.length} season{sh.seasons.length === 1 ? "" : "s"}
+      </div>
+    </div>
+  );
+}
+
 function StatePills({ counts, onPick }:
   { counts: Record<string, number>; onPick: (s: string) => void }) {
   return (
@@ -158,7 +179,11 @@ export default function Series({ anime }: { anime: boolean }) {
   const [eps, setEps] = useState<Episode[]>([]);
   const [dls, setDls] = useState<Record<string, DL>>({});
   const [text, setText] = useState(urlQ);
-  const [view, setView] = useStored<"grid" | "list">("vo_tv_view", "list");
+  // Grid by default, like Sonarr's series index — a wall of poster cards with a progress bar
+  // each, which is what makes a shelf of shows readable at a glance. The old default was `list`,
+  // which on a library of two shows rendered as two thin lines on an empty page. A stored
+  // preference still wins; this only changes what a fresh browser sees.
+  const [view, setView] = useStored<"grid" | "list">("vo_tv_view", "grid");
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [msg, setMsg] = useState("");
@@ -273,13 +298,6 @@ export default function Series({ anime }: { anime: boolean }) {
     await runAction(refresh);
   }
 
-  async function scanNow() {
-    try {
-      const r = await api.tvScan();
-      setMsg(r.started ? "scan started — reading the files…" : (r.note || "a scan is already running"));
-    } catch (e) { setMsg("failed: " + (e as Error).message); }
-    await runAction(refresh);
-  }
 
   /* Re-read ONE show's files and act on the result. The unit an operator works in: after
      replacing a whole show's files by hand (a fresh MULTI rip), a library-wide re-read is minutes
@@ -352,7 +370,10 @@ export default function Series({ anime }: { anime: boolean }) {
           : <span className="muted">—</span>}</td>
         <td className="muted" style={{ width: 90 }}>{e.quality || "—"}</td>
         <td>
-          <div className="row">
+          {/* Folded into a menu, like the Films rows. Six loose buttons wrapped onto two lines in
+              every episode of a 12-episode season, which made the table twice as tall as it
+              needed to be and put the actions in a different place on each row. */}
+          <RowMenu>
             {!settled && <button className="btn sec small" onClick={() => setRelEp(e)}
               title="Search the indexers for this one episode and pick a release yourself">
               Search…</button>}
@@ -371,11 +392,11 @@ export default function Series({ anime }: { anime: boolean }) {
             {e.status !== "ignored" && <button className="btn sec small" onClick={() => setLips(e)}
               title={"Read the lips: measure this file's audio against the picture itself — the "
                 + "one reading here that doesn't compare two files that could both be wrong"}>
-              👄</button>}
+              👄 Read the lips…</button>}
             {!settled && <Act cls="btn sec small" run={() => act(() => api.epIgnore(e.id))}
               title={"Stop working on this episode. A rescan won't re-open it; it is revisited on "
                 + "the ignored-revisit schedule."}>Ignore</Act>}
-          </div>
+          </RowMenu>
         </td>
       </tr>
     );
@@ -465,10 +486,12 @@ export default function Series({ anime }: { anime: boolean }) {
               {sh.prio && <span className="prio" title="prioritised">★</span>}
               {sh.title}
             </div>
-            <div className="sub">
-              {sh.eps.length} episode{sh.eps.length === 1 ? "" : "s"} tracked
-              {" · "}{sh.seasons.length} season{sh.seasons.length === 1 ? "" : "s"}
-            </div>
+            {/* The bar Sonarr's series list is built around, saying the thing this app
+                actually knows. NOT "episodes on disk / total episodes": a record exists only for
+                an episode whose file was SHORT of its profile, so the denominator is gaps found,
+                not the season length. Labelling it "gaps closed" is the difference between a
+                number you can trust and one that quietly claims to know how long the show is. */}
+            <ShowProgress sh={sh} />
             <StatePills counts={sh.byStatus} onPick={pickStatus} />
           </div>
         </div>
@@ -481,27 +504,56 @@ export default function Series({ anime }: { anime: boolean }) {
 
   return (
     <>
-      <div className="panel">
-        <div className="row">
-          <div>
-            <b>{anime ? "🎌 Anime" : "📺 TV Shows"}</b>{" "}
-            <span className="muted">
-              episodes whose file is short of the {anime ? "anime" : "series"} language profile
-            </span>
-          </div>
-          <div className="spacer" />
-          {msg && <span className="muted">{msg}</span>}
-          <Act cls="btn sec" run={searchNow}
-            title="Search every pending episode now instead of waiting for the timer">
-            🔍 Search now</Act>
-          <Act cls="btn" run={scanNow}
-            title="Ask Sonarr what it has, read those files and record what each is missing">
-            Scan {anime ? "anime" : "series"}</Act>
-          <RescanButton scope={scope} label={label} />
-          <RescanButton scope={scope} label={label} full />
-          <RecheckButton scope={scope} />
+      {/* ONE toolbar, in the same order as Films: filter, search, view, count, then the actions.
+          This page used to stack a titled header panel of actions ON TOP of a second filter bar,
+          which read as two pages joined end to end and pushed the shows themselves below the
+          fold. The page title is already in the top bar; repeating it here bought nothing. */}
+      <div className="row toolbar">
+        <select value={status} onChange={e => pickStatus(e.target.value)}
+          aria-label="Filter by pipeline state">
+          <option value="">all states ({fmtNum(kindEps.length)})</option>
+          {TV_STATES.map(s => (
+            <option key={s} value={s}>{stateLabel(s)} ({fmtNum(counts[s] ?? 0)})</option>
+          ))}
+        </select>
+        <input className="search" type="search" value={text}
+          placeholder={anime ? "Search anime…" : "Search show…"}
+          onChange={e => setText(e.target.value)}
+          aria-label={anime ? "Search anime by title" : "Search shows by title"} />
+        <div className="segbtns" role="group" aria-label="View">
+          <button className={view === "grid" ? "active" : ""} onClick={() => setView("grid")}
+            title="Poster cards, one height each">▦ Grid</button>
+          <button className={view === "list" ? "active" : ""} onClick={() => setView("list")}
+            title="One row per show">☰ List</button>
         </div>
-        <div className="chips" style={{ marginTop: 12 }}>
+        <span className="muted">
+          {fmtNum(shown.length)} show{shown.length === 1 ? "" : "s"} · {fmtNum(shownEps)} episode
+          {shownEps === 1 ? "" : "s"}
+        </span>
+        <div className="spacer" />
+        {msg && <span className="muted">{msg}</span>}
+        {(counts.error ?? 0) > 0 &&
+          <Act cls="btn sec" run={() => act(api.tvRetryErrors)}
+            title={"Blocklist the failed release, drop its donor and re-search — every failed "
+              + "episode, not just this show's"}>
+            ↻ Retry {counts.error} errors</Act>}
+        <button className="btn sec" disabled={shown.length === 0}
+          onClick={() => setOpen(allOpen ? new Set() : new Set(shown.map(s => s.key)))}>
+          {allOpen ? "Collapse all" : "Expand all"}</button>
+        <Act cls="btn sec" run={searchNow}
+          title="Search every pending episode now instead of waiting for the timer">
+          🔍 Search now</Act>
+        {/* There is no third "Scan series" button any more. It called /api/tv/scan, which scans
+            series AND anime — on a page that is about one of them, while the two buttons beside
+            this one are already scoped to this tab's kind. The other kind has its own tab and its
+            own buttons, so nothing is lost and the toolbar fits on one line, like Films'. */}
+        <RescanButton scope={scope} label={label} />
+        <RescanButton scope={scope} label={label} full />
+        <RecheckButton scope={scope} />
+        <LiveDot />
+      </div>
+
+      <div className="chips" style={{ margin: "0 2px 12px" }}>
           {TV_STATES.map(s => (
             <button key={s} className="chip"
               style={{
@@ -513,10 +565,9 @@ export default function Series({ anime }: { anime: boolean }) {
               title={status === s ? "showing only these — click to clear"
                                   : `show only the ${stateLabel(s)} episodes`}
               onClick={() => pickStatus(status === s ? "" : s)}>
-              {stateLabel(s)} <b>{fmtNum(counts[s] ?? 0)}</b>
-            </button>
-          ))}
-        </div>
+            {stateLabel(s)} <b>{fmtNum(counts[s] ?? 0)}</b>
+          </button>
+        ))}
       </div>
 
       {picked.length > 0 && (
@@ -540,37 +591,6 @@ export default function Series({ anime }: { anime: boolean }) {
       )}
 
       <div className="panel capped full">
-        <div className="row toolbar panel-head">
-          <select value={status} onChange={e => pickStatus(e.target.value)}
-            aria-label="Filter by pipeline state">
-            <option value="">all states</option>
-            {TV_STATES.map(s => <option key={s} value={s}>{stateLabel(s)}</option>)}
-          </select>
-          <input className="search" type="search" value={text}
-            placeholder={anime ? "Search anime…" : "Search show…"}
-            onChange={e => setText(e.target.value)}
-            aria-label={anime ? "Search anime by title" : "Search shows by title"} />
-          <span className="muted">
-            {fmtNum(shown.length)} show{shown.length === 1 ? "" : "s"} · {fmtNum(shownEps)} episode
-            {shownEps === 1 ? "" : "s"}
-          </span>
-          <LiveDot />
-          <div className="spacer" />
-          {(counts.error ?? 0) > 0 &&
-            <Act cls="btn sec" run={() => act(api.tvRetryErrors)}
-              title={"Blocklist the failed release, drop its donor and re-search — every failed "
-                + "episode, not just this show's"}>
-              ↻ Retry {counts.error} errors</Act>}
-          <button className="btn sec" disabled={shown.length === 0}
-            onClick={() => setOpen(allOpen ? new Set() : new Set(shown.map(s => s.key)))}>
-            {allOpen ? "Collapse all" : "Expand all"}</button>
-          <div className="segbtns">
-            <button className={view === "grid" ? "active" : ""} onClick={() => setView("grid")}
-              title="Poster cards">▦ Grid</button>
-            <button className={view === "list" ? "active" : ""} onClick={() => setView("list")}
-              title="One row per show">☰ List</button>
-          </div>
-        </div>
 
         <div className="panel-body">
           {shown.length === 0

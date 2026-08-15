@@ -72,7 +72,7 @@
   --fit-lg: clamp(280px, 62vh, 720px);
   --fit-xl: clamp(320px, 65vh, 820px);
   --card-h: clamp(184px, 24vh, 260px);
-  --showcard-h: clamp(116px, 16vh, 158px);
+  --showcard-h: clamp(150px, 20vh, 200px);
 }
 
 * { box-sizing: border-box; }
@@ -701,14 +701,14 @@ input[type=checkbox].sw:checked::after { transform: translateX(17px); background
               margin: 16px 2px 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
 .libsection:first-child { margin-top: 4px; }
 
-.showcardgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+.showcardgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
                 gap: 12px; align-items: start; }
 .showcard { border: 1px solid var(--border); border-radius: 10px; background: var(--panel2);
             overflow: hidden; }
 .showcard.open { grid-column: 1 / -1; }
 .showcard-head { display: flex; gap: 10px; padding: 10px; cursor: pointer; }
 .showcard-head:hover { filter: brightness(1.08); }
-.showcard-head .poster { width: 52px; height: 78px; flex: 0 0 52px; }
+.showcard-head .poster { width: 68px; height: 102px; flex: 0 0 68px; }
 .showcard-meta { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .showcard-title { font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
 .showcard-meta .chips { gap: 4px; }
@@ -766,3 +766,19 @@ pre.logs.mini { max-height: 220px; font-size: 11.5px; }
 .lipwin .bar > span { display: block; height: 100%; background: var(--series-1); }
 .lipwin.skip { color: var(--muted); }
 .lipwin.skip .bar > span { background: var(--st-none); }
+
+/* ---- series progress: the bar Sonarr's list is built around ----------
+   Its denominator is GAPS FOUND, not the season length — a record only
+   exists for an episode whose file was short of its profile — so the
+   label says "gaps closed" and never implies we know how long the show
+   is. Full width in a card, so a wall of shows can be scanned vertically
+   for the ones that have not moved. */
+.showprog { margin: 5px 0 2px; min-width: 0; }
+.showprog-bar {
+  height: 6px; border-radius: 3px; background: var(--bg);
+  border: 1px solid var(--border); overflow: hidden;
+}
+.showprog-bar > span { display: block; height: 100%; background: var(--series-1); }
+.showprog-bar > span.all { background: var(--st-good); }
+.showprog .sub { margin-top: 3px; }
+.showprog .sub b { color: var(--text); font-variant-numeric: tabular-nums; }
