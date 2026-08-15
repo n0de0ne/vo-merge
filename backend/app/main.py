@@ -145,7 +145,30 @@ def status():
 
 @api.get("/movies")
 def movies(status: str | None = None):
-    return core.get_movies(status)
+    """Every tracked film, plus how much of its language target it now meets.
+
+    `targets`/`targets_met` are computed here rather than stored, from the SAME resolution the
+    scan used (`kind_of` picks the profile, `profile` resolves the anime `orig` slot per title),
+    so a film's progress cannot disagree with the gap that produced it. Doing it in the endpoint
+    also means it is right immediately after a settings change, where a stored column would need
+    a rescan to catch up.
+
+    The UI needs a denominator to draw a bar at all: `need_audio`/`need_subs` say what is MISSING
+    and nothing in the record says how many were wanted."""
+    cfg = core.load_config()
+    rows = core.get_movies(status)
+    prof = {}
+    for m in rows:
+        key = (media.kind_of(m.get("french_path"), m.get("original_lang"), cfg),
+               m.get("original_lang"))
+        if key not in prof:
+            prof[key] = media.profile(key[0], cfg, key[1])
+        want_a, want_s = prof[key]
+        missing = len([x for x in (m.get("need_audio") or "").split(",") if x]) \
+            + len([x for x in (m.get("need_subs") or "").split(",") if x])
+        m["targets"] = len(want_a) + len(want_s)
+        m["targets_met"] = max(0, m["targets"] - missing)
+    return rows
 
 
 # Secrets the UI must be able to read back, each with its reason. Everything else in

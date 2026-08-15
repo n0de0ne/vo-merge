@@ -6,8 +6,8 @@ import { runAction, usePoll, useStored } from "../lib/poll";
 import { setParam, useRoute } from "../lib/router";
 import { fmtAgo, fmtNum } from "../lib/format";
 import {
-  Act, AiPill, DownloadBar, DriftBadge, Empty, LiveDot, Pill, Poster, QueuedLine, RowMenu,
-  STATE_LABEL, STATES, Tracks,
+  Act, AiPill, DownloadBar, DriftBadge, Empty, LiveDot, Pill, Poster, Progress, QueuedLine,
+  RowMenu, STATE_LABEL, STATES, Tracks,
 } from "../components/ui";
 import { LipSyncModal, ReleaseModal, SyncEditor } from "../components/modals";
 
@@ -265,6 +265,12 @@ function MovieCard({ m, dl, act, onOpen, onNote }:
           <div className="spacer" />
           <MovieActions m={m} act={act} onOpen={onOpen} onNote={onNote} />
         </div>
+        {/* Same anchor the show cards carry, and the same idea: how much of what this title
+            needs is done. For a film the unit is its language targets rather than its episodes —
+            `targets`/`targets_met` come from the endpoint, resolved with the profile the scan
+            itself used, because nothing in the record says how many were WANTED. Pinned above
+            the scroller so a wall of text below can never push it out of view. */}
+        <TargetProgress m={m} />
         <div className="card-scroll">
           <div className="sub">
             → {m.original_title} · {m.original_lang}{m.quality ? ` · ${m.quality}` : ""}
@@ -274,6 +280,22 @@ function MovieCard({ m, dl, act, onOpen, onNote }:
         </div>
       </div>
     </div>
+  );
+}
+
+/** How much of this film's language target its file now meets. The two fields are optional
+ *  because they are computed by the endpoint rather than stored, so an older cached response
+ *  simply renders no bar rather than a wrong one. */
+function TargetProgress({ m }: { m: Movie }) {
+  const total = m.targets ?? 0;
+  if (total <= 0) return null;
+  const done = m.targets_met ?? 0;
+  return (
+    <Progress done={done} total={total}
+      title={`${done} of ${total} target language(s) present in the file`}>
+      <b>{done}</b> of {total} target{total === 1 ? "" : "s"} met
+      {done >= total && " · complete"}
+    </Progress>
   );
 }
 
@@ -460,6 +482,9 @@ export default function Films() {
                       </td>
                       <td>
                         <Pill s={m.status} /> <AiPill s={m.ai_status} />
+                        {/* The same bar the cards carry, so switching view does not change what
+                            you can see about a title. */}
+                        <TargetProgress m={m} />
                         {m.status === "sync_fail" && m.sync_delta != null &&
                           <div className="sub">Δ {m.sync_delta.toFixed(1)}s</div>}
                         {m.status === "downloading" && <DownloadBar dl={dlOf(m)} />}

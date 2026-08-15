@@ -5,7 +5,7 @@ import { setParam, useRoute } from "../lib/router";
 import { fmtNum, fmtSE } from "../lib/format";
 import {
   Act, AiPill, DownloadBar, DriftBadge, Empty, LiveDot, Pill, Poster, QueuedLine,
-  RowMenu, STATE_LABEL, Tracks, TV_STATES,
+  Progress, RowMenu, STATE_LABEL, Tracks, TV_STATES,
 } from "../components/ui";
 import { LipSyncModal, ReleaseModal } from "../components/modals";
 
@@ -33,27 +33,6 @@ interface Show {
 /** A show's (or season's) states, counted. The whole point of the collapsed row: fifty episodes
  *  in one line you can read, instead of fifty rows you have to scroll past. Clicking one filters
  *  the page to that state — the old chips were decorative, which made the count a dead end. */
-/** How much of what this show needed has actually been done. `merged` is the terminal state for
- *  a record that met its profile, so it is the only honest numerator here. */
-function ShowProgress({ sh }: { sh: Show }) {
-  const done = sh.byStatus.merged ?? 0;
-  const total = sh.eps.length;
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  const left = total - done;
-  return (
-    <div className="showprog" title={`${done} of ${total} tracked episode(s) now meet the profile`}>
-      <div className="showprog-bar">
-        <span style={{ width: pct + "%" }} className={done === total ? "all" : undefined} />
-      </div>
-      <div className="sub">
-        <b>{done}</b> of {total} gap{total === 1 ? "" : "s"} closed
-        {left > 0 && <> · {left} to go</>}
-        {" · "}{sh.seasons.length} season{sh.seasons.length === 1 ? "" : "s"}
-      </div>
-    </div>
-  );
-}
-
 function StatePills({ counts, onPick }:
   { counts: Record<string, number>; onPick: (s: string) => void }) {
   return (
@@ -491,7 +470,14 @@ export default function Series({ anime }: { anime: boolean }) {
                 an episode whose file was SHORT of its profile, so the denominator is gaps found,
                 not the season length. Labelling it "gaps closed" is the difference between a
                 number you can trust and one that quietly claims to know how long the show is. */}
-            <ShowProgress sh={sh} />
+            <Progress done={sh.byStatus.merged ?? 0} total={sh.eps.length}
+              title={`${sh.byStatus.merged ?? 0} of ${sh.eps.length} tracked episode(s) now meet the profile`}>
+              <b>{sh.byStatus.merged ?? 0}</b> of {sh.eps.length} gap
+              {sh.eps.length === 1 ? "" : "s"} closed
+              {sh.eps.length - (sh.byStatus.merged ?? 0) > 0
+                && <> · {sh.eps.length - (sh.byStatus.merged ?? 0)} to go</>}
+              {" · "}{sh.seasons.length} season{sh.seasons.length === 1 ? "" : "s"}
+            </Progress>
             <StatePills counts={sh.byStatus} onPick={pickStatus} />
           </div>
         </div>

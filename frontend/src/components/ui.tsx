@@ -108,15 +108,52 @@ export function DriftBadge({ d }: { d?: number | null }) {
 
 /** What the library file actually contains, read off the FILE by mkvmerge — not from
  *  Radarr/Sonarr metadata — plus what it is still missing. */
-export function Tracks({ a, s, na, ns }:
-  { a?: string | null; s?: string | null; na?: string | null; ns?: string | null }) {
+export function Tracks({ a, s, na, ns, cap = 6 }:
+  { a?: string | null; s?: string | null; na?: string | null; ns?: string | null; cap?: number }) {
   if (!a && !s && !na && !ns) return null;
   return (
     <div className="sub tracks" title="languages read from the file itself">
-      🔊 {a || <span className="muted">none tagged</span>}
-      {s ? <> · 💬 {s}</> : <> · <span className="muted">no subs</span></>}
+      🔊 <Langs v={a} cap={cap} /> · 💬 <Langs v={s} cap={cap} empty="no subs" />
       {na && <span className="needs">+ {na} audio</span>}
       {ns && <span className="needs">+ {ns} subs</span>}
+    </div>
+  );
+}
+
+/** A comma list of language codes, truncated. A multi-language WEB release can carry thirty
+ *  subtitle tracks, and rendering all of them made one card a wall of text that dwarfed every
+ *  other card in the grid — and buried the one part that matters, which is what is still
+ *  MISSING. The full list stays in the tooltip. */
+function Langs({ v, cap, empty = "none tagged" }:
+  { v?: string | null; cap: number; empty?: string }) {
+  const all = (v || "").split(",").map(x => x.trim()).filter(Boolean);
+  if (!all.length) return <span className="muted">{empty}</span>;
+  const extra = all.length - cap;
+  return (
+    <span title={all.length > cap ? all.join(", ") : undefined}>
+      {all.slice(0, cap).join(", ")}
+      {extra > 0 && <span className="muted"> +{extra} more</span>}
+    </span>
+  );
+}
+
+/** The completion bar both library pages are built around, in ONE place so Films and TV cannot
+ *  drift apart again — which is exactly what happened when TV got a bar and Films did not.
+ *
+ *  `done`/`total` mean different things per page and that is fine, because each supplies its own
+ *  wording: a show counts gaps closed across its tracked episodes, a film counts the language
+ *  targets its file now meets. Neither is "episodes on disk / total episodes" — this app only
+ *  ever knows what it found missing. */
+export function Progress({ done, total, children, title }:
+  { done: number; total: number; children: ReactNode; title?: string }) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return (
+    <div className="showprog" title={title}>
+      <div className="showprog-bar" role="progressbar" aria-valuenow={done} aria-valuemin={0}
+        aria-valuemax={total}>
+        <span style={{ width: pct + "%" }} className={total > 0 && done >= total ? "all" : undefined} />
+      </div>
+      <div className="sub">{children}</div>
     </div>
   );
 }

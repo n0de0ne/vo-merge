@@ -10,6 +10,10 @@ export interface Movie {
   // read off the FILE by mkvmerge, not from Radarr/Sonarr metadata
   audio_langs?: string | null; sub_langs?: string | null; needs?: string | null;
   need_audio?: string | null; need_subs?: string | null; added_subs?: string | null;
+  // Computed by /api/movies from the profile the scan resolved — the record itself only says
+  // what is MISSING, and a bar needs a denominator.
+  targets?: number;
+  targets_met?: number;
 }
 export interface Status {
   enabled: boolean; grab_mode: string; counts: Record<string, number>; states: string[];
