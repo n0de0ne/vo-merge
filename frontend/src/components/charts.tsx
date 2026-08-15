@@ -122,9 +122,15 @@ export function TimeSeries(
   const pad = { l: 42, r: 12, t: 10, b: 22 };
   const iw = Math.max(60, w - pad.l - pad.r), ih = height - pad.t - pad.b;
   const all = series.flatMap(s => s.values).filter((v): v is number => v != null);
-  const hi = yMax ?? (all.length ? Math.max(...all) : 1);
   const lo = yMin;
-  const top = hi === lo ? lo + 1 : hi + (hi - lo) * 0.08;
+  // An explicit yMax is a CEILING, not a hint: padding it produced a "108.0%" tick on the
+  // coverage chart, which is not a number a percentage can take. Only an auto-scaled axis gets
+  // headroom above its largest point.
+  const top = yMax != null
+    ? (yMax === lo ? lo + 1 : yMax)
+    : (all.length ? Math.max(...all) : 1) === lo
+      ? lo + 1
+      : (Math.max(...all) + (Math.max(...all) - lo) * 0.08);
   const x = (i: number) => pad.l + (days.length < 2 ? iw / 2 : (i / (days.length - 1)) * iw);
   const y = (v: number) => pad.t + ih - ((v - lo) / (top - lo)) * ih;
   const fmt = valueFmt ?? ((n: number) => fmtNum(n) + unit);
