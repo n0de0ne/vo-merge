@@ -2351,6 +2351,9 @@ def _lipsync(kind, rec, ident, body):
                                    tag=f" {ident}")
         out.update(offset_ms=off, confidence=conf, compared="library vs donor")
         if body.apply and off is not None:
+            # drift=None on purpose: a lip-sync reading is a constant offset, and _set_sync
+            # stores it with sync_manual=1, which makes the merge apply what it is given without
+            # re-measuring. Leaving a previous attempt's rate stretch in place would apply both.
             _set_sync(kind, rec, ident, SetSyncIn(offset_ms=int(off), drift=None))
             out["applied"], out["note"] = pipeline.enqueue_merge(kind, ident)
         return out

@@ -1107,7 +1107,8 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
                     # to the other one. See pipeline.lipsync_rescue.
                     rescue = lipsync_rescue(base, donor, min(ei["dur"] or 0, fi["dur"] or 0),
                                             cfg, fps_diff=fps_diff, tag=f" {ep['id']}",
-                                            on_progress=lambda msg: _beat("episode", ep["id"], msg))
+                                            on_progress=lambda msg: _beat("episode", ep["id"], msg),
+                                            donor_ai=(daidx[ids[0]] if ids else 0))
             if rescue is None:
                 why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
                 _reject_and_retry_ep(ep, why, cfg, delta,

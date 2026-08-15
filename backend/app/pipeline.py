@@ -1520,7 +1520,7 @@ def _lipsync_qc(out, n_base_auds, cfg, tag=""):
         return True, 0, 0.0
 
 
-def lipsync_rescue(base, donor, dur, cfg, fps_diff=False, tag="", on_progress=None):
+def lipsync_rescue(base, donor, dur, cfg, fps_diff=False, tag="", on_progress=None, donor_ai=0):
     """The rung below the wide probe: measure each file against its OWN picture and take the
     difference.
 
@@ -1541,7 +1541,12 @@ def lipsync_rescue(base, donor, dur, cfg, fps_diff=False, tag="", on_progress=No
         return None
     from . import lipsync
     try:
-        off, conf = lipsync.rescue(base, donor, dur, cfg, tag=tag, on_progress=on_progress)
+        # Measure the track the merge is actually going to graft. Audio streams in one container
+        # normally share a timeline, so stream 0 is usually the same answer — but "usually" is not
+        # a property worth relying on when the right index is already in hand, and the track being
+        # grafted is also the one whose speech we want to correlate.
+        off, conf = lipsync.rescue(base, donor, dur, cfg, tag=tag, on_progress=on_progress,
+                                   donor_ai=donor_ai)
     except Exception as e:                       # a rescue attempt must never break the merge
         core.log(f"sync{tag}: lip-sync rescue error: {e}")
         return None
@@ -2577,7 +2582,8 @@ def _merge_movie_impl(tmdb_id, cfg=None):
                     # match each to its own picture instead.
                     rescue = lipsync_rescue(base, donor, min(ei["dur"] or 0, fi["dur"] or 0),
                                             cfg, fps_diff=fps_diff, tag=f" {tmdb_id}",
-                                            on_progress=lambda msg: _beat("movie", tmdb_id, msg))
+                                            on_progress=lambda msg: _beat("movie", tmdb_id, msg),
+                                            donor_ai=(daidx[ids[0]] if ids else 0))
             if rescue is None:
                 why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
                 # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit

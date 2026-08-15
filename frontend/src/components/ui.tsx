@@ -11,7 +11,11 @@ export const STATE_LABEL: Record<string, string> = { ready: "queued" };
 
 export const STATES = ["pending", "searching", "no_release", "grabbed", "downloading",
                        "ready", "merging", "merged", "review", "sync_fail", "error", "ignored"];
-export const TV_STATES = STATES.filter(s => s !== "review");
+// TV used to drop `review` on the grounds that only films park there. Episodes do too:
+// `_reject_and_retry_ep` passes final="review" whenever `sync_review` is on, which is the
+// default. Filtering it out of the list meant those episodes could be neither found nor filtered
+// on the pages that own them.
+export const TV_STATES = STATES;
 
 export function Pill({ s }: { s: string }) {
   return <span className={`pill ${s}`}>{STATE_LABEL[s] ?? s.replace("_", " ")}</span>;
@@ -75,8 +79,11 @@ export function DownloadBar({ dl }: { dl?: DL }) {
   const st = dl.state || "";
   const active = (dl.dlspeed || 0) > 0;
   const label = active ? fmtSpeed(dl.dlspeed) : pct >= 100 ? "done" : (DL_LABEL[st] ?? "waiting");
-  const meta = [label, active ? fmtEta(dl.eta) : "", `${dl.seeds || 0} seeds`]
-    .filter(Boolean).join(" · ");
+  // qB reports num_complete as -1 for a swarm it has not scraped yet. That is "unknown", not a
+  // seed count — the stall sweep already treats it that way (`_swarm_seeds`), and rendering it
+  // raw put "-1 seeds" on screen.
+  const seeds = (dl.seeds ?? 0) < 0 ? "seeds unknown" : `${dl.seeds || 0} seeds`;
+  const meta = [label, active ? fmtEta(dl.eta) : "", seeds].filter(Boolean).join(" · ");
   const cls = active ? "live" : st === "stalledDL" ? "stalled" : st === "queuedDL" ? "queued" : "";
   return (
     <div className="dlbar" title={`${st} · ${pct}% of ${fmtBytes(dl.size)}`}>

@@ -125,12 +125,12 @@ export function TimeSeries(
   const lo = yMin;
   // An explicit yMax is a CEILING, not a hint: padding it produced a "108.0%" tick on the
   // coverage chart, which is not a number a percentage can take. Only an auto-scaled axis gets
-  // headroom above its largest point.
-  const top = yMax != null
-    ? (yMax === lo ? lo + 1 : yMax)
-    : (all.length ? Math.max(...all) : 1) === lo
-      ? lo + 1
-      : (Math.max(...all) + (Math.max(...all) - lo) * 0.08);
+  // headroom above its largest point — and `Math.max()` of no arguments is -Infinity, so the
+  // "every sample is null" case has to be handled before it reaches the arithmetic or the whole
+  // axis renders as NaN.
+  const peak = all.length ? Math.max(...all) : lo + 1;
+  const top = yMax != null ? (yMax > lo ? yMax : lo + 1)
+    : peak > lo ? peak + (peak - lo) * 0.08 : lo + 1;
   const x = (i: number) => pad.l + (days.length < 2 ? iw / 2 : (i / (days.length - 1)) * iw);
   const y = (v: number) => pad.t + ih - ((v - lo) / (top - lo)) * ih;
   const fmt = valueFmt ?? ((n: number) => fmtNum(n) + unit);

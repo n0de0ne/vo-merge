@@ -84,8 +84,14 @@ RULES = [
          fix="The sync was wrong, not the release choice — measure it properly (a wide probe or "
              "a lip-sync read) or take a different donor.",
          remedies=["sync_probe_apply", "lipsync_apply", "another", "ai"]),
+    # NOTE the pattern deliberately does NOT include "no compatible release after". Both
+    # `reject_and_retry` and `_reject_and_retry_ep` compose their final message as
+    # f"{reason}; no compatible release after {n} tries" — that suffix is on EVERY exhausted
+    # failure, whatever its cause, so matching it here swallowed donor-vanished, donor-unreadable,
+    # useless-release and mux failures into this group and offered them a sync remedy. The leading
+    # reason is what classifies; the suffix only says the budget is spent.
     dict(code="different_cut", label="Different cut — no offset aligns them", severity="judgement",
-         match=r"couldn't sync|low-confidence sync|no compatible release after|different cut",
+         match=r"couldn't sync|low-confidence sync|different cut",
          why="The analysis windows disagree even after the wide ±300s rescue, which means "
              "material differs INSIDE the runtime (an extra scene, a different edit) — no single "
              "offset can align the pair.",
@@ -347,8 +353,16 @@ def records(code, limit=200, offset=0, states=FAIL_STATES):
     for r in page:
         r["drift"] = drift_of(r["error"])
         r["has_donor"] = bool(r.get("en_file"))
+    # The rule's own `remedies` is a list of CODES; the UI needs the same expanded dicts `groups`
+    # hands it (label/bulk/slow/note), or every button in the drill-down filters itself out on a
+    # `bulk` attribute that a string does not have — which is to say, silently renders nothing.
+    rule = BY_CODE.get(code)
+    if rule:
+        drifts = any(drift_of(r.get("error")) for r in rows)
+        rule = dict(rule, remedies=[dict(REMEDIES[x], code=x) for x in rule["remedies"]
+                                    if x in REMEDIES and (x != "apply_drift" or drifts)])
     return {"code": code, "total": len(rows), "offset": offset, "limit": limit,
-            "items": page, "rule": BY_CODE.get(code), "now": time.time()}
+            "items": page, "rule": rule, "now": time.time()}
 
 
 # --------------------------------------------------------------------------- bulk remedies
@@ -384,10 +398,23 @@ def _apply_one(action, rec, cfg, params):
         rec_full = core.get_movie(ident) if kind == "movie" else core.get_episode(ident)
         if not rec_full:
             return False, "record not found"
-        if rec_full.get("dl_hash"):
+        h = rec_full.get("dl_hash")
+        # A season pack is ONE torrent behind many episodes, so deleting it with its files for
+        # one of them destroys the donor for every pack-mate still waiting on it — and this
+        # remedy is offered in bulk, so it would do that repeatedly. Same guard tv.retry_episode
+        # uses: drop it only when no other live record still needs that hash.
+        if h and kind == "episode":
+            live = [x for x in core.get_episodes()
+                    if x.get("dl_hash") == h and x["id"] != ident
+                    and x["status"] not in ("error", "no_release", "ignored", "merged")]
+            if live:
+                core.log(f"problems: keeping donor {str(h)[:12]} — {len(live)} pack-mate(s) "
+                         f"still need it")
+                h = None
+        if h:
             try:
                 qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"]); qb.login()
-                qb.delete([rec_full["dl_hash"]], delete_files=True)
+                qb.delete([h], delete_files=True)
             except Exception as e:
                 core.log(f"problems: could not drop donor for {kind} {ident}: {e}")
         setter(ident, "pending", tried=pipeline.blocklist(rec_full), error=None,
@@ -398,6 +425,11 @@ def _apply_one(action, rec, cfg, params):
         k = params.get("drift") or drift_of(rec.get("error"))
         if not k:
             return False, "no rate ratio in this record's message"
+        # Same range guard main._set_sync applies. `drift` can arrive from the request body, so
+        # without this the bulk path is a way around the validation the single-record path has —
+        # and a wild ratio would stretch the audio into nonsense across a whole group.
+        if not 0.9 <= float(k) <= 1.11:
+            return False, f"{k} is not a rate ratio (must be between 0.9 and 1.11)"
         setter(ident, rec["status"], sync_offset_ms=int(params.get("offset_ms") or 0),
                sync_drift=float(k), sync_manual=1, error=None)
         queued, note = pipeline.enqueue_merge(kind, ident)
@@ -423,8 +455,15 @@ def _apply_one(action, rec, cfg, params):
             if not m:
                 return False, "Radarr no longer has this movie"
             return True, str(pipeline.ingest_movie(m, cfg, refresh=True))
-        n = tv.scan(cfg, only_series=rec.get("series_id"), refresh=True)
-        return True, f"re-read; {n} gap(s) in this series"
+        # A TV rescan is per-SERIES, not per-episode. Selecting 40 episodes of one show would
+        # otherwise re-probe that whole show 40 times; the pass is idempotent, so once is enough.
+        sid = rec.get("series_id")
+        done = params.setdefault("_rescanned", set())
+        if sid in done:
+            return True, "already re-read with this show"
+        done.add(sid)
+        n = tv.scan(cfg, only_series=sid, refresh=True)
+        return True, f"re-read the show; {n} gap(s) found"
 
     if action == "ai":
         from . import agent

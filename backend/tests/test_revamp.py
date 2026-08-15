@@ -247,6 +247,86 @@ def test_every_error_the_pipeline_writes_lands_in_the_right_group(app_env, statu
     assert problems.classify(status, error) == code
 
 
+@pytest.mark.parametrize("reason,code", [
+    ("donor file vanished before the merge", "donor_gone"),
+    ("donor unreadable (probe failed)", "donor_unreadable"),
+    ("release carries none of the missing languages (still needs eng)", "useless_release"),
+    ("mux failed: mkvmerge rc=2", "mux_failed"),
+    ("couldn't sync (low-confidence sync)", "different_cut"),
+])
+def test_an_exhausted_failure_keeps_its_own_cause(app_env, reason, code):
+    """Both retry paths compose the final message as
+    f"{reason}; no compatible release after {n} tries" — that suffix rides on EVERY exhausted
+    failure whatever caused it. Matching it in the different-cut rule swallowed four unrelated
+    causes into one group and offered each of them a sync remedy that could not help."""
+    from app import problems
+    assert problems.classify("sync_fail", f"{reason}; no compatible release after 4 tries") == code
+
+
+def test_the_drill_down_hands_the_ui_usable_remedies(app_env):
+    """`groups()` expands each remedy code into {code,label,bulk,slow,note}; the drill-down used
+    to return the raw rule, whose `remedies` are bare strings. The page filters on `r.bulk`, which
+    a string does not have — so every bulk button on that view silently rendered nothing."""
+    core = app_env
+    _movie(core)
+    core.set_status(1, "sync_fail", error="donor file vanished before the merge")
+    from app import problems
+    rule = problems.records("donor_gone")["rule"]
+    assert rule and rule["remedies"], "no remedies returned"
+    for r in rule["remedies"]:
+        assert isinstance(r, dict) and {"code", "label", "bulk", "note"} <= set(r)
+
+
+def test_picking_another_release_keeps_a_donor_a_pack_mate_still_needs(app_env, monkeypatch):
+    """A season pack is ONE torrent behind many episodes. Deleting it with its files for one of
+    them destroys the donor for every episode still waiting on it — and this remedy is offered in
+    bulk, so it would do it repeatedly. Same guard tv.retry_episode uses."""
+    core = app_env
+    from app import problems
+    for e in (1, 2):
+        core.upsert_episode(dict(id=f"7:1:{e}", series_id=7, series_title="Show", tvdb_id=1,
+                                 season=1, episode=e, french_path=f"/m/S01E0{e}.mkv",
+                                 quality="WEB", poster=None, series_type="standard",
+                                 orig_lang="eng"))
+        core.set_ep_status(f"7:1:{e}", "sync_fail", dl_hash="deadbeef",
+                           error="donor unreadable (probe failed)")
+    deleted = []
+    monkeypatch.setattr(problems, "_apply_one", problems._apply_one)     # keep the real one
+
+    class FakeQB:
+        def __init__(self, *a, **k): pass
+        def login(self): pass
+        def delete(self, hashes, delete_files=False): deleted.extend(hashes)
+
+    import app.clients
+    monkeypatch.setattr(app.clients, "QBittorrent", FakeQB)
+    cfg = dict(core.DEFAULTS)
+    rec = [r for r in problems._rows() if r["key"] == "7:1:1"][0]
+    ok, msg = problems._apply_one("another", rec, cfg, {})
+    assert ok and deleted == [], f"deleted a shared pack donor: {msg}"
+
+    # ...and once no pack-mate needs it, the torrent may go. (`another` moved E01 to `pending`,
+    # which is not a failing state, so put it back where the remedy can find it.)
+    core.set_ep_status("7:1:2", "merged")
+    core.set_ep_status("7:1:1", "sync_fail", dl_hash="deadbeef",
+                       error="donor unreadable (probe failed)")
+    rec = [r for r in problems._rows() if r["key"] == "7:1:1"][0]
+    problems._apply_one("another", rec, cfg, {})
+    assert deleted == ["deadbeef"]
+
+
+def test_apply_drift_refuses_a_ratio_that_is_not_a_rate(app_env):
+    """`drift` can arrive from the request body, so without this the bulk path is a way around
+    the 0.9-1.11 guard the single-record endpoint applies — across a whole group at once."""
+    core = app_env
+    _movie(core)
+    core.set_status(1, "sync_fail", error="the arithmetic ratio is 1.0427083")
+    from app import problems
+    rec = problems._rows()[0]
+    ok, msg = problems._apply_one("apply_drift", rec, dict(core.DEFAULTS), {"drift": 4.0})
+    assert not ok and "not a rate ratio" in msg
+
+
 def test_the_pal_ratio_is_read_back_out_of_the_message(app_env):
     """`_sync_fail_reason` puts the arithmetic ratio in the error precisely so the next actor does
     not have to re-derive it. Reading it back is what turns the largest 'impossible' bucket into a
@@ -497,6 +577,40 @@ def test_lipsync_falls_back_to_software_when_the_igpu_fails(app_env):
         lipsync._decode = monkey
     assert calls == ["vaapi", None]
     assert out.shape[0] == 40
+
+
+def test_lipsync_rejects_windows_that_disagree(app_env):
+    """The consensus tolerance is ABSOLUTE. It was briefly scaled by the spread of the very
+    disagreement it exists to detect — so the wilder the windows disagreed the more generous it
+    became, and it could never reject anything."""
+    from app import core, lipsync
+    import numpy as np
+    cfg = dict(core.DEFAULTS, lipsync_min_windows=3, lipsync_min_conf=0.1)
+    # Windows that resolved confidently but landed thousands of ms apart: not one displacement.
+    wins = [{"start": i * 10.0, "offset_ms": v, "conf": 0.8, "used": True, "why": None}
+            for i, v in enumerate([-2000, -100, 900, 2400, 5000])]
+    used = [w for w in wins if w["used"]]
+    offs = np.array([w["offset_ms"] for w in used], float)
+    med = float(np.median(offs))
+    agree = [w for w in used if abs(w["offset_ms"] - med) <= lipsync.AGREE_TOL_MS]
+    assert len(agree) < cfg["lipsync_min_windows"], "scattered windows were accepted as agreeing"
+    # ...while windows within a couple of frames of each other still are.
+    tight = [-40, 10, 0, 55, -20]
+    med2 = float(np.median(tight))
+    assert len([v for v in tight if abs(v - med2) <= lipsync.AGREE_TOL_MS]) == 5
+
+
+def test_applying_a_lipsync_offset_clears_any_stale_rate_stretch(app_env):
+    """A lip-sync reading is a CONSTANT offset. `sync_manual=1` makes the merge apply what it is
+    given verbatim, so a drift left over from a previous attempt would be applied on top of it —
+    the same trap DONOR_RESET exists for."""
+    core = app_env
+    _movie(core)
+    core.set_status(1, "review", sync_drift=1.0427083, sync_offset_ms=250, sync_manual=1,
+                    french_path="/nope.mkv")
+    from app import lipsync
+    src = __import__("inspect").getsource(lipsync.remedy)
+    assert "sync_drift=None" in src, "remedy() must clear sync_drift when it sets an offset"
 
 
 def test_lipsync_refuses_a_file_too_short_to_sample(app_env):

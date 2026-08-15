@@ -66,6 +66,10 @@ SYLLABLE_LO, SYLLABLE_HI = 2.0, 8.0
 MIN_VISUAL_STD = 1e-4
 MIN_SPEECH_FRAC = 0.05           # fraction of the window that must look like speech
 
+# How far two windows may differ and still be measuring the same constant displacement. Matches
+# the 150ms the window consensus in sync.py uses, and is deliberately absolute — see `measure`.
+AGREE_TOL_MS = 150.0
+
 
 def available(cfg=None):
     """Whether lip-sync can run at all. ffmpeg is the only hard requirement; opencv is a bonus."""
@@ -380,10 +384,16 @@ def measure(path, ai=0, dur=None, cfg=None, tag="", on_progress=None,
 
     # Consensus, not mean: one window locking onto a musical phrase would drag an average. The
     # median is the value, and the spread around it is what decides whether to believe it.
+    #
+    # The tolerance is ABSOLUTE (and the same 150ms the window consensus in sync.py uses). It was
+    # briefly `max(120, 2.5 * spread)` — scaled by the very disagreement it is meant to detect, so
+    # the wilder the windows disagreed the more generous it became and it could never reject
+    # anything. A real displacement is constant across the runtime; windows that differ by more
+    # than a couple of frames are not measuring one.
     offs = np.array([w["offset_ms"] for w in used], dtype=float)
     med = float(np.median(offs))
     spread = float(np.median(np.abs(offs - med)))
-    agree = [w for w in used if abs(w["offset_ms"] - med) <= max(120.0, 2.5 * spread)]
+    agree = [w for w in used if abs(w["offset_ms"] - med) <= AGREE_TOL_MS]
     if len(agree) < need:
         return {"offset_ms": None, "confidence": 0.0, "windows": wins, "agreed": len(agree),
                 "tested": len(wins), "method": method, "face": bool(faces),
@@ -502,7 +512,13 @@ def remedy(kind, ident, cfg, apply=False):
         if not apply:
             return True, f"lip-sync says {off:+d}ms (conf {conf:.2f})"
         setter = core.set_status if kind == "movie" else core.set_ep_status
-        setter(ident, rec["status"], sync_offset_ms=int(off), sync_manual=1, error=None)
+        # sync_drift MUST be cleared alongside. A lip-sync reading is a constant offset; leaving a
+        # rate stretch from a previous attempt in place means the merge applies both, and
+        # `sync_manual=1` is exactly what makes it apply them verbatim without re-measuring. This
+        # is the same trap DONOR_RESET exists for — the sync fields are the ones every retry path
+        # forgets.
+        setter(ident, rec["status"], sync_offset_ms=int(off), sync_drift=None, sync_manual=1,
+               error=None)
         queued, note = pipeline.enqueue_merge(kind, ident)
         return queued, f"lip-sync {off:+d}ms (conf {conf:.2f}) — {note}"
     # No donor: still worth reading, because it says whether the LIBRARY file is the problem.
