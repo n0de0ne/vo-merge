@@ -6,7 +6,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from . import agent, core, scheduler, pipeline, media
+from . import (agent, core, history, inventory, lipsync, media, pipeline, problems, scheduler,
+               settings_meta)
 from .clients import Prowlarr, Radarr, QBittorrent, Plex, Sonarr
 
 
@@ -20,7 +21,15 @@ async def _lifespan(_app):
     core.init_tv()
     core.init_indexes()
     core.init_probe_cache()
+    core.init_history()             # the transition log + the daily coverage roll-up
     core.migrate_config()
+    # An existing install has a full probe inventory and an empty chart, and the first sample
+    # would otherwise land whenever the next scan happens — an hour away, or a day. One point at
+    # startup means the Overview draws something immediately instead of an unexplained blank.
+    try:
+        history.backfill_if_empty(core.load_config())
+    except Exception as e:
+        core.log(f"history backfill skipped: {e}")
     scheduler.start()
     yield
 
@@ -405,6 +414,13 @@ def do_rescan(forget: bool = False, scope: str = "all"):
                 kinds = None if scope in ("all", "tv") else (scope,)
                 st["episodes"] = tv.scan(cfg, kinds=kinds)
             st["phase"] = "done"
+            # A scan is the only moment the inventory is known to be current, so it is the right
+            # moment to record a point. Idempotent per day: two scans on one day refresh the same
+            # row rather than weighting that day twice.
+            try:
+                history.sample(cfg)
+            except Exception as e:
+                core.log(f"rescan({scope}): coverage sample failed: {e}")
             core.log(f"rescan({scope}, {'full' if forget else 'progressive'}): "
                      f"{st['films']} film gap(s), {st['episodes']} episode gap(s) · "
                      f"read {media.STATS['probed']} file(s), "
@@ -426,59 +442,11 @@ def do_rescan(forget: bool = False, scope: str = "all"):
 BROKEN_ERR = pipeline.BROKEN_ERR
 
 
-# What counts as vo-merge having actually CHANGED a file. `replaced` legitimately records no
-# added languages (the download became the file), so it can only be recognised by its kind; a
-# `grafted` row that recorded nothing added says nothing about what the app did, and `already`
-# (a scan closing out a file that was correct on its own) is not work at all. Recently-merged,
-# the 24h/7d counters and the completion forecast all read this, so they cannot disagree about
-# what a completion is.
-DID_WORK = ("(merge_kind = 'replaced' OR COALESCE(added_langs,'') != '' "
-            "OR COALESCE(added_subs,'') != '')")
-
-
-def _inventory(cfg, cols="path, auds, subs, err"):
-    """Every probed library file, classified against the profile its library targets.
-
-    The `probes` table is the ONLY complete inventory: `scan()` deliberately inserts a
-    movies/episodes record only when a file HAS a gap, so those tables are a list of problems,
-    not a list of files. Everything that reports on "how much of the library is correct" —
-    /coverage and /library both — reads this, so the summary and the browsable list can never
-    disagree about what "complete" means.
-
-    Yields (row, top, kind, want_a, want_s, have_a, have_s, miss_a, miss_s). `-EN` mirrors are
-    skipped: they are symlinks to the same files and would double-count."""
-    mount = (cfg.get("media_mount") or "/media").rstrip("/")
-    anime = {x.lower() for x in (cfg.get("anime_dirs") or ["Anime"])}
-    series = {x.lower() for x in (cfg.get("series_dirs") or ["Series"])}
-    mirrors = {v.lower() for v in pipeline.EN_LIBS.values()}
-    prof = {}
-    with core.db() as c:
-        rows = c.execute(f"SELECT {cols} FROM probes").fetchall()
-        # The anime profile's original-audio slot resolves per title, and the probes table has no
-        # idea what a title's original language is — so borrow it from whichever record covers
-        # this path. A file with no record (it never had a gap) leaves the slot unresolved, which
-        # drops it: better than demanding a language we can't name.
-        origs = {r["p"]: r["o"] for r in c.execute(
-            "SELECT french_path p, original_lang o FROM movies WHERE french_path IS NOT NULL "
-            "UNION ALL SELECT french_path p, orig_lang o FROM episodes "
-            "WHERE french_path IS NOT NULL")}
-    for r in rows:
-        path = r["path"] or ""
-        top = path[len(mount) + 1:].split(os.sep, 1)[0] if path.startswith(mount + "/") else "?"
-        if top.lower() in mirrors:
-            continue
-        kind = "anime" if top.lower() in anime else ("series" if top.lower() in series else "movie")
-        key = (kind, origs.get(path))
-        if key not in prof:
-            prof[key] = media.profile(kind, cfg, key[1])
-        want_a, want_s = prof[key]
-        if r["err"]:
-            yield r, top, kind, want_a, want_s, None, None, None, None
-            continue
-        have_a = {x for x in (r["auds"] or "").split(",") if x}
-        have_s = {x for x in (r["subs"] or "").split(",") if x}
-        yield (r, top, kind, want_a, want_s, have_a, have_s,
-               [k for k in want_a if k not in have_a], [k for k in want_s if k not in have_s])
+# Both moved to inventory.py so the scheduler's history sampler reads the SAME classifier the
+# endpoints do — a second implementation of "what does complete mean" is the one duplication this
+# app cannot afford. Re-exported under their old names: every call site here is unchanged.
+DID_WORK = inventory.DID_WORK
+_inventory = inventory.build
 
 
 @api.get("/forecast")
@@ -2276,6 +2244,158 @@ def ep_grab(ep_id: str, body: GrabIn):
     from . import tv
     n = tv.grab_episode(ep_id, body.link, body.rid, body.title)
     return {"ok": True, "episodes": n}
+
+
+# ============================================================ history & activity
+@api.get("/history")
+def history_summary(days: int = 30):
+    """Coverage over time, and what the pipeline did each day.
+
+    Everything else this API returns is a snapshot, which is why "is it getting better?" was
+    unanswerable from the UI. Days with no coverage SAMPLE come back null (nobody probed the
+    library that day) while days with no EVENTS come back zero (nothing happened) — the
+    difference matters, and collapsing it is how a chart starts lying."""
+    return history.summary(max(2, min(days, 365)))
+
+
+@api.get("/events")
+def events(limit: int = 100, offset: int = 0, kind: str | None = None,
+           status: str | None = None, q: str | None = None, since: float | None = None):
+    """The Activity → History feed: every state transition, newest first."""
+    return history.events(min(limit, 500), offset, kind, status, q, since)
+
+
+@api.get("/movie/{tmdb_id}/timeline")
+def movie_timeline(tmdb_id: int, limit: int = 60):
+    """One title's own history. "Three releases, each rejected for a different reason" is a
+    different problem from "one release, one sync failure", and nothing in the record itself
+    could ever tell them apart."""
+    return {"items": history.timeline("movie", tmdb_id, limit), "now": time.time()}
+
+
+@api.get("/episode/{ep_id}/timeline")
+def episode_timeline(ep_id: str, limit: int = 60):
+    return {"items": history.timeline("episode", ep_id, limit), "now": time.time()}
+
+
+# ============================================================ problems (grouped failures)
+@api.get("/problems")
+def problems_groups():
+    """Failures rolled up by CAUSE, each with what happened, what fixes it, and the remedies
+    that apply. A season pack failing 40 times is one problem, not forty rows."""
+    return problems.groups()
+
+
+@api.get("/problems/act")
+def problems_bulk_state():
+    """Progress of a running (or the last) bulk remedy."""
+    return problems.BULK_STATE
+
+
+@api.get("/problems/{code}")
+def problems_records(code: str, limit: int = 200, offset: int = 0):
+    if code not in problems.BY_CODE:
+        raise HTTPException(404, f"unknown problem code {code!r}")
+    return problems.records(code, min(limit, 500), offset)
+
+
+class ProblemActIn(BaseModel):
+    action: str
+    code: str | None = None            # apply to a whole group…
+    keys: list[str] | None = None      # …or to exactly these "movie:123" / "episode:1:2:3"
+    reason: str | None = None          # for `unfixable`
+    drift: float | None = None         # override the parsed rate ratio
+    offset_ms: int | None = None
+
+
+@api.post("/problems/act")
+def problems_act(body: ProblemActIn):
+    """Apply one remedy to one group, or to a hand-picked selection.
+
+    Explicit `keys` win over `code`, so a partial selection in the UI is never silently widened
+    to the whole group — the difference between retrying six records and retrying four hundred."""
+    spec = problems.REMEDIES.get(body.action)
+    if not spec:
+        raise HTTPException(422, f"unknown remedy {body.action!r}")
+    targets = problems.targets_for(body.code, body.keys)
+    if not targets:
+        raise HTTPException(404, "nothing matched that selection")
+    if not spec["bulk"] and len(targets) > 1:
+        raise HTTPException(422, f"{body.action!r} needs a decision per record — apply it to one")
+    cfg = core.load_config()
+    params = {k: v for k, v in
+              (("reason", body.reason), ("drift", body.drift), ("offset_ms", body.offset_ms),
+               ("code", body.code)) if v is not None}
+    if not problems.start_bulk(body.action, targets, cfg, params):
+        return {"ok": True, "started": False, "note": "a bulk remedy is already running"}
+    return {"ok": True, "started": True, "action": body.action, "total": len(targets)}
+
+
+# ============================================================ lip-sync
+class LipSyncIn(BaseModel):
+    apply: bool = False
+    track: int | None = None       # which audio track; default = every track of the library file
+    donor: bool = True             # compare against the donor when there is one
+
+
+def _lipsync(kind, rec, ident, body):
+    cfg = core.load_config()
+    if not cfg.get("lipsync_enabled", True):
+        raise HTTPException(409, "lip-sync is switched off (Settings → Lip-sync)")
+    base, donor = rec.get("french_path"), rec.get("en_file")
+    if not (base and os.path.exists(base)):
+        raise HTTPException(409, f"the library file is not on disk (library={base!r})")
+    out = {"kind": kind, "key": str(ident)}
+    if body.donor and donor and os.path.exists(donor):
+        off, conf = lipsync.rescue(base, donor, None, dict(cfg, lipsync_rescue=True),
+                                   tag=f" {ident}")
+        out.update(offset_ms=off, confidence=conf, compared="library vs donor")
+        if body.apply and off is not None:
+            _set_sync(kind, rec, ident, SetSyncIn(offset_ms=int(off), drift=None))
+            out["applied"], out["note"] = pipeline.enqueue_merge(kind, ident)
+        return out
+    # No donor — read the library file's own tracks. This is the measurement nothing else in the
+    # app can make: it says whether the FILE is the problem, with nothing to compare it against.
+    out.update(compared="library file against its own picture",
+               **lipsync.check(base, [body.track] if body.track is not None else None, cfg,
+                               tag=f" {ident}"))
+    return out
+
+
+@api.post("/movie/{tmdb_id}/lipsync")
+def movie_lipsync(tmdb_id: int, body: LipSyncIn):
+    """Measure this title's audio against the PICTURE.
+
+    Unlike every other measurement here, it does not depend on two files agreeing with each
+    other — so it still answers when the pair has been called a different cut, and it works on a
+    library file that has no donor at all. Accurate to about a frame on original-language audio
+    and to roughly ±150ms on a dub, which is where the interesting failures live."""
+    mv = core.get_movie(tmdb_id)
+    if not mv:
+        raise HTTPException(404, "unknown movie")
+    return _lipsync("movie", mv, tmdb_id, body)
+
+
+@api.post("/episode/{ep_id}/lipsync")
+def episode_lipsync(ep_id: str, body: LipSyncIn):
+    """Episode mirror of movie_lipsync."""
+    e = core.get_episode(ep_id)
+    if not e:
+        raise HTTPException(404, "unknown episode")
+    return _lipsync("episode", e, ep_id, body)
+
+
+# ============================================================ settings schema
+@api.get("/settings/schema")
+def settings_schema():
+    """Every config key with its type, help and current value, grouped for a settings page.
+
+    The old form hand-wrote about forty of the 111 keys, so the rest could only be changed by
+    editing config.json on the host — which silently decided which parts of the app an operator
+    could run. Describing them as data means a new key appears in the UI with no frontend
+    change."""
+    cfg = core.load_config()
+    return settings_meta.schema(cfg, masked=_mask_secrets(dict(cfg)))
 
 
 app.mount("/api", api)

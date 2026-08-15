@@ -1093,7 +1093,7 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             # On the budget-spending attempt, run the pipeline's own wide probe before parking
             # — see pipeline.wide_probe_rescue. Otherwise spend the automatic budget on ANOTHER
             # release first (this used to be terminal on the first attempt).
-            from .pipeline import wide_probe_rescue
+            from .pipeline import lipsync_rescue, wide_probe_rescue
             rescue = None
             if (ep.get("attempts") or 0) + 1 >= cfg.get("max_sync_retries", 4):
                 rescue = wide_probe_rescue(base, donor, 0, (daidx[ids[0]] if ids else 0),
@@ -1102,6 +1102,12 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
                                            on_progress=lambda msg: _beat("episode", ep["id"], msg),
                                            base_fps=bi.get("fps"), donor_fps=di.get("fps"),
                                            base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+                if rescue is None:
+                    # Last rung before parking — match each file to its own picture instead of
+                    # to the other one. See pipeline.lipsync_rescue.
+                    rescue = lipsync_rescue(base, donor, min(ei["dur"] or 0, fi["dur"] or 0),
+                                            cfg, fps_diff=fps_diff, tag=f" {ep['id']}",
+                                            on_progress=lambda msg: _beat("episode", ep["id"], msg))
             if rescue is None:
                 why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
                 _reject_and_retry_ep(ep, why, cfg, delta,
@@ -1133,6 +1139,16 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
             _unlink(out)
             _reject_and_retry_ep(ep, f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
                                      f"(conf {qconf:.2f})", cfg, delta,
+                                 final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
+        # ...and against the PICTURE, which is the only check that catches a base and a graft
+        # that are equally wrong. Off by default; see pipeline._lipsync_qc.
+        from .pipeline import _lipsync_qc
+        ok_lip, lres, lconf = _lipsync_qc(out, len(bi["auds"]), cfg, tag=f" {ep['id']}")
+        if not ok_lip:
+            _unlink(out)
+            _reject_and_retry_ep(ep, f"post-merge lip-sync: grafted audio is {lres:+d}ms out "
+                                     f"against the picture (conf {lconf:.2f})", cfg, delta,
                                  final="review" if cfg.get("sync_review", True) else "sync_fail")
             return
     shutil.move(out, fr)            # replace FR file in place (same name)

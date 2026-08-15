@@ -1506,6 +1506,51 @@ def wide_probe_rescue(base, donor, base_ai, donor_ai, dur, fps_diff, cfg, tag=""
     return int(round(m)), conf, method, drift
 
 
+def _lipsync_qc(out, n_base_auds, cfg, tag=""):
+    """Post-merge lip-sync gate, shared by the movie and episode merge paths. Never raises: a QC
+    that errors must accept, exactly like an inconclusive one — refusing a good merge because a
+    decode failed is strictly worse than not checking."""
+    if not cfg.get("lipsync_qc") or not cfg.get("lipsync_enabled", True):
+        return True, 0, 0.0
+    from . import lipsync
+    try:
+        return lipsync.verify_graft(out, n_base_auds, cfg, tag=tag)
+    except Exception as e:
+        core.log(f"lipsync QC{tag}: skipped ({e})")
+        return True, 0, 0.0
+
+
+def lipsync_rescue(base, donor, dur, cfg, fps_diff=False, tag="", on_progress=None):
+    """The rung below the wide probe: measure each file against its OWN picture and take the
+    difference.
+
+    Everything above this rung compares the two files to each other, so all of it fails in the
+    same way — when the pair does not share a timeline, there is nothing to correlate and the
+    verdict is "different cut, pick another or ignore", which is an instruction no unattended
+    system can follow. Reading lips is the only measurement here that does not need the two files
+    to agree, because the reference is the picture in each one.
+
+    Deliberately NOT tried when the framerates differ and no stretch was found: lip-sync returns
+    one number, and a constant cannot correct a rate difference — applying it would be the exact
+    mistake the `fps_diff and not drift` guard above exists to prevent.
+
+    Returns wide_probe_rescue's shape — (offset_ms, conf, method, drift) — or None."""
+    if fps_diff:
+        return None
+    if not (cfg.get("lipsync_enabled", True) and cfg.get("lipsync_rescue", True)):
+        return None
+    from . import lipsync
+    try:
+        off, conf = lipsync.rescue(base, donor, dur, cfg, tag=tag, on_progress=on_progress)
+    except Exception as e:                       # a rescue attempt must never break the merge
+        core.log(f"sync{tag}: lip-sync rescue error: {e}")
+        return None
+    if off is None or conf < float(cfg.get("lipsync_min_conf", 0.30)):
+        return None
+    core.log(f"sync{tag}: lip-sync resolved {off:+d}ms (conf {conf:.2f}) -> merging with it")
+    return int(off), float(conf), "lipsync", None
+
+
 # How long a movie may sit in a mid-transition state before it is presumed crashed. These two
 # states had NO reader at all: stage_search walks only `pending`, stage_finish reconciles only
 # `downloading` and `merging` — so a crash between claiming pending->searching and writing the
@@ -2527,6 +2572,12 @@ def _merge_movie_impl(tmdb_id, cfg=None):
                                            on_progress=lambda msg: _beat("movie", tmdb_id, msg),
                                            base_fps=bi.get("fps"), donor_fps=di.get("fps"),
                                            base_dur=bi.get("dur"), donor_dur=di.get("dur"))
+                if rescue is None:
+                    # Last rung before parking: the two files can't be matched to each other, so
+                    # match each to its own picture instead.
+                    rescue = lipsync_rescue(base, donor, min(ei["dur"] or 0, fi["dur"] or 0),
+                                            cfg, fps_diff=fps_diff, tag=f" {tmdb_id}",
+                                            on_progress=lambda msg: _beat("movie", tmdb_id, msg))
             if rescue is None:
                 why = _sync_fail_reason(m, fps_diff, drift, bi.get("fps"), di.get("fps"))
                 # Try ANOTHER RELEASE before asking a human. `sync_review` used to short-circuit
@@ -2576,6 +2627,18 @@ def _merge_movie_impl(tmdb_id, cfg=None):
             reject_and_retry(tmdb_id,
                              f"post-merge QC: grafted audio misaligned by {qres:+d}ms "
                              f"(conf {qconf:.2f})", cfg, delta,
+                             final="review" if cfg.get("sync_review", True) else "sync_fail")
+            return
+        # The check above compares the graft to the BASE's own track, so it passes whenever the
+        # two are equally wrong — a leader present in both files, a base that was already out.
+        # Reading the grafted track against the picture is the only way to catch that, and it is
+        # off by default because it costs a second decode.
+        ok_lip, lres, lconf = _lipsync_qc(out, len(bi["auds"]), cfg, tag=f" {tmdb_id}")
+        if not ok_lip:
+            _unlink(out)
+            reject_and_retry(tmdb_id,
+                             f"post-merge lip-sync: grafted audio is {lres:+d}ms out against the "
+                             f"picture (conf {lconf:.2f})", cfg, delta,
                              final="review" if cfg.get("sync_review", True) else "sync_fail")
             return
     # sync_manual=0: the instruction has been CARRIED OUT. Leaving it set would let a single

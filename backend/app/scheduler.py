@@ -1,7 +1,7 @@
 """APScheduler: runs the pipeline stages on configurable intervals, plus the merge worker."""
 import threading
 from apscheduler.schedulers.background import BackgroundScheduler
-from . import core, pipeline, tv
+from . import core, history, pipeline, tv
 
 _sched = BackgroundScheduler(daemon=True)
 _merge_threads = {}          # pool slot index -> worker thread
@@ -158,6 +158,16 @@ def _housekeeping_job():
                 pipeline.SCAN_LOCK.release()
         pipeline.purge_recycle(cfg)
         pipeline.revisit_ignored(cfg)
+        # One coverage sample a day is what makes the trend line exist at all. It reads the
+        # probe inventory that the prune above has just corrected, so the point recorded is the
+        # library as it stands rather than as it stood before the deletions were noticed.
+        try:
+            row = history.sample(cfg)
+            dropped = core.prune_events(int(cfg.get("history_keep_days", 90)))
+            core.log(f"history: sampled {row['complete']}/{row['total']} complete"
+                     + (f" · pruned {dropped} old event(s)" if dropped else ""))
+        except Exception as e:
+            core.log(f"history sample error: {e}")
         if cfg.get("auto_repair"):
             with core.db() as c:
                 paths = [r["path"] for r in c.execute(

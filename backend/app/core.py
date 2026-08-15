@@ -178,6 +178,29 @@ DEFAULTS = {
                                            # evidence of misalignment
     "qc_max_offset_ms": 1500,              # a confident residual offset beyond this rejects the
                                            # merge (blocklist donor, try another release)
+    # ---- lip-sync: the only ABSOLUTE sync signal we have (lipsync.py) ----------------------
+    # Every other measurement in this app is RELATIVE — donor audio against base audio, donor cuts
+    # against base cuts. All of them are satisfied by two files that agree with each other and are
+    # both wrong, which is exactly what a donor with a leader and a base with the same leader
+    # produces. Correlating mouth movement in the PICTURE against the speech envelope of a track
+    # answers a different question: is this audio in sync with what is on screen. It is also the
+    # only thing that can measure a library file's OWN sync, with no donor at all.
+    "lipsync_enabled": True,               # allow the /lipsync endpoints and the rescue rung
+    "lipsync_qc": False,                   # additionally verify every graft this way. Off by
+                                           # default: it costs a second decode pass per merge, and
+                                           # postmerge_qc already catches the common failure.
+    "lipsync_rescue": True,                # when window + ratio detection have both failed, try
+                                           # lip-sync before parking the record. This is the rung
+                                           # that turns "different cut, manual pick or ignore" into
+                                           # a number — see docs/AUTONOMY.md.
+    "lipsync_windows": 6,                  # sampling windows across the runtime
+    "lipsync_window_dur": 24,              # seconds per window (dialogue-dense enough to correlate)
+    "lipsync_fps": 12,                     # frames/s sampled; syllables run 2-8 Hz, so 12 is
+                                           # comfortably above Nyquist and keeps the decode cheap
+    "lipsync_max_lag_s": 4.0,              # search bound. Lip-sync error beyond a few seconds is
+                                           # not a lip-sync problem, it is a different cut.
+    "lipsync_min_conf": 0.30,              # per-window correlation floor
+    "lipsync_min_windows": 3,              # windows that must agree before a verdict is reported
     "recycle_keep_days": 7,                # originals DISCARDED by a replacement (_place_multi /
                                            # TV direct remux) go to <media>/.vo-merge-recycle for
                                            # this many days instead of being destroyed, so a bad
@@ -247,6 +270,9 @@ DEFAULTS = {
                                            # in qB at once (a season pack counts as one). vo-merge
                                            # won't grab another until a merge finishes + donor is
                                            # freed, dropping the count below the cap.
+    "history_keep_days": 90,               # how long the state-transition log (core.events) is
+                                           # kept. It is what every chart on the Overview is drawn
+                                           # from; 0 disables the daily prune, never the writing.
     "db_backup_keep": 7,                   # nightly VACUUM INTO /config/backup/, keeping this
                                            # many daily snapshots (0 = no backup). The DB is the
                                            # probe inventory plus every record's state, and it
@@ -855,6 +881,95 @@ def forget_probe(path):
         c.execute("DELETE FROM probes WHERE path=?", (path,))
 
 
+def init_history():
+    """Two tables that exist only so the UI can draw a line rather than a dot.
+
+    Everything the app kept was a SNAPSHOT: `movies`/`episodes` hold current state, `probes` holds
+    what each file contains right now. Nothing recorded WHEN anything changed, so every question of
+    the form "is this getting better?" — coverage over time, merges per day, whether the error rate
+    is climbing — was unanswerable, and the forecast had to reconstruct a rate from `merged_at`
+    alone (which only exists for one of the twelve states).
+
+    - `events` is the transition log, written from the one place every status change goes through
+      (`_set_row`, plus the two `claim_*` helpers). Titles are DENORMALISED into it on purpose: a
+      pruned record must not take its own history with it, and a chart that silently loses its
+      early months is worse than no chart.
+    - `coverage_history` is a daily roll-up of the probe inventory, keyed by DAY so re-sampling is
+      idempotent — the housekeeping job and the end of every scan both write it, and a busy day
+      must not weigh more than a quiet one."""
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL,
+            kind TEXT,               -- 'movie' | 'episode'
+            key TEXT,                -- tmdb_id (as text) | episode id
+            title TEXT,              -- denormalised: survives the record being pruned
+            sub TEXT,                -- "1998" | "S02E07"
+            frm TEXT,                -- status before
+            sts TEXT,                -- status after
+            detail TEXT,             -- the one line that explains it (error / release / langs)
+            tag TEXT )""")           # tag = machine-readable secondary classifier (merge_kind)
+        _ensure_cols(c, "events", {"tag": "TEXT"})
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_sts_ts ON events(sts, ts)")
+        c.execute("""CREATE TABLE IF NOT EXISTS coverage_history (
+            day TEXT PRIMARY KEY,    -- 'YYYY-MM-DD', UTC
+            ts REAL,
+            total INTEGER, complete INTEGER,
+            missing_audio INTEGER, missing_subs INTEGER, missing_both INTEGER,
+            unreadable INTEGER,
+            libs TEXT )""")          # libs = JSON {lib: {total, complete}}
+
+
+# Transitions that say nothing and would drown the log. `searching` is entered and left within one
+# sweep for every pending record, so keeping it turns a few hundred meaningful rows a day into tens
+# of thousands and makes "what happened to this title" unreadable.
+_EVENT_SKIP = {"searching"}
+
+
+def log_event(kind, key, frm, sts, title=None, sub=None, detail=None, tag=None):
+    """Append one state transition. Never raises: history is a nice-to-have, and a failure to
+    record one must not roll back the state change it describes."""
+    if sts in _EVENT_SKIP and frm in _EVENT_SKIP:
+        return
+    try:
+        with db() as c:
+            c.execute("INSERT INTO events (ts,kind,key,title,sub,frm,sts,detail,tag) "
+                      "VALUES (?,?,?,?,?,?,?,?,?)",
+                      (time.time(), kind, str(key), title, sub, frm, sts,
+                       redact(detail) if detail else None, tag))
+    except Exception:
+        pass
+
+
+def prune_events(keep_days=90):
+    """Cap the transition log. Run daily; returns how many rows went."""
+    if keep_days <= 0:
+        return 0
+    with db() as c:
+        cur = c.execute("DELETE FROM events WHERE ts < ?", (time.time() - keep_days * 86400,))
+        return cur.rowcount or 0
+
+
+def snapshot_coverage(row: dict):
+    """Upsert TODAY's coverage roll-up. Keyed by day, so the scan that runs at 04:30 and the one
+    an operator starts at 19:00 both land on the same row instead of weighting the day twice."""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    with db() as c:
+        c.execute("""INSERT INTO coverage_history
+                       (day,ts,total,complete,missing_audio,missing_subs,missing_both,unreadable,libs)
+                     VALUES (?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(day) DO UPDATE SET
+                       ts=excluded.ts, total=excluded.total, complete=excluded.complete,
+                       missing_audio=excluded.missing_audio, missing_subs=excluded.missing_subs,
+                       missing_both=excluded.missing_both, unreadable=excluded.unreadable,
+                       libs=excluded.libs""",
+                  (day, time.time(), row.get("total", 0), row.get("complete", 0),
+                   row.get("missing_audio", 0), row.get("missing_subs", 0),
+                   row.get("missing_both", 0), row.get("unreadable", 0),
+                   json.dumps(row.get("libs") or {})))
+
+
 def prune_missing_probes():
     """Drop probe rows whose file no longer exists. Nothing else ever removes them, so a library
     that has had titles deleted keeps counting them forever — which quietly skews every coverage
@@ -1133,8 +1248,41 @@ def _set_row(table, key_col, key, status, fields, expect=None):
         where += " AND status=?"
         args.append(expect)
     with db() as c:
+        # Read the row FIRST so the transition can be logged with what it came from. A blind
+        # UPDATE can't tell a real state change from a scan re-writing the same status, and that
+        # difference is the whole content of the history log. One primary-key read per write.
+        before = c.execute(f"SELECT * FROM {table} WHERE {key_col}=?", (key,)).fetchone()
         cur = c.execute(f"UPDATE {table} SET {sets} WHERE {where}", tuple(vals) + tuple(args))
-        return cur.rowcount == 1
+        ok = cur.rowcount == 1
+    if ok and before is not None and before["status"] != status:
+        _log_transition(table, before, status, fields)
+    return ok
+
+
+def _log_transition(table, before, status, fields):
+    """Denormalise a row into one `events` entry. `detail` carries the one line that explains the
+    transition — the error for a failure, what was added for a merge, the release for a grab —
+    because a bare "error" in a timeline tells you nothing you can act on."""
+    if table == "movies":
+        kind, key = "movie", before["tmdb_id"]
+        title, sub = before["title"], (str(before["year"]) if before["year"] else None)
+    else:
+        kind, key = "episode", before["id"]
+        title = before["series_title"]
+        sub = f"S{int(before['season'] or 0):02d}E{int(before['episode'] or 0):02d}"
+    detail = fields.get("error")
+    tag = None
+    if status == "merged":
+        # `merged` is the terminal state for three different outcomes and only two are work we
+        # did, so the KIND has to survive into the history or every chart drawn from it repeats
+        # the "a library re-read looks like thousands of merges" mistake.
+        tag = fields.get("merge_kind") or before["merge_kind"] or "grafted"
+        if not detail:
+            detail = ", ".join(x for x in (fields.get("added_langs"),
+                                           fields.get("added_subs")) if x) or None
+    if not detail:
+        detail = fields.get("progress") or fields.get("candidate_title")
+    log_event(kind, key, before["status"], status, title, sub, detail, tag)
 
 
 def set_status(tmdb_id, status, expect=None, **fields):
@@ -1149,9 +1297,13 @@ def claim_movie(tmdb_id, from_status, to_status, **fields):
     fields["updated"] = time.time()
     keys = ",".join(f"{k}=?" for k in fields)
     with db() as c:
+        before = c.execute("SELECT * FROM movies WHERE tmdb_id=?", (tmdb_id,)).fetchone()
         cur = c.execute(f"UPDATE movies SET {keys} WHERE tmdb_id=? AND status=?",
                         tuple(fields.values()) + (tmdb_id, from_status))
-        return cur.rowcount == 1
+        ok = cur.rowcount == 1
+    if ok and before is not None:
+        _log_transition("movies", before, to_status, fields)
+    return ok
 
 
 def claim_episode(ep_id, from_status, to_status, **fields):
@@ -1160,9 +1312,13 @@ def claim_episode(ep_id, from_status, to_status, **fields):
     fields["updated"] = time.time()
     keys = ",".join(f"{k}=?" for k in fields)
     with db() as c:
+        before = c.execute("SELECT * FROM episodes WHERE id=?", (ep_id,)).fetchone()
         cur = c.execute(f"UPDATE episodes SET {keys} WHERE id=? AND status=?",
                         tuple(fields.values()) + (ep_id, from_status))
-        return cur.rowcount == 1
+        ok = cur.rowcount == 1
+    if ok and before is not None:
+        _log_transition("episodes", before, to_status, fields)
+    return ok
 
 
 def get_movies(status=None):
