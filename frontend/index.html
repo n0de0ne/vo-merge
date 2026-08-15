@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VO Merger</title>
+    <!-- The app is dark-only, so tell the browser: without this the form controls and the
+         scrollbars render light on a dark page, and the address bar flashes white on load. -->
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#11151c" />
+    <!-- Inline so it costs no request and cannot 404 behind the SPA catch-all, which returns
+         index.html for any unknown path — a missing favicon.ico would otherwise be served the
+         whole HTML document and log a decode error on every page load. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E" />
   </head>
   <body>
     <div id="root"></div>

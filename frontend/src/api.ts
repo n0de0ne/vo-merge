@@ -16,6 +16,10 @@ export interface Status {
   paused?: boolean;
   hold?: string | null;      // "paused" | "scanning" — why no new work is starting
   merging_now?: number;      // merges still in flight (a pause lets these finish)
+  // The watchdogs' memory. Per-cycle logs could say "qB error, returning"; only this says for
+  // HOW LONG, which is the difference between a blip and an outage.
+  deps_down?: Record<string, number>;          // dependency -> seconds unreachable
+  disk?: { low: boolean; free_gb: number | null; hold_until?: number | null };
 }
 export interface Episode {
   id: string; series_id: number; series_title: string; season: number; episode: number;
@@ -182,6 +186,93 @@ export interface Dash {
   merge_workers?: number;
   disk: { path: string; total: number; free: number } | null;
   next_runs: Record<string, number>; now: number;
+}
+
+// ---------------------------------------------------------------- history & activity
+// Coverage is a SNAPSHOT series: a day with no sample is null (nobody probed the library that
+// day), not zero. Throughput is an EVENT series: a day with no events really is zero. Collapsing
+// the two is how a chart starts lying, so the shapes keep them apart.
+export interface CoveragePoint {
+  day: string; total: number | null; complete: number | null; pct: number | null;
+  missing_audio?: number; missing_subs?: number; missing_both?: number; unreadable?: number;
+  libs?: Record<string, { total: number; complete: number }>;
+}
+export interface ThroughputPoint {
+  day: string; grafted: number; replaced: number; already: number; failed: number;
+  grabbed: number; no_release: number; ignored: number; merged: number;
+}
+export interface HistorySummary {
+  days: number; now: number;
+  coverage: CoveragePoint[]; throughput: ThroughputPoint[];
+  totals: Record<string, number>;
+  have_coverage: boolean; first_sample: string | null; gained_pct: number | null;
+}
+export interface EventRow {
+  id: number; ts: number; kind: string; key: string; title: string | null; sub: string | null;
+  frm: string | null; sts: string; detail: string | null; tag: string | null;
+}
+export interface EventPage { items: EventRow[]; total: number; offset: number; limit: number; now: number; }
+
+// ---------------------------------------------------------------- problems
+export interface Remedy { code: string; label: string; bulk: boolean; slow: boolean; note: string; }
+export interface ProblemSample {
+  kind: string; key: string; title: string | null; sub: string | null; status: string;
+  error: string | null; poster: string | null; updated: number | null;
+  ai_status?: string | null; ai_verdict?: string | null; priority?: number | null;
+}
+export interface ProblemGroup {
+  code: string; label: string; severity: "fixable" | "judgement" | "external";
+  why: string; fix: string;
+  count: number; movies: number; episodes: number; shows: number; with_ai: number;
+  newest: number | null; drifts: number[];
+  remedies: Remedy[]; sample_error: string | null; samples: ProblemSample[];
+}
+export interface ProblemsView { groups: ProblemGroup[]; total: number; now: number; }
+export interface ProblemRecord extends ProblemSample {
+  drift: number | null; has_donor: boolean; series_id?: number;
+}
+export interface ProblemPage {
+  code: string; total: number; offset: number; limit: number;
+  items: ProblemRecord[]; rule: ProblemGroup | null; now: number;
+}
+export interface BulkState {
+  running: boolean; action: string; code: string; started: number; finished: number;
+  total: number; done: number; ok: number; failed: number; error: string | null;
+  results: { kind: string; key: string; title: string | null; sub: string | null;
+             ok: boolean; message: string }[];
+}
+
+// ---------------------------------------------------------------- settings schema
+export interface FieldSpec {
+  key: string; type: "text" | "password" | "number" | "bool" | "select" | "list_str"
+    | "list_int" | "profiles";
+  label: string; help?: string; unit?: string; advanced?: boolean; secret?: boolean;
+  danger?: boolean; test?: string; min?: number; max?: number; step?: number;
+  options?: [string, string][];
+  value: any; default: any; section: string;
+}
+export interface SettingsSection {
+  id: string; label: string; icon: string; blurb: string; fields: FieldSpec[];
+}
+export interface SettingsSchema {
+  sections: SettingsSection[]; undescribed: string[]; stale: string[];
+}
+
+// ---------------------------------------------------------------- lip-sync
+export interface LipWindow {
+  start: number; offset_ms: number | null; conf: number; used: boolean; why: string | null;
+}
+export interface LipTrackResult {
+  offset_ms: number | null; confidence: number; windows: LipWindow[];
+  agreed: number; tested: number; method: string; face: boolean; spread_ms?: number;
+  note: string; track?: { index: number; lang: string | null; name?: string | null };
+}
+export interface LipSyncResult {
+  kind: string; key: string; compared: string;
+  offset_ms?: number | null; confidence?: number;      // library-vs-donor form
+  applied?: boolean; note?: string;
+  path?: string; dur?: number | null; fps?: number | null;   // library-file form
+  tracks?: LipTrackResult[];
 }
 
 // When the server has an api_key set, every request needs it. It is kept in localStorage so a
@@ -370,4 +461,60 @@ export const api = {
   grab: (id: number, link: string, rid: string, title: string) =>
     j<Movie>(`/api/movie/${id}/grab`,
       { method: "POST", body: JSON.stringify({ link, rid, title }) }),
+  searchReleases: (query: string) =>
+    j<{ query: string; count: number; results: Candidate[] }>("/api/search_releases",
+      { method: "POST", body: JSON.stringify({ query }) }),
+
+  // ---- History: the only endpoints with a time axis ----
+  history: (days = 30) => j<HistorySummary>(`/api/history?days=${days}`),
+  events: (o: { limit?: number; offset?: number; kind?: string; status?: string; q?: string } = {}) =>
+    j<EventPage>("/api/events?" + new URLSearchParams({
+      limit: String(o.limit ?? 100), offset: String(o.offset ?? 0),
+      ...(o.kind ? { kind: o.kind } : {}), ...(o.status ? { status: o.status } : {}),
+      ...(o.q ? { q: o.q } : {}),
+    })),
+  timeline: (kind: string, key: string) =>
+    j<{ items: EventRow[]; now: number }>(
+      kind === "movie" ? `/api/movie/${key}/timeline`
+                       : `/api/episode/${encodeURIComponent(key)}/timeline`),
+
+  // ---- Problems: failures grouped by cause, with the remedy that fixes each ----
+  problems: () => j<ProblemsView>("/api/problems"),
+  problemRecords: (code: string, limit = 200, offset = 0) =>
+    j<ProblemPage>(`/api/problems/${code}?limit=${limit}&offset=${offset}`),
+  problemAct: (body: { action: string; code?: string; keys?: string[]; reason?: string;
+                       drift?: number; offset_ms?: number }) =>
+    j<{ ok: boolean; started: boolean; action?: string; total?: number; note?: string }>(
+      "/api/problems/act", { method: "POST", body: JSON.stringify(body) }),
+  problemActState: () => j<BulkState>("/api/problems/act"),
+
+  // ---- Settings, described as data so every key is reachable ----
+  settingsSchema: () => j<SettingsSchema>("/api/settings/schema"),
+
+  // ---- Lip-sync: audio against the PICTURE, not against another file ----
+  lipsync: (kind: string, key: string, o: { apply?: boolean; donor?: boolean } = {}) =>
+    j<LipSyncResult>(
+      kind === "movie" ? `/api/movie/${key}/lipsync`
+                       : `/api/episode/${encodeURIComponent(key)}/lipsync`,
+      { method: "POST", body: JSON.stringify({ apply: !!o.apply, donor: o.donor !== false }) }),
+
+  // ---- Per-record sync tools shared by Review and Problems ----
+  syncProbe: (kind: string, key: string, o: { apply?: boolean; max_lag_s?: number } = {}) =>
+    j<any>(kind === "movie" ? `/api/movie/${key}/sync_probe`
+                            : `/api/episode/${encodeURIComponent(key)}/sync_probe`,
+      { method: "POST", body: JSON.stringify({ apply: !!o.apply, max_lag_s: o.max_lag_s ?? 300 }) }),
+  setSync: (kind: string, key: string, offset_ms: number, drift?: number | null) =>
+    j<any>(kind === "movie" ? `/api/movie/${key}/set_sync`
+                            : `/api/episode/${encodeURIComponent(key)}/set_sync`,
+      { method: "POST", body: JSON.stringify({ offset_ms, drift: drift ?? null }) }),
+  unfixable: (kind: string, key: string, reason: string) =>
+    j<{ ok: boolean }>(kind === "movie" ? `/api/movie/${key}/unfixable`
+                                        : `/api/episode/${encodeURIComponent(key)}/unfixable`,
+      { method: "POST", body: JSON.stringify({ reason }) }),
+  context: (kind: string, key: string) =>
+    j<any>(kind === "movie" ? `/api/movie/${key}/context`
+                            : `/api/episode/${encodeURIComponent(key)}/context`),
+  assign: (epId: string, path: string) =>
+    j<any>(`/api/episode/${encodeURIComponent(epId)}/assign`,
+      { method: "POST", body: JSON.stringify({ path }) }),
 };
