@@ -1,7 +1,7 @@
-fastapi==0.115.14
-uvicorn[standard]==0.34.3
-apscheduler==3.11.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+apscheduler==3.11.3
 # 2.32.3 carries CVE-2024-47081 (.netrc credential leak); fixed in 2.32.4.
-requests==2.32.4
-pydantic==2.11.7
-numpy==2.2.6
+requests==2.34.2
+pydantic==2.13.5
+numpy==2.5.2
