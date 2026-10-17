@@ -48,6 +48,8 @@ Runs as one Docker container on an Unraid host ("Thor"). Repo: `github.com:alans
   → `grab`/`qb_grab` → `merge_movie` → `finish_movie`. Also shared helpers used by TV.
 - `tv.py` — episode pipeline (mirrors pipeline.py); imports shared helpers from it.
 - `sync.py` — A/V offset/drift detection: multi-window **consensus** + **linear-drift** fit.
+- `retime.py` — applies a measured stretch to the grafted AUDIO (decode, re-time, re-encode), and
+  repairs files merged before it existed. See "A stretch must change the audio".
 - `offdet_video.py` — video **scene-cut** cross-correlation (primary sync signal).
 - `offdet.py` — audio cross-correlation (fallback sync signal).
 - `scheduler.py` — APScheduler: `_search_job` (every `search_interval_min`) and `_finish_job`
@@ -809,8 +811,10 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
   re-checks the base: still missing something → blocklist that release and try another; profile
   met → mark it done.
 - **Framerate mismatch → drift, not reject.** Don't reject on differing fps; let
-  `sync.detect()` measure a **linear drift** and apply `mkvmerge --sync TID:offset,num/den`.
-  Only bail if auto-sync is off, or if fps differ but no reliable drift could be measured.
+  `sync.detect()` measure a **linear drift** and re-time the grafted audio by it (`retime.py` —
+  **not** `mkvmerge --sync TID:offset,num/den` on audio, which is what caused the micro skips;
+  subtitles still take the ratio). Only bail if auto-sync is off, or if fps differ but no
+  reliable drift could be measured.
 - **Sync confidence gates outcome, but a human is the LAST resort.** `sync.detect()` returns
   `(offset_ms|None, conf, method, drift)`. None / low-confidence / inconsistent →
   `reject_and_retry`, which blocklists that release and fetches a DIFFERENT one, up to
@@ -826,6 +830,54 @@ satisfies the profile. Both were literal `fre`+`eng` checks before.
   release by hand. `merge_movie` sets status to **`merging` BEFORE** detection and streams a per-window
   `progress` field (UI polls every 8s).
 - Output replaces the library (French) file in place; forced `.mkv`; named after the library file.
+
+## A stretch must change the audio, not its timestamps (`retime.py`)
+
+Every rate stretch — the PAL ratio, the 1.001 pulldown, a fitted linear drift — used to reach the
+file as `mkvmerge --sync TID:d,o/p`. mkvmerge applies that by rescaling the track's TIMESTAMPS and
+leaves every sample as it was, so a 45-minute PAL graft carried timestamps ~115 s longer (or
+shorter) than the audio inside them. A player that follows the samples drifts; one that follows
+the timestamps cuts or pads the audio to keep up, every second or so. That was the "micro skips on
+some TV shows" report, and it is why it hit TV: French broadcast and PAL DVD sources are 25 fps
+against 23.976 WEB donors, while films are usually 23.976 on both sides. Reproduced with real
+mkvmerge on a pure tone: a constant offset decodes clean, every stretch ratio breaks it. Lip-sync
+was suspected and is innocent — it only ever produces a constant offset.
+
+- **The merge** (`pipeline.graft_cmd`, shared by both merge paths): when `drift` is set, mkvmerge
+  still stretches the donor's audio — into a small audio-only file — so where each track STARTS is
+  mkvmerge's own arithmetic, unchanged. `retime.measure` reads that file's timeline, `render`
+  decodes it, changes its speed, re-encodes it, and it is muxed in with a CONSTANT `--sync`. The
+  donor then contributes only subtitles, which keep the mkvmerge ratio: a cue is an instant, so
+  rescaling its timestamp IS re-timing it. `_donor_opts` raises if handed audio with a drift, so
+  there is no second way in.
+- **The repair** (`POST /api/library/retime`, Library page → "Audio stretched by a frame-rate
+  difference"): the samples inside an old stretched track are untouched — that is the bug — so the
+  original audio is still in the library file and is re-timed in place, no download. Candidates
+  are every file vo-merge grafted or replaced; each is screened from its first two minutes and
+  only a track that then MEASURES as a clean stretch over its whole length is touched. The record's
+  `sync_drift` is only a hint (`scope=flagged`): `DONOR_RESET` clears it when a record is
+  re-opened, so a stretched file that later gained a subtitle no longer says so. The file is
+  replaced only if it did not change meanwhile and the result verifies; a second run finds nothing.
+- **What "measures as a stretch" means** (`retime.fit`): decoded in fixed 48000-sample chunks
+  (so a TrueHD track is thousands of lines, not millions), with `-copyts` (otherwise every start
+  is rebased to the file's earliest stream), and a line through (samples held, timestamp). `k` is
+  its slope; `resid` the worst chunk's distance from it. A track whose timestamps JUMP (a
+  broadcast dropout) is left alone and reported — a uniform re-time would desync the audio
+  around the gap.
+- **How the speed changes** (`retime_method`): `tempo` keeps the pitch, which is right for a dub
+  (French voices are recorded against the 25 fps picture at natural pitch), via rubberband when the
+  ffmpeg build has it, else atempo. `resample` moves pitch with speed, as a PAL transfer does.
+  Placement, measured on synthesized speech: resample ≤0.2 ms, rubberband ≤2 ms, atempo ≤6 ms. Do
+  not "compensate" atempo for the ~21 ms it appears early on a beep train after silence — that is
+  a property of that signal, and doing so made real speech 16-21 ms late. `asetrate` takes only an
+  integer, so `rate_pair` resamples to S and relabels as A with S/A ≈ k to ~1e-9 (a plain
+  `round(48000/k)` would drift 0.15 s over a film).
+- **Codec** (`retime_codec`): AC-3 640k by default because everything passes it through; FLAC
+  for lossless. A re-encode is the price — Matroska has no way to say "play this 4% slower".
+
+`_donor_opts` also used to emit `--audio-tracks ""` for a subtitle-only graft, which mkvmerge
+rejects as a parse error, so every one of those merges failed and blocklisted a good release. It
+now says `--no-audio`.
 
 ## Sync detection (sync.py / offdet_video.py)
 
@@ -1319,6 +1371,7 @@ Keys you'll touch most: `scan_mode` (**files**|tag), `scan_all_movies`, `lang_pr
 `multi_indexer_ids`, `grab_mode` (auto|approval), `scope_films`/`scope_series`, `min_seeders`,
 `score_threshold`, `max_sync_retries`, `sync_*` (windows/window_dur/hwaccel/threads,
 `sync_ratio_test`/`sync_ratio_span`/`sync_ratio_min_conf`/`sync_ratio_margin` for the PAL path),
+`retime_method`/`retime_codec` (how a stretched graft's audio is re-timed and re-encoded),
 `stall_timeout_min`/`dl_max_age_min`, `search_interval_min`/`finish_interval_min`/
 `promote_interval_min`, `max_inflight_downloads` (download slots) /`max_parallel_merges`
 (concurrent merges, applied live via `MERGE_GATE`), `enabled` (master switch),

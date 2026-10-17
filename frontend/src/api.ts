@@ -89,6 +89,21 @@ export interface AiLogItem {
 export interface AiLog {
   items: AiLogItem[]; counts: Record<string, number>; now: number;
 }
+/** One file whose audio carries a stretched timeline (see backend retime.py). `k` is how far the
+ *  timestamps are stretched against the samples: 0.959041 / 1.042708 are the PAL ratios. */
+export interface RetimeItem {
+  title: string; kind: "movie" | "episode"; id: number | string; path: string;
+  tracks: { aidx: number; lang: string; k: number }[];
+}
+
+export interface RetimeState {
+  running: boolean; started: number; finished: number; phase: string;
+  dry_run: boolean; scope: "all" | "flagged"; checked: number; total: number;
+  found: RetimeItem[]; fixed: RetimeItem[];
+  skipped: { title: string; path: string; reason: string }[];
+  error: string | null;
+}
+
 export interface RepairState {
   running: boolean; started: number; finished: number; phase: string;
   checked: number; total: number; deleted: number; searched: number;
@@ -412,6 +427,10 @@ export const api = {
     j<{ ok: boolean; started: boolean; total?: number; note?: string }>("/api/library/repair",
       { method: "POST", body: JSON.stringify({ dry_run: false, paths: paths ?? null }) }),
   repairState: () => j<RepairState>("/api/library/repair"),
+  retimeStart: (dryRun: boolean, scope: "all" | "flagged" = "all") =>
+    j<{ ok: boolean; started: boolean; note?: string }>("/api/library/retime",
+      { method: "POST", body: JSON.stringify({ dry_run: dryRun, scope }) }),
+  retimeState: () => j<RetimeState>("/api/library/retime"),
   tvRetryErrors: () => j<{ ok: boolean; retried: number }>("/api/tv/retry_errors", { method: "POST" }),
   retryAllErrors: () =>
     j<{ ok: boolean; movies: number; episodes: number }>("/api/retry_errors", { method: "POST" }),

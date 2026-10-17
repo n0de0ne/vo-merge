@@ -739,6 +739,38 @@ def library_repair_state():
     return pipeline.REPAIR_STATE
 
 
+class RetimeIn(BaseModel):
+    dry_run: bool = True
+    scope: str = "all"     # "all": every file vo-merge wrote; "flagged": only merges that
+                           # recorded a stretch (fast, but misses re-opened records)
+
+
+@api.post("/library/retime")
+def library_retime(body: RetimeIn):
+    """Find and re-time the stretched audio that merges wrote before `retime.py` existed — the
+    "micro skips" on PAL-sourced titles.
+
+    Those merges handed a rate stretch to mkvmerge as `--sync TID:d,o/p`, which rescales a
+    track's timestamps and leaves its samples untouched. The samples are therefore still the
+    original audio, so the repair re-times them in place: no download, no new release. Only a
+    track that MEASURES as a clean stretch is touched, and the file is replaced only after the
+    result verifies, so running it twice changes nothing the second time.
+
+    `dry_run` (the default) measures and reports without changing anything. Either way it reads
+    files, so it runs in a thread: poll `GET /api/library/retime` for progress and results."""
+    if body.scope not in ("all", "flagged"):
+        raise HTTPException(400, "scope must be 'all' or 'flagged'")
+    if not pipeline.start_retime(core.load_config(), dry_run=body.dry_run, scope=body.scope):
+        return {"ok": True, "started": False, "note": "a re-time pass is already running"}
+    return {"ok": True, "started": True, "dry_run": body.dry_run, "scope": body.scope}
+
+
+@api.get("/library/retime")
+def library_retime_state():
+    """Progress and results of the running (or last) re-time pass."""
+    return pipeline.RETIME_STATE
+
+
 @api.get("/queue")
 def queue(limit: int = 100):
     """The merge queue, in the order it will actually be drained, plus WHY it is or isn't

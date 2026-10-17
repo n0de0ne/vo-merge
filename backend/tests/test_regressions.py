@@ -1862,3 +1862,191 @@ def test_a_download_that_cannot_promote_escalates_instead_of_sitting_forever(app
     assert e["status"] == "error" and "stuck for 3 min" in e["error"], e["error"]
     assert not e["progress"], "the annotation is replaced by the error, not left beside it"
     tv._STUCK_PASSES.clear()
+
+
+# ------------------------------------------------------------------ re-timing a stretch
+# A rate stretch used to reach the file as `mkvmerge --sync TID:d,o/p`, which rescales timestamps
+# and leaves the samples untouched. Reported as "micro skips" on PAL-sourced series: a player that
+# follows the timestamps has to cut or pad the audio every second or so to keep up.
+def test_a_stretch_never_reaches_mkvmerge_as_a_timestamp_ratio(app_env, monkeypatch):
+    """Audio + drift must go through retime.graft_stretched; only subtitles may keep the
+    mkvmerge ratio (a cue is an instant, so rescaling its timestamp IS re-timing it)."""
+    from app import pipeline, retime
+    with pytest.raises(ValueError):
+        pipeline._donor_opts([1], {1: "eng"}, [], 0, 0.959041)
+    calls = []
+    monkeypatch.setattr(retime, "graft_stretched",
+                        lambda donor, ids, *a, **kw: calls.append(ids) or (["RETIMED.mka"], []))
+    info = {"auds": [{"id": 1, "name": "English"}]}
+    cmd, _ = pipeline.graft_cmd("out.mkv", "base.mkv", "donor.mkv", [1], {1: "eng"},
+                                [{"id": 2, "lang": "eng"}], 250, 0.959041, info, "/tmp", {})
+    assert calls == [[1]] and "RETIMED.mka" in cmd
+    i = cmd.index("donor.mkv")
+    donor_opts = cmd[cmd.index("RETIMED.mka") + 1:i]
+    assert "--no-audio" in donor_opts, "the donor must not contribute its audio a second time"
+    assert ["--sync", "2:250,959041/1000000"] == donor_opts[donor_opts.index("--sync"):][:2]
+    # no stretch -> the plain path, unchanged
+    cmd, tmps = pipeline.graft_cmd("out.mkv", "base.mkv", "donor.mkv", [1], {1: "eng"}, [], 250,
+                                   None, info, "/tmp", {})
+    assert tmps == [] and ["--sync", "1:250"] == cmd[cmd.index("--sync"):][:2]
+
+
+def test_a_subtitle_only_graft_builds_a_command_mkvmerge_accepts(app_env):
+    """`--audio-tracks ""` is a parse error in mkvmerge, so every subtitle-only graft failed to
+    mux and was blocklisted as a broken release."""
+    from app import pipeline
+    opts = pipeline._donor_opts([], {}, [{"id": 3, "lang": "eng"}], 0, None)
+    assert "--audio-tracks" not in opts and "--no-audio" in opts
+    assert opts[opts.index("--subtitle-tracks") + 1] == "3"
+
+
+def test_retime_fit_tells_a_stretch_from_gaps(app_env):
+    """A clean stretch is a straight line through (samples, timestamps); a track with a dropout
+    is not, and must be left alone — a uniform re-time would shift the audio around the gap."""
+    from app import retime
+    chunks = [(0.5 + 0.959041 * i, 1.0) for i in range(600)]
+    f = retime.fit(chunks)
+    assert abs(f["k"] - 0.959041) < 1e-9 and f["resid"] < 1e-9 and f["start"] == 0.5
+    assert abs(retime.fit([(i * 1.0, 1.0) for i in range(600)])["k"] - 1) < 1e-12
+    gapped = [(i + (0.12 if i > 300 else 0), 1.0) for i in range(600)]
+    assert retime.fit(gapped)["resid"] > retime.RESID_MAX
+
+
+@pytest.mark.parametrize("k", [24000 / 1001 / 25, 25 / (24000 / 1001), 25 / 24, 24 / 25, 1.001,
+                               1 / 1.001, 1.000412, 0.99987])
+def test_rate_pair_is_exact_enough_for_a_feature_film(app_env, k):
+    """asetrate takes an integer, so asetrate=round(48000/k) drifts up to 1/48000 — 0.15 s by
+    the end of a two-hour film. The (S, A) pair must be good to well under a millisecond."""
+    from app import retime
+    s, a = retime.rate_pair(k)
+    assert abs(s / a - k) * 7200 < 1e-3
+
+
+_BINS = all(__import__("shutil").which(b) for b in ("mkvmerge", "ffmpeg", "ffprobe"))
+
+
+def _beeps(path, aidx):
+    """Onset of every beep in one audio track, in seconds from its first sample."""
+    import numpy as np
+    x = np.frombuffer(subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-map", f"0:a:{aidx}", "-ac", "1", "-ar", "48000",
+         "-af", "asetpts=N/SR/TB", "-f", "f32le", "-"], capture_output=True, timeout=300).stdout,
+        np.float32)
+    idx, last = [], -48000
+    for i in np.flatnonzero(np.abs(x) > 0.1):
+        if i - last > 24000:
+            idx.append(i)
+        last = i
+    return np.array(idx) / 48000.0
+
+
+@pytest.mark.skipif(not _BINS, reason="needs mkvmerge and ffmpeg")
+@pytest.mark.parametrize("method", ["tempo", "resample"])
+def test_a_stretched_graft_is_retimed_contiguous_and_in_place(app_env, tmp_path, method):
+    """End to end with the real tools: a 23.976 donor (a 50 ms beep every 2 s) grafted onto a
+    25 fps base. The old mux is reproduced, then (a) the repair and (b) the new merge path must
+    both yield a track whose timestamps match its samples (k = 1) with every beep where the
+    stretched timestamps said it should play."""
+    import numpy as np
+    from app import pipeline, retime
+    def run(*a):
+        subprocess.run(a, check=True, capture_output=True, timeout=300)
+    def mk(path, fps, src, lang):
+        run("ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=s=96x64:r={fps}:d=40", "-f", "lavfi",
+            "-i", src, "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3", "-b:a", "192k",
+            "-metadata:s:a:0", f"language={lang}", path)
+    base, donor = str(tmp_path / "base.mkv"), str(tmp_path / "donor.mkv")
+    mk(base, 25, "sine=f=440:r=48000:d=40", "fre")
+    mk(donor, "24000/1001",
+       "aevalsrc='if(lt(mod(t\\,2)\\,0.05)\\,sin(2*PI*1000*t)\\,0)':s=48000:d=40", "eng")
+    k, off = 24000 / 1001 / 25, 700
+    cfg = dict(app_env.DEFAULTS, retime_method=method, disk_floor_gb=0)
+
+    old = str(tmp_path / "old.mkv")                       # what every merge used to write
+    run("mkvmerge", "-o", old, base, "--no-video", "--audio-tracks", "1", "--language", "1:eng",
+        "--sync", f"1:{off},{round(k * 1e6)}/1000000", donor)
+    was = retime.measure(old, [1], cfg)[1]
+    assert abs(was["k"] - k) < 1e-4, "the old mux really does stretch only the timestamps"
+    expected = was["start"] + k * _beeps(old, 1)
+
+    def placed(path):
+        now = retime.measure(path, [1], cfg)[1]
+        assert abs(now["k"] - 1) < 1e-4, f"timestamps still stretched: k={now['k']}"
+        got = now["start"] + _beeps(path, 1)
+        err = [g - expected[np.argmin(abs(g - expected))] for g in got]
+        assert len(got) >= len(expected) - 1
+        assert abs(np.mean(err)) < 0.005 and max(map(abs, err)) < 0.030, err
+
+    fixed = str(tmp_path / "fixed.mkv")
+    __import__("shutil").copy(old, fixed)
+    r = retime.repair_file(fixed, cfg)
+    assert r["changed"] and not r["error"], r
+    assert [t["aidx"] for t in r["tracks"] if t.get("fix")] == [1], "only the stretched track"
+    placed(fixed)
+    again = retime.repair_file(fixed, cfg)
+    assert not again["changed"] and not [t for t in again["tracks"] if t.get("fix")]
+
+    out = str(tmp_path / "merged.mkv")
+    info = pipeline.probe(donor)
+    cmd, tmps = pipeline.graft_cmd(out, base, donor, [1], {1: "eng"}, [], off, k, info,
+                                   str(tmp_path), cfg)
+    ok, err = pipeline.run_mux(cmd, out, cfg)
+    retime.cleanup(tmps)
+    assert ok, err
+    placed(out)
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".")], "temp files left behind"
+
+
+@pytest.mark.skipif(not _BINS, reason="needs mkvmerge and ffmpeg")
+def test_a_subtitle_only_graft_actually_muxes(app_env, tmp_path):
+    from app import pipeline
+    base, donor = str(tmp_path / "base.mkv"), str(tmp_path / "donor.mkv")
+    srt = tmp_path / "en.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=25:d=4", "-f",
+                    "lavfi", "-i", "sine=d=4", "-c:v", "libx264", "-preset", "ultrafast", base],
+                   check=True, capture_output=True, timeout=120)
+    subprocess.run(["mkvmerge", "-o", donor, base, "--language", "0:eng", str(srt)],
+                   check=True, capture_output=True, timeout=120)
+    out = str(tmp_path / "out.mkv")
+    cmd, _ = pipeline.graft_cmd(out, base, donor, [], {}, [{"id": 2, "lang": "eng"}], 0, None,
+                                {"auds": []}, str(tmp_path), dict(app_env.DEFAULTS))
+    ok, err = pipeline.run_mux(cmd, out, dict(app_env.DEFAULTS))
+    assert ok, err
+
+
+def test_a_retime_check_never_takes_a_merge_slot(app_env, tmp_path, monkeypatch):
+    """Screening only reads. Taking MERGE_GATE per file across a pass over every grafted file
+    would keep re-taking the slot ahead of the merge worker; only the rewrite may hold one."""
+    from contextlib import contextmanager
+    from app import pipeline, retime
+    f = tmp_path / "Show S01E01.mkv"; f.write_bytes(b"x")
+    app_env.upsert_episode({"id": "7:1:1", "series_id": 7, "series_title": "Show", "tvdb_id": 7,
+                            "season": 1, "episode": 1, "french_path": str(f), "quality": "1080p"})
+    app_env.set_ep_status("7:1:1", "merged", merge_kind="grafted", sync_drift=0.959041)
+    calls = []
+
+    def fake_repair(path, cfg, flagged=False, dry_run=False, tag=""):
+        calls.append(dry_run)
+        return {"path": path, "error": None, "changed": not dry_run,
+                "tracks": [{"aidx": 1, "lang": "eng", "k": 0.959041, "fix": True}]}
+    slots = []
+
+    @contextmanager
+    def slot(cfg=None):
+        slots.append(calls[-1] if calls else None)
+        yield
+    monkeypatch.setattr(retime, "repair_file", fake_repair)
+    monkeypatch.setattr(pipeline.MERGE_GATE, "slot", slot)
+    monkeypatch.setattr(pipeline, "_after_retime", lambda row, cfg: None)
+    cfg = dict(app_env.DEFAULTS)
+
+    pipeline.run_retime(cfg, dry_run=True)
+    st = pipeline.RETIME_STATE
+    assert slots == [] and calls == [True] and len(st["found"]) == 1 and not st["fixed"]
+
+    calls.clear()
+    pipeline.run_retime(cfg, dry_run=False)
+    assert calls == [True, False], "measure without the slot, then rewrite (re-measuring) with it"
+    assert slots == [True], "the slot is taken once, for the rewrite only"
+    assert [x["path"] for x in st["fixed"]] == [str(f)]

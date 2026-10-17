@@ -178,6 +178,14 @@ DEFAULTS = {
                                            # evidence of misalignment
     "qc_max_offset_ms": 1500,              # a confident residual offset beyond this rejects the
                                            # merge (blocklist donor, try another release)
+    # ---- re-timing a rate stretch (retime.py) -----------------------------------------------
+    # A stretch (PAL 25 vs 23.976, a fitted drift) is applied to the grafted AUDIO by decoding,
+    # re-timing and re-encoding it. Handing the ratio to mkvmerge only rescaled timestamps, which
+    # is what produced the micro skips. These two only choose how; there is no off switch.
+    "retime_method": "tempo",              # tempo: keep the pitch (rubberband, else atempo);
+                                           # resample: pitch follows speed, as a PAL transfer does
+    "retime_codec": "ac3",                 # re-encode to ac3 / eac3 (640k, passthrough
+                                           # everywhere) or flac (lossless, ~3x larger)
     # ---- lip-sync: the only ABSOLUTE sync signal we have (lipsync.py) ----------------------
     # Every other measurement in this app is RELATIVE — donor audio against base audio, donor cuts
     # against base cuts. All of them are satisfied by two files that agree with each other and are

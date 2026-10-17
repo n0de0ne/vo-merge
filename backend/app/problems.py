@@ -131,6 +131,13 @@ RULES = [
              "occasionally a full disk.",
          fix="Check free space, then take a different release; the library file is untouched.",
          remedies=["another", "retry"]),
+    dict(code="retime_failed", label="Could not re-time the audio", severity="fixable",
+         match=r"audio re-time failed",
+         why="The two files run at different rates, so the grafted audio had to be sped up or "
+             "slowed down — and this donor's could not be: ffmpeg could not decode it, or its own "
+             "timestamps jump, and a uniform re-time would desync the audio around the jumps.",
+         fix="Take a different release; the library file is untouched.",
+         remedies=["another", "retry"]),
     dict(code="not_visible", label="Download never became visible", severity="external",
          match=r"never became visible",
          why="qB reported the download complete, but the path it named never appeared to this "

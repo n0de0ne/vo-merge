@@ -274,6 +274,18 @@ SECTIONS = [
                       "of evidence is not evidence of misalignment."),
             dict(key="qc_max_offset_ms", type="number", label="QC reject threshold", unit="ms",
                  advanced=True),
+            dict(key="retime_method", type="select", label="Re-timing a rate difference",
+                 options=[("tempo", "Keep the pitch"), ("resample", "Resample (pitch follows speed)")],
+                 help="When the two files run at different rates (PAL 25 fps against 23.976), the "
+                      "grafted audio is sped up or slowed down by ~4% and re-encoded. Keeping the "
+                      "pitch leaves every voice as it was recorded; resampling is what a PAL "
+                      "transfer itself does, and moves voices by ~0.7 semitone."),
+            dict(key="retime_codec", type="select", label="Re-timed audio format", advanced=True,
+                 options=[("ac3", "AC-3 640k (plays everywhere)"), ("eac3", "E-AC-3 640k"),
+                          ("flac", "FLAC (lossless, ~3x larger)")],
+                 help="A re-timed track has to be re-encoded. AC-3 passes straight through to "
+                      "every TV and receiver; FLAC keeps every bit of the decoded audio, but some "
+                      "clients transcode it."),
             dict(key="mux_timeout_min", type="number", label="Mux timeout", unit="min",
                  advanced=True,
                  help="A deadlock guard, not a tuning knob. A wedged mkvmerge held the merge "

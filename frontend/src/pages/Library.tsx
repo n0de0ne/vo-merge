@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api, type Coverage, type CoverageLib, type HistorySummary, type LibItem, type LibPage,
-  type RepairPlan, type RepairState, type RescanState,
+  type RepairPlan, type RepairState, type RescanState, type RetimeState,
 } from "../api";
 import { runAction, usePoll } from "../lib/poll";
 import { setParam, useRoute } from "../lib/router";
@@ -214,6 +214,83 @@ function RepairPanel({ n, onDone }: { n: number; onDone: () => void }) {
             <button className="btn sec"
               onClick={() => { setSt(null); setPlan(null); onDone(); }}>Done</button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- stretched audio */
+
+/** Merges used to hand a frame-rate stretch (PAL 25 fps against 23.976) to mkvmerge as a
+ *  timestamp ratio, which leaves the audio itself untouched — so players cut or pad it to keep up,
+ *  every second or so. New merges re-time the audio for real; this finds the files written before
+ *  that and fixes them from the audio they already hold. It rewrites library files, so it checks
+ *  first and only then offers the run. */
+function RetimePanel() {
+  const [st, setSt] = useState<RetimeState | null>(null);
+  const [note, setNote] = useState("");
+  const running = !!st?.running;
+  usePoll(() => api.retimeState().then(setSt).catch(() => {}), running ? 3000 : 60000, [running]);
+
+  const start = (dry: boolean) => runAction(async () => {
+    if (!dry && !window.confirm(`Re-time the stretched audio in ${st!.found.length} file(s)?\n\n`
+      + "Each file is measured again, its stretched audio track is re-encoded at the right speed, "
+      + "and the file is replaced in place only once the result checks out. Nothing is "
+      + "downloaded and nothing else in the file changes.")) return;
+    const r = await api.retimeStart(dry);
+    setNote(r.started ? "" : (r.note || "could not start"));
+    setSt(await api.retimeState());
+  });
+
+  const finished = !!st && !running && st.finished > 0;
+  const list = finished ? (st!.dry_run ? st!.found : st!.fixed) : [];
+  // k is timestamps over samples: 0.959041 reads as "-4.10%", the PAL speed-up.
+  const pct = (k: number) => `${k > 1 ? "+" : ""}${((k - 1) * 100).toFixed(2)}%`;
+  return (
+    <div className="panel repair">
+      <div className="row">
+        <b className="h2">🎚️ Audio stretched by a frame-rate difference</b>
+        <span className="sub">earlier merges stretched the added audio's timestamps but not the
+          audio itself, so players skip to keep up</span>
+        <div className="spacer" />
+        {!running && <Act cls="btn sec" busyLabel="Starting…" run={() => start(true)}
+          title={"Measure every file vo-merge grafted or replaced. Reads the files, changes "
+            + "nothing."}>{finished ? "Check again" : "Check the files vo-merge wrote"}</Act>}
+      </div>
+      {note && <div className="warn" style={{ marginTop: 6 }}>{note}</div>}
+      {running && <div className="sub" style={{ marginTop: 6 }}>
+        {st!.dry_run ? "checking" : "re-timing"} · {fmtNum(st!.checked)} of {fmtNum(st!.total)}
+        {" "}· {fmtNum(st!.found.length)} stretched
+        {!st!.dry_run && <> · {fmtNum(st!.fixed.length)} fixed</>}</div>}
+      {finished && (
+        <div className="repair-plan">
+          <div>
+            {st!.dry_run
+              ? <><b>{fmtNum(st!.found.length)}</b> of {fmtNum(st!.checked)} file(s) carry
+                  stretched audio</>
+              : <><b>{fmtNum(st!.fixed.length)}</b> file(s) re-timed</>}
+            {st!.skipped.length > 0 && <> · <b>{fmtNum(st!.skipped.length)}</b> skipped</>}
+          </div>
+          {list.slice(0, 10).map(f => (
+            <div className="muted small" key={f.path} title={f.path}>
+              {f.title || f.path.split("/").pop()} — {f.tracks.map(t =>
+                `${lang(t.lang)} ${pct(t.k)}`).join(", ")}</div>
+          ))}
+          {list.length > 10 && <div className="muted small">+{fmtNum(list.length - 10)} more</div>}
+          {st!.skipped.slice(0, 6).map((s, i) => (
+            <div className="muted small" key={`${s.path}-${i}`} title={s.path}>
+              {s.title || s.path.split("/").pop()} — {s.reason}</div>
+          ))}
+          {st!.skipped.length > 6 &&
+            <div className="muted small">+{fmtNum(st!.skipped.length - 6)} more skipped</div>}
+          {st!.error && <div className="err">{st!.error}</div>}
+          {st!.dry_run && st!.found.length > 0 && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <Act cls="btn" busyLabel="Starting…" run={() => start(false)}>
+                Re-time {fmtNum(st!.found.length)} file(s)</Act>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -576,6 +653,7 @@ export default function Library() {
       )}
 
       {(d?.repairable ?? 0) > 0 && <RepairPanel n={d!.repairable} onDone={load} />}
+      <RetimePanel />
 
       <div className="section-title">Coverage</div>
       <CoverageHistory />

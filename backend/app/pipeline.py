@@ -6,7 +6,7 @@ Search & merge logic is ported verbatim from the validated dry-run scripts.
 import json, os, re, subprocess, shutil, time, hashlib, threading
 from contextlib import contextmanager
 import requests
-from . import agent, core, sync, media
+from . import agent, core, sync, media, retime
 from .clients import Prowlarr, Radarr, Sonarr, QBittorrent, Plex
 
 class _MergeGate:
@@ -88,6 +88,14 @@ SCAN_STATE = {"running": False, "scope": "", "phase": "", "started": 0, "finishe
 REPAIR_STATE = {"running": False, "started": 0, "finished": 0, "phase": "",
                 "checked": 0, "total": 0, "deleted": 0, "searched": 0,
                 "skipped": [], "done": [], "error": None}
+
+# progress of the current/last "re-time stretched audio" pass (run_retime). Its own lock rather
+# than SCAN_LOCK: it is a merge-shaped rewrite of files vo-merge already wrote, so it shares the
+# merge slots (MERGE_GATE) instead of holding up scans, searches and merges for its whole run.
+RETIME_LOCK = threading.Lock()
+RETIME_STATE = {"running": False, "started": 0, "finished": 0, "phase": "", "dry_run": True,
+                "scope": "all", "checked": 0, "total": 0,
+                "found": [], "fixed": [], "skipped": [], "error": None}
 
 # Language detection in release names now lives in media._DUB_MARKERS, which carries a marker
 # per language so scoring works for any profile — the old FR_DUB / EN_OK / EN_AUDIO trio only
@@ -1874,6 +1882,140 @@ def start_repair(paths, cfg):
     return True
 
 
+def retime_candidates(scope="all"):
+    """The library files vo-merge itself wrote — grafted or replaced — one row per file.
+
+    `flagged` means the record says its merge applied a stretch. It is a hint, not the authority:
+    DONOR_RESET clears `sync_drift` whenever a record goes back for another release, so a file
+    that was stretched and later re-opened (say, for a missing subtitle) no longer says so — which
+    is why scope "all" screens every file rather than trusting the column. Two episode records
+    can share one file (a double episode); it is listed once."""
+    rows = {}
+    with core.db() as c:
+        for r in c.execute("SELECT tmdb_id, title, status, french_path, merged_file, sync_drift "
+                           "FROM movies WHERE merge_kind IN ('grafted','replaced')"):
+            path = r["merged_file"] if r["merged_file"] and os.path.exists(r["merged_file"]) \
+                else r["french_path"]
+            if path:
+                rows.setdefault(path, {"kind": "movie", "id": r["tmdb_id"],
+                                       "title": r["title"] or "", "path": path, "flagged": False})
+                rows[path]["flagged"] |= bool(r["sync_drift"] and abs(r["sync_drift"] - 1) > 1e-6)
+        for r in c.execute("SELECT id, series_title, season, episode, status, french_path, "
+                           "sync_drift FROM episodes WHERE merge_kind IN ('grafted','replaced')"):
+            path = r["french_path"]
+            if path:
+                rows.setdefault(path, {"kind": "episode", "id": r["id"],
+                                       "title": f"{r['series_title'] or ''} "
+                                                f"S{r['season'] or 0:02d}E{r['episode'] or 0:02d}",
+                                       "path": path, "flagged": False})
+                rows[path]["flagged"] |= bool(r["sync_drift"] and abs(r["sync_drift"] - 1) > 1e-6)
+    out = sorted(rows.values(), key=lambda x: (not x["flagged"], x["title"]))
+    return [x for x in out if x["flagged"]] if scope == "flagged" else out
+
+
+def _retime_busy(row):
+    """A merge is about to rewrite (or is rewriting) this file — leave it to the merge."""
+    rec = core.get_movie(row["id"]) if row["kind"] == "movie" else core.get_episode(row["id"])
+    key = f"{'m' if row['kind'] == 'movie' else 'e'}{row['id']}"
+    return not rec or rec.get("status") in ("ready", "merging") or key in _merging_now()
+
+
+def _after_retime(row, cfg):
+    """The file changed on disk under the same path: have Plex re-analyse it (a plain scan never
+    re-reads streams after an in-place remux) and let the *arr see the new size."""
+    try:
+        if row["kind"] == "movie":
+            mv = core.get_movie(row["id"]) or {}
+            plex_dir = os.path.dirname(row["path"]).replace(cfg["media_mount"],
+                                                            cfg["plex_media_prefix"], 1)
+            plex_refresh(cfg, [plex_dir, mirror_to_en(row["path"], cfg)], mv.get("title"),
+                         year=mv.get("year"))
+            if mv.get("radarr_id"):
+                Radarr(cfg["radarr_url"], cfg["radarr_key"]).rescan(mv["radarr_id"])
+        else:
+            from . import tv
+            ep = core.get_episode(row["id"]) or {}
+            tv._plex_ep_refresh(ep, cfg)
+            if ep.get("series_id"):
+                Sonarr(cfg["sonarr_url"], cfg["sonarr_key"]).rescan(ep["series_id"])
+    except Exception as e:
+        core.log(f"retime: refresh after re-timing {row['title']} skipped: {e}")
+
+
+def run_retime(cfg, dry_run=True, scope="all"):
+    """Find — and unless `dry_run`, re-time — the stretched audio in files vo-merge wrote before
+    `retime.py` existed. Every decision is made by measuring the file (retime.repair_file), so a
+    second run finds nothing and changes nothing. Progress lands in RETIME_STATE."""
+    st = RETIME_STATE
+    st.update(running=True, started=time.time(), finished=0, phase="listing", dry_run=dry_run,
+              scope=scope, checked=0, total=0, found=[], fixed=[], skipped=[], error=None)
+    try:
+        rows = retime_candidates(scope)
+        st.update(total=len(rows), phase="checking" if dry_run else "re-timing")
+        for row in rows:
+            st["checked"] += 1
+            if not os.path.exists(row["path"]):
+                st["skipped"].append({"title": row["title"], "path": row["path"],
+                                      "reason": "not on disk"})
+                continue
+            if _retime_busy(row):
+                st["skipped"].append({"title": row["title"], "path": row["path"],
+                                      "reason": "a merge is about to rewrite it"})
+                continue
+            # Measuring only reads, so it takes no merge slot: holding one per file across a pass
+            # over thousands of files would keep re-taking it ahead of the merge worker. Only the
+            # rewrite shares the slots — and it measures again under the slot, so what it acts on
+            # is what is on disk now, not what the screen saw.
+            tag = f" {row['kind']} {row['id']}"
+            r = retime.repair_file(row["path"], cfg, flagged=row["flagged"], dry_run=True, tag=tag)
+            if not dry_run and not r["error"] and any(t.get("fix") for t in r["tracks"]):
+                with MERGE_GATE.slot(cfg):
+                    r = retime.repair_file(row["path"], cfg, flagged=True, tag=tag)
+            fixes = [t for t in r["tracks"] if t.get("fix")]
+            for t in r["tracks"]:
+                if t.get("note") and t["note"] != "not stretched":
+                    st["skipped"].append({"title": row["title"], "path": row["path"],
+                                          "reason": f"audio track {t['aidx']} ({t['lang']}): "
+                                                    f"{t['note']}"})
+            if r["error"]:
+                st["skipped"].append({"title": row["title"], "path": row["path"],
+                                      "reason": r["error"]})
+                continue
+            item = {"title": row["title"], "kind": row["kind"], "id": row["id"],
+                    "path": row["path"],
+                    "tracks": [{"aidx": t["aidx"], "lang": t["lang"], "k": t["k"]} for t in fixes]}
+            if fixes:
+                st["found"].append(item)
+            if r["changed"]:
+                st["fixed"].append(item)
+                _after_retime(row, cfg)
+        st["phase"] = "done"
+        core.log(f"retime pass ({'dry run' if dry_run else 'real'}, {scope}): "
+                 f"{st['checked']} file(s) checked, {len(st['found'])} stretched, "
+                 f"{len(st['fixed'])} re-timed, {len(st['skipped'])} skipped")
+    except Exception as e:
+        st["error"] = str(e)
+        st["phase"] = "error"
+        core.log(f"retime pass error: {e}")
+    finally:
+        st.update(running=False, finished=time.time())
+
+
+def start_retime(cfg, dry_run=True, scope="all"):
+    """Run `run_retime` on a worker thread. False when a pass is already running."""
+    if not RETIME_LOCK.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            run_retime(cfg, dry_run=dry_run, scope=scope)
+        finally:
+            RETIME_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def abort_merge(kind, ident):
     """Stop a merge. Returns what actually happened: "killed" (it was running — its decode or
     mux was killed and the worker parks it as `review`), "dequeued" (it was only waiting, so it
@@ -2396,11 +2538,19 @@ def _donor_opts(aud_ids, langs, subs, offset, drift):
     """mkvmerge options selecting what the DONOR contributes. These precede the donor filename,
     so they apply to it and not to the base (which keeps its video, audio, subs and chapters).
 
-    Both audio and subtitles get the same --sync: the donor's tracks are timed to the donor's
-    video, so a subtitle grafted onto the base drifts exactly as its audio would."""
+    Both audio and subtitles get the same --sync offset: the donor's tracks are timed to the
+    donor's video, so a subtitle grafted onto the base drifts exactly as its audio would. A rate
+    STRETCH is the exception, and only for audio: `--sync TID:d,o/p` rescales timestamps without
+    touching the samples, which is the micro-skip bug (retime.py). Audio that needs a stretch
+    goes through `graft_cmd`/`retime.graft_stretched`; handing it here is a programming error."""
+    if aud_ids and drift:
+        raise ValueError("a stretched audio track must be re-timed (graft_cmd), not given to "
+                         "mkvmerge as a --sync ratio")
     sub_ids = [s["id"] for s in subs]
-    opts = ["--no-video", "--no-chapters", "--no-buttons", "--no-track-tags",
-            "--audio-tracks", ",".join(str(i) for i in aud_ids)]
+    opts = ["--no-video", "--no-chapters", "--no-buttons", "--no-track-tags"]
+    # An empty list is not "no tracks" to mkvmerge: `--audio-tracks ""` is a parse error, so a
+    # subtitle-only graft could never mux at all.
+    opts += ["--audio-tracks", ",".join(str(i) for i in aud_ids)] if aud_ids else ["--no-audio"]
     opts += ["--subtitle-tracks", ",".join(str(i) for i in sub_ids)] if sub_ids else ["--no-subtitles"]
     for i in aud_ids:
         opts += ["--language", f"{i}:{langs[i]}", "--default-track", f"{i}:0"]
@@ -2414,6 +2564,28 @@ def _donor_opts(aud_ids, langs, subs, offset, drift):
         for i in aud_ids + sub_ids:
             opts += ["--sync", f"{i}:{arg}"]
     return opts
+
+
+def graft_cmd(out, base, donor, ids, langs, subs, offset, drift, donor_info, workdir, cfg,
+              tag=""):
+    """The mkvmerge command for a graft, and the temp files it reads (remove them after the mux).
+
+    Shared by the movie and episode merges so a stretch can only ever reach the audio one way:
+    when `drift` is set, the donor's audio tracks are re-timed by `retime.graft_stretched` and
+    added as separate inputs with a constant offset, and the donor itself contributes only its
+    subtitles — which keep the mkvmerge stretch, correctly. Output track order is unchanged in
+    the way that matters: the base's audio first, then the grafted audio (qc_grafted_audio and
+    the lip-sync QC both count on that), then subtitles. Raises retime.RetimeError."""
+    cmd, tmps, aud = ["mkvmerge", "-o", out, base], [], ids
+    if ids and drift:
+        names = {a["id"]: a.get("name") or "" for a in donor_info["auds"]}
+        args, tmps = retime.graft_stretched(donor, ids, langs, names, offset, drift, workdir,
+                                            cfg, tag=tag)
+        cmd += args
+        aud = []
+    if aud or subs:
+        cmd += _donor_opts(aud, langs, subs, offset, drift) + [donor]
+    return cmd, tmps
 
 
 def _merge_movie_impl(tmdb_id, cfg=None):
@@ -2611,9 +2783,20 @@ def _merge_movie_impl(tmdb_id, cfg=None):
     outdir = os.path.dirname(libfile) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(libfile))[0] + ".mkv")
-    cmd = ["mkvmerge", "-o", out, base] + \
-          _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    ok, err = run_mux(cmd, out, cfg)
+    if ids and drift:
+        _beat("movie", tmdb_id, f"re-timing the grafted audio x{drift:.6f}…")
+    try:
+        cmd, tmps = graft_cmd(out, base, donor, ids, langs, subs, offset, drift, di, outdir, cfg,
+                              tag=f" {tmdb_id}")
+    except retime.RetimeError as e:
+        # Almost always the donor (audio ffmpeg can't decode, timestamps that jump) — another
+        # release is the automatic fix, exactly like a failed mux.
+        reject_and_retry(tmdb_id, f"audio re-time failed: {e}", cfg, delta, final="error")
+        return
+    try:
+        ok, err = run_mux(cmd, out, cfg)
+    finally:
+        retime.cleanup(tmps)
     if not ok:
         # A failed mux is almost always the DONOR — a container mkvmerge can't parse, a
         # truncated download — and another release is the automatic fix. This used to park as

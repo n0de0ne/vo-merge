@@ -218,6 +218,8 @@ LIVE_ERRORS = [
      "useless_release"),
     ("error", "mux failed: mkvmerge rc=2: no space left on device", "mux_failed"),
     ("error", "multi remux failed: mkvmerge rc=2", "mux_failed"),
+    ("error", "audio re-time failed: donor audio track 1 has timestamp jumps of up to 120 ms — "
+              "a uniform re-time would desync the audio around them", "retime_failed"),
     ("error", "download complete but /downloads/x never became visible", "not_visible"),
     ("no_release", "all candidate releases stalled after 4 tries", "stalled"),
     ("no_release", "all releases stalled", "stalled"),

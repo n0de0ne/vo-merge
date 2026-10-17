@@ -23,6 +23,13 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/requirements.txt
+      - name: Install media tools
+        # The re-timing tests run the real mkvmerge and ffmpeg: the micro-skip bug lived in what
+        # mkvmerge does with a --sync ratio, which no mock can reproduce. Without the tools those
+        # tests skip, so install them rather than let CI pass on a skip.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mkvtoolnix ffmpeg
       - name: Install
         working-directory: backend
         run: |

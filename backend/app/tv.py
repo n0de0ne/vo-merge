@@ -7,12 +7,12 @@ Reuses the proven merge helpers from pipeline.py / offdet*.py. Gated behind scop
 """
 import os, re, shutil, time, threading
 from collections import defaultdict
-from . import core, media
+from . import core, media, retime
 from .clients import Sonarr, Prowlarr, QBittorrent
 from .pipeline import (probe, _video_quality, _pick_link, _hash_from_magnet, qb_grab, _is_stalled,
                        _qb_to_local, _free_donor, grab_budget, MERGE_GATE, RES,
                        MERGE_WAKE, _merging_now, NOT_VISIBLE_MAX,
-                       _pick_subs, _donor_opts, hold_reason, reopen_status,
+                       _pick_subs, graft_cmd, hold_reason, reopen_status,
                        CLOSEABLE, _orig_codes, DONOR_RESET, AI_RESET, blocklist, _beat,
                        run_mux, SearchUnavailable, _sync_fail_reason,
                        resolve_donor_path, qc_grafted_audio, _unlink, recycle)
@@ -1124,8 +1124,19 @@ def _merge_episode_impl(ep, en_file, cfg, hint=None):
     outdir = os.path.dirname(fr) + "/_merged"
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, os.path.splitext(os.path.basename(fr))[0] + ".mkv")
-    cmd = ["mkvmerge", "-o", out, base] + _donor_opts(ids, langs, subs, offset, drift) + [donor]
-    ok_mux, mux_err = run_mux(cmd, out, cfg)
+    # a stretch is applied to the audio itself, never as an mkvmerge --sync ratio (retime.py)
+    if ids and drift:
+        _beat("episode", ep["id"], f"re-timing the grafted audio x{drift:.6f}…")
+    try:
+        cmd, tmps = graft_cmd(out, base, donor, ids, langs, subs, offset, drift, di, outdir, cfg,
+                              tag=f" {ep['id']}")
+    except retime.RetimeError as e:
+        _reject_and_retry_ep(ep, f"audio re-time failed: {e}", cfg, delta, final="error")
+        return
+    try:
+        ok_mux, mux_err = run_mux(cmd, out, cfg)
+    finally:
+        retime.cleanup(tmps)
     if not ok_mux:
         # almost always the donor's container — blocklist it and fetch another (see pipeline)
         _reject_and_retry_ep(ep, f"mux failed: {mux_err}", cfg, delta, final="error")
