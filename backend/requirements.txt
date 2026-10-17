@@ -5,3 +5,10 @@ apscheduler==3.11.0
 requests==2.32.4
 pydantic==2.11.7
 numpy==2.2.6
+# Deliberately NOT here: opencv. lipsync.py can use a Haar cascade to place the mouth precisely
+# and will if `cv2` happens to be importable, but it is not a dependency — the module finds the
+# talking region without one, by looking for the pixels whose motion sits at the syllable rate.
+# Shipping opencv would cost ~40MB and pin us to its 4.x line: OpenCV 5 REMOVED CascadeClassifier
+# and the bundled cascade data, so a routine dependency bump would have silently disabled the
+# better path while everything kept working. Verified against 5.0.0 — the import guard holds and
+# lip-sync falls back cleanly.

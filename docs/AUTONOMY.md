@@ -192,6 +192,43 @@ right now the one failure that slips the gate is **unrecoverable and invisible**
   the *arr so a replacement is searched). An `auto_repair: false` config flag that runs the
   real pass on a schedule when enabled fits the trust model; default stays plan-first.
 
+### 5a. What post-merge QC still cannot see (added by the August 2026 UI work)
+
+The QC pass above closed the confident-but-wrong graft, and it is the right first check. But it
+compares the grafted track to the base's **own audio track**, which means it is satisfied by two
+tracks that are equally wrong. Two real shapes slip it:
+
+- base and donor both carry the same leader, so both are displaced identically and they agree;
+- the library file was already out of sync before vo-merge ever touched it, so the graft is
+  aligned to a wrong reference and passes.
+
+Both are invisible for the same reason the original desync was: every signal the pipeline had was
+RELATIVE — donor cuts vs base cuts, donor audio vs base audio, graft vs base. `lipsync.py` adds
+the only absolute one, by correlating mouth movement in the picture against the speech envelope of
+a track. It is wired as an optional post-merge gate (`lipsync_qc`, off by default — it costs a
+second decode pass), as the last rung of the sync ladder before a record is parked
+(`lipsync_rescue`, on), and as an operator/agent action.
+
+It is also the only way to ask *"is this library file itself in sync?"* — a question with no donor
+in it, which nothing else here can express. That matters for the second shape above: a file whose
+French track reads +0 ms and whose grafted English track reads +900 ms has a bad graft; a file
+where every track reads +900 ms has a bad source, and no amount of re-merging will help.
+
+Its limits are stated in the module and worth repeating here: it is good to a frame or two on
+original-language audio, roughly ±150 ms on a dub (dubbing preserves *when* people speak, not how
+lips move), and it resolves nothing at all on animation, narration, or a film with little
+on-screen dialogue. Hence the multi-window consensus, and hence inconclusive ACCEPTS — a quiet
+film must not burn its retry budget on a measurement that was never going to resolve.
+
+### 5b. The remaining human step was reading forty identical error messages
+
+Section 2 dealt with states that dead-end into a human. The other half of that problem is that
+even when a failure had a mechanical fix, nothing put the failures with the same cause next to
+each other, so the fix was invisible: `problems.py` groups by cause, names the remedy, and applies
+it to a whole group. The PAL case is the clearest — `_sync_fail_reason` already writes the exact
+stretch ratio into the error string, and the group can now apply it to a whole season in one
+click.
+
 ## 6. Posture: config prerequisites for unattended operation
 
 `enabled: true`, `grab_mode: "auto"`, `ai_tickets: true`, `scope_series` as desired,
